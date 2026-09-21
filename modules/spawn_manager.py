@@ -6,6 +6,35 @@ from modules.drive_service import get_google_services, SPREADSHEET_ID
 # 1. READ / FETCH DATA
 # ==========================================
 
+def get_breeder_details_map():
+    """Fetches all breeders and maps them by Breeder ID for fast lookup."""
+    _, sheets_service = get_google_services()
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Breeders!A2:J'
+    ).execute()
+
+    rows = result.get('values', [])
+    breeders_map = {}
+
+    for idx, row in enumerate(rows, start=2):
+        if not row:
+            continue
+        breeder_id = row[0]
+        breeders_map[breeder_id] = {
+            "row_index": idx,
+            "id": breeder_id,
+            "sex": row[1] if len(row) > 1 else "",
+            "variety": row[2] if len(row) > 2 else "",
+            "grade": row[3] if len(row) > 3 else "N/A",
+            "image_url": row[4] if len(row) > 4 else "",
+            "status": row[5] if len(row) > 5 else "",
+            "tank": row[6] if len(row) > 6 else "",
+            "notes": row[7] if len(row) > 7 else ""
+        }
+    return breeders_map
+
+
 def get_available_breeders():
     """Fetches active male and female breeders ready for pairing."""
     _, sheets_service = get_google_services()
@@ -62,6 +91,31 @@ def get_all_spawns():
             "notes": row[11] if len(row) > 11 else ""
         })
     return spawns
+
+
+def get_active_pairings_with_details():
+    """
+    Fetches all active pairings ('In Pairing' or 'Pending (Success)')
+    enriched with full male and female breeder profile data.
+    """
+    all_spawns = get_all_spawns()
+    breeders_map = get_breeder_details_map()
+    
+    active_statuses = ["In Pairing", "Pending (Success)"]
+    active_pairs = []
+
+    for spawn in all_spawns:
+        if spawn.get("status") in active_statuses:
+            male_info = breeders_map.get(spawn["male_id"], {})
+            female_info = breeders_map.get(spawn["female_id"], {})
+            
+            active_pairs.append({
+                "spawn": spawn,
+                "male": male_info,
+                "female": female_info
+            })
+
+    return active_pairs
 
 
 # ==========================================
@@ -155,7 +209,6 @@ def mark_pairing_failed(spawn_id, failure_reason):
     if row_idx:
         male_id, female_id = spawn_data[1], spawn_data[2]
 
-        # Update Status (Col E) & Failure Reason (Col I)
         sheets_service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f'Spawns!E{row_idx}',
@@ -170,7 +223,6 @@ def mark_pairing_failed(spawn_id, failure_reason):
             body={'values': [[failure_reason]]}
         ).execute()
 
-        # Reset parents
         _update_breeder_status(sheets_service, male_id, "Available")
         _update_breeder_status(sheets_service, female_id, "Available")
 
