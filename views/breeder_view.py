@@ -22,6 +22,38 @@ COLOR_PATTERN_OPTIONS = [
     "Others"
 ]
 
+def evaluate_grade(caudal_180, caudal_prop, dorsal_good, anal_good, ventral_good, pectoral_good, body_shape, color_good):
+    """
+    Evaluates fish grade based on physical traits and IBC show criteria:
+    - Show Grade: Full 180° caudal spread, clean fin branching/proportion, 
+                 proper body shape (Bullet/Regular), clean dorsal/anal/ventral/pectoral fins, and good color.
+    - Material Grade: Good color coverage and high-tier form features, but minor form flaws or spoonhead.
+    - Pet Grade: Lacks core form criteria or key show traits.
+    """
+    passed_fin_checks = sum([
+        caudal_180,
+        caudal_prop,
+        dorsal_good,
+        anal_good,
+        ventral_good,
+        pectoral_good
+    ])
+    
+    # Show Grade: Strict form standards met
+    if (caudal_180 and 
+        caudal_prop and 
+        body_shape in ["Bullet Head", "Regular"] and 
+        passed_fin_checks >= 5 and 
+        color_good):
+        return "Show Grade"
+    # Material Grade: Strong breeding/color potential with minor physical limitations
+    elif (caudal_180 or caudal_prop or passed_fin_checks >= 3) and color_good:
+        return "Material Grade"
+    # Pet Grade: Standard pet quality
+    else:
+        return "Pet Grade"
+
+
 def render_breeder_page():
     st.title("🐟 Betta Breeder Management")
 
@@ -35,6 +67,7 @@ def render_breeder_page():
             col1, col2 = st.columns(2)
             
             with col1:
+                st.markdown("### 📋 Basic Info")
                 sex = st.selectbox("Sex", ["Male", "Female"])
                 
                 # Color / Pattern Class dropdown selector
@@ -46,23 +79,59 @@ def render_breeder_page():
                     custom_pattern = st.text_input("Specify Other Pattern", placeholder="e.g. Black Star")
                     
                 lineage = st.text_input("Lineage / Breeder Source", placeholder="e.g. Peter Suson")
-            
-            with col2:
                 dob = st.date_input("Date of Birth / Age", datetime.date.today())
-                notes = st.text_area("Notes / Traits", placeholder="e.g. Big caudal 180 degrees, active swimmer")
                 photo_file = st.file_uploader("Upload Breeder Photo", type=["jpg", "jpeg", "png"])
 
-            submit = st.form_submit_button("📷 Register Breeder & Upload")
+            with col2:
+                st.markdown("### 🏆 Form Evaluation Criteria")
+                
+                caudal_180 = st.checkbox("Caudal Fin Spread 180°", value=True)
+                caudal_prop = st.checkbox("Caudal Fin Proportion (Good branching, no damage)", value=True)
+                dorsal_good = st.checkbox("Dorsal Fin Structure (Broad base & clean overlapping)", value=True)
+                anal_good = st.checkbox("Anal Fin Structure (Parallel & proper length)", value=True)
+                ventral_good = st.checkbox("Ventral Fins (Straight, broad, no curl)", value=True)
+                pectoral_good = st.checkbox("Pectoral Fins (Full & undamaged)", value=True)
+                
+                body_shape = st.selectbox(
+                    "Body Shape", 
+                    ["Bullet Head", "Regular", "Spoonhead"]
+                )
+                
+                color_good = st.checkbox("Good Color / Pattern Coverage", value=True)
+
+                notes = st.text_area("Notes / Traits", placeholder="e.g. Active swimmer, sharp caudal ray edges")
+
+            submit = st.form_submit_button("📷 Register Breeder & Evaluate Grade")
 
         if submit:
-            # Determine the selected pattern class
+            # Determine selected color pattern
             selected_pattern = custom_pattern.strip() if pattern_class == "Others" else pattern_class
             
+            # Auto-calculate the fish classification
+            grade = evaluate_grade(
+                caudal_180=caudal_180,
+                caudal_prop=caudal_prop,
+                dorsal_good=dorsal_good,
+                anal_good=anal_good,
+                ventral_good=ventral_good,
+                pectoral_good=pectoral_good,
+                body_shape=body_shape,
+                color_good=color_good
+            )
+
             if not selected_pattern or not lineage:
                 st.error("Please fill in the Color / Pattern Class and Lineage fields.")
             else:
-                # Format standard variety value with hardcoded HMKP tail type
                 full_variety = f"HMKP - {selected_pattern}"
+                
+                # Format evaluation results into the notes field for logging
+                form_summary = (
+                    f"Grade: {grade} | Head: {body_shape} | "
+                    f"180°: {'Yes' if caudal_180 else 'No'}, "
+                    f"Branching: {'Good' if caudal_prop else 'Damaged/Poor'}, "
+                    f"Color: {'Good' if color_good else 'Fair'}"
+                )
+                full_notes = f"[{form_summary}] {notes}".strip()
 
                 with st.spinner("Uploading photos to Google Drive..."):
                     result = register_breeder(
@@ -71,10 +140,10 @@ def render_breeder_page():
                         lineage=lineage,
                         dob=str(dob),
                         photo_path=photo_file,
-                        notes=notes
+                        notes=full_notes
                     )
 
-                st.success(f"Registered successfully! Breeder ID: **{result['breeder_id']}**")
+                st.success(f"Registered successfully! Breeder ID: **{result['breeder_id']}** | Grade: **{grade}**")
                 
                 c1, c2 = st.columns(2)
                 with c1:
@@ -84,7 +153,7 @@ def render_breeder_page():
                 with c2:
                     st.subheader("Breeder Photo")
                     if photo_file:
-                        st.image(photo_file, caption=f"{full_variety} ({sex})", width=300)
+                        st.image(photo_file, caption=f"{full_variety} ({sex}) — {grade}", width=300)
 
     # TAB 2: BREEDER GALLERY / INVENTORY
     with tab2:
