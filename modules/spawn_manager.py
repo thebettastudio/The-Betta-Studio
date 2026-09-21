@@ -171,6 +171,7 @@ def get_breeder_details_map():
             continue
         breeder_id = row[0]
 
+        # Column map:
         # Col A (0): ID | Col B (1): Sex | Col C (2): Variety | Col D (3): Status
         # Col E (4): Tank | Col F (5): Grade | Col G (6): Photo ID / Image URL | Col H (7): Notes
         photo_val = row[6] if len(row) > 6 else ""
