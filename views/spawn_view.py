@@ -13,22 +13,21 @@ from modules.spawn_manager import (
 
 def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
     """
-    Sources and renders breeder images.
-    Converts Google Drive view links or raw File IDs to direct thumbnail URLs 
-    and displays a formatted placeholder if no image source is found.
+    Sources and renders breeder images as styled HTML.
+    Applies the global `.spawn-card-img` CSS class to ensure correct sizing and glow effects.
     """
     if not image_url or not isinstance(image_url, str):
         st.markdown(
             f"""
             <div style="
-                border: 2px dashed #e0e0e0; 
+                border: 2px dashed #2A303F; 
                 border-radius: 8px; 
-                padding: 24px 10px; 
+                padding: 12px; 
                 text-align: center; 
-                background-color: #fafafa; 
-                margin-bottom: 12px;">
-                <span style="font-size: 32px;">🐟</span><br/>
-                <span style="color: #888888; font-size: 13px; font-weight: 500;">No {gender_label} Image Sourced</span>
+                background-color: #1A1D24; 
+                margin-bottom: 8px;">
+                <span style="font-size: 20px;">🐟</span><br/>
+                <span style="color: #888888; font-size: 11px; font-weight: 500;">No {gender_label} Image</span>
             </div>
             """, 
             unsafe_allow_html=True
@@ -50,28 +49,28 @@ def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
     elif re.match(r'^[a-zA-Z0-9_-]{25,50}$', url):
         file_id = url
 
-    # If a Google Drive ID is detected, convert it to a direct high-res thumbnail link
+    # If a Google Drive ID is detected, convert it to a direct thumbnail link
     if file_id:
         url = f"https://drive.google.com/thumbnail?id={file_id}&sz=w800"
 
-    # Render image source
+    # Render image using raw HTML to leverage `.spawn-card-img` styling
     if url.startswith("http://") or url.startswith("https://"):
-        try:
-            st.image(url, use_container_width=True)
-        except Exception:
-            st.warning(f"⚠️ Unable to load {gender_label} image from source URL.")
+        st.markdown(
+            f'<img src="{url}" class="spawn-card-img" alt="{gender_label} Betta" />',
+            unsafe_allow_html=True
+        )
     else:
         st.markdown(
             f"""
             <div style="
-                border: 2px dashed #e0e0e0; 
+                border: 2px dashed #2A303F; 
                 border-radius: 8px; 
-                padding: 24px 10px; 
+                padding: 12px; 
                 text-align: center; 
-                background-color: #fafafa; 
-                margin-bottom: 12px;">
-                <span style="font-size: 32px;">🖼️</span><br/>
-                <span style="color: #888888; font-size: 13px; font-weight: 500;">Invalid {gender_label} Image Source</span>
+                background-color: #1A1D24; 
+                margin-bottom: 8px;">
+                <span style="font-size: 20px;">🖼️</span><br/>
+                <span style="color: #888888; font-size: 11px; font-weight: 500;">Invalid Source</span>
             </div>
             """, 
             unsafe_allow_html=True
@@ -132,7 +131,6 @@ def render_spawn_page():
                     # --- Male Breeder Image & Details ---
                     with col_male:
                         st.markdown("#### ♂️ Male Breeder")
-                        # Priority check: 'photo_id' from breeder registry, then fallbacks
                         male_img_src = (
                             male.get("photo_id") or 
                             male.get("image_url") or 
@@ -148,7 +146,6 @@ def render_spawn_page():
                     # --- Female Breeder Image & Details ---
                     with col_female:
                         st.markdown("#### ♀️ Female Breeder")
-                        # Priority check: 'photo_id' from breeder registry, then fallbacks
                         female_img_src = (
                             female.get("photo_id") or 
                             female.get("image_url") or 
