@@ -125,48 +125,45 @@ def render_spawn_page():
 
                     st.divider()
 
-                    # Side-by-side Breeder Cards
-                    col_male, col_female = st.columns(2)
+                    # 4 Columns Layout:
+                    # Col 1: Male Info | Col 2: Male Image | Col 3: Female Info | Col 4: Female Image
+                    col_male_info, col_male_img, col_female_info, col_female_img = st.columns([2, 1, 2, 1])
 
-                    # --- Male Breeder Image & Details ---
-                    with col_male:
+                    # --- Column 1: Male Info ---
+                    with col_male_info:
                         st.markdown("#### ♂️ Male Breeder")
-                        img_col, info_col = st.columns([1, 3])
-                        
-                        with img_col:
-                            male_img_src = (
-                                male.get("photo_id") or 
-                                male.get("image_url") or 
-                                male.get("image") or 
-                                male.get("photo") or 
-                                ""
-                            )
-                            display_breeder_image(male_img_src, gender_label="Male")
-                            
-                        with info_col:
-                            st.markdown(f"**ID:** `{male.get('id', spawn['male_id'])}`")
-                            st.markdown(f"**Variety:** {male.get('variety', 'N/A')}")
-                            st.markdown(f"**Grade:** `{male.get('grade', 'N/A')}`")
+                        st.markdown(f"**ID:** `{male.get('id', spawn['male_id'])}`")
+                        st.markdown(f"**Variety:** {male.get('variety', 'N/A')}")
+                        st.markdown(f"**Grade:** `{male.get('grade', 'N/A')}`")
 
-                    # --- Female Breeder Image & Details ---
-                    with col_female:
+                    # --- Column 2: Male Picture ---
+                    with col_male_img:
+                        male_img_src = (
+                            male.get("photo_id") or 
+                            male.get("image_url") or 
+                            male.get("image") or 
+                            male.get("photo") or 
+                            ""
+                        )
+                        display_breeder_image(male_img_src, gender_label="Male")
+
+                    # --- Column 3: Female Info ---
+                    with col_female_info:
                         st.markdown("#### ♀️ Female Breeder")
-                        img_col, info_col = st.columns([1, 3])
-                        
-                        with img_col:
-                            female_img_src = (
-                                female.get("photo_id") or 
-                                female.get("image_url") or 
-                                female.get("image") or 
-                                female.get("photo") or 
-                                ""
-                            )
-                            display_breeder_image(female_img_src, gender_label="Female")
-                            
-                        with info_col:
-                            st.markdown(f"**ID:** `{female.get('id', spawn['female_id'])}`")
-                            st.markdown(f"**Variety:** {female.get('variety', 'N/A')}")
-                            st.markdown(f"**Grade:** `{female.get('grade', 'N/A')}`")
+                        st.markdown(f"**ID:** `{female.get('id', spawn['female_id'])}`")
+                        st.markdown(f"**Variety:** {female.get('variety', 'N/A')}")
+                        st.markdown(f"**Grade:** `{female.get('grade', 'N/A')}`")
+
+                    # --- Column 4: Female Picture ---
+                    with col_female_img:
+                        female_img_src = (
+                            female.get("photo_id") or 
+                            female.get("image_url") or 
+                            female.get("image") or 
+                            female.get("photo") or 
+                            ""
+                        )
+                        display_breeder_image(female_img_src, gender_label="Female")
 
                     st.divider()
 
