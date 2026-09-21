@@ -1,61 +1,97 @@
+# views/breeder_view.py
 import streamlit as st
-import tempfile
-import os
-from modules.breeder_registry import register_breeder
+import datetime
+from modules.breeder_registry import register_breeder, get_all_breeders
 
 def render_breeder_page():
-    st.header("🧬 Breeder Registry (Parent Stock)")
-    st.caption("Register male and female breeders, generate tank QR tags, and sync photos to Google Drive.")
+    st.title("🐟 Betta Breeder Management")
 
-    with st.form("register_breeder_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
+    tab1, tab2 = st.tabs(["➕ Register New Breeder", "📋 Breeder Gallery & Inventory"])
 
-        with col1:
-            sex = st.selectbox("Sex", ["Male", "Female"])
-            variety = st.text_input("Variety / Pattern", placeholder="e.g. Avatar Black Star HMPK")
-            lineage = st.text_input("Lineage / Origin", placeholder="e.g. Line A - Grand Champion Sire")
+    # TAB 1: REGISTER BREEDER
+    with tab1:
+        st.subheader("Register a New Breeder")
+        
+        with st.form("register_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                sex = st.selectbox("Sex", ["Male", "Female"])
+                variety = st.text_input("Variety / Tail Type", placeholder="e.g. Yellow Koi Galaxy, Halfmoon")
+                lineage = st.text_input("Lineage / Breeder Source", placeholder="e.g. Peter Suson")
+            
+            with col2:
+                dob = st.date_input("Date of Birth / Age", datetime.date.today())
+                notes = st.text_area("Notes / Traits", placeholder="e.g. Big caudal 180 degrees, active swimmer")
+                photo_file = st.file_uploader("Upload Breeder Photo", type=["jpg", "jpeg", "png"])
 
-        with col2:
-            dob = st.date_input("Date of Birth / Hatch Date")
-            notes = st.text_area("Notes & Traits", placeholder="Iridescence, tail spread, aggression score...")
-
-        uploaded_photo = st.file_uploader("Upload Breeder Photo", type=["jpg", "jpeg", "png"])
-
-        submit = st.form_submit_button("📷 Register Breeder & Upload")
+            submit = st.form_submit_button("📷 Register Breeder & Upload")
 
         if submit:
-            if not uploaded_photo:
-                st.error("Please upload a photo of the breeder.")
-            elif not variety:
-                st.error("Please specify the variety/pattern.")
+            if not variety or not lineage:
+                st.error("Please fill in the Variety and Lineage fields.")
             else:
-                with st.spinner("Uploading photo to Google Drive and generating QR code..."):
-                    # Save temporarily to local disk so drive script can process it
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
-                        tmp_file.write(uploaded_photo.getvalue())
-                        tmp_path = tmp_file.name
+                with st.spinner("Uploading photos and saving breeder details..."):
+                    result = register_breeder(
+                        sex=sex,
+                        variety=variety,
+                        lineage=lineage,
+                        dob=str(dob),
+                        photo_path=photo_file,
+                        notes=notes
+                    )
 
-                    try:
-                        result = register_breeder(
-                            sex=sex,
-                            variety=variety,
-                            lineage=lineage,
-                            dob=str(dob),
-                            photo_path=tmp_path,
-                            notes=notes
-                        )
+                st.success(f"Registered successfully! Breeder ID: **{result['breeder_id']}**")
+                
+                # Show images inline directly in Streamlit instead of external Google Drive links!
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.subheader("Tank Tag QR Code")
+                    if photo_file:
+                        st.image(result['qr_url'], width=220)
+                with c2:
+                    st.subheader("Breeder Photo")
+                    if photo_file:
+                        st.image(photo_file, caption=f"{variety} ({sex})", width=300)
 
-                        st.success(f"Registered successfully! Breeder ID: **{result['breeder_id']}**")
+    # TAB 2: BREEDER GALLERY / INVENTORY
+    with tab2:
+        st.subheader("Registered Breeders")
+        if st.button("🔄 Refresh Gallery"):
+            st.rerun()
 
-                        # Display generated QR Code & Links
-                        qr_col, img_col = st.columns(2)
-                        with qr_col:
-                            st.write("### Tank Tag QR Code")
-                            st.markdown(f"[View in Google Drive]({result['qr_url']})")
-                        with img_col:
-                            st.write("### Breeder Photo")
-                            st.markdown(f"[View in Google Drive]({result['photo_url']})")
+        breeders = get_all_breeders()
+        if not breeders:
+            st.info("No breeders registered yet. Add your first breeder in the Registration tab!")
+        else:
+            # Filter by Sex or Search
+            search_query = st.text_input("🔍 Search by ID, Variety, or Lineage:", "")
+            
+            filtered = [
+                b for b in breeders
+                if search_query.lower() in b['id'].lower()
+                or search_query.lower() in b['variety'].lower()
+                or search_query.lower() in b['lineage'].lower()
+            ]
 
-                    finally:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
+            # Display as visual cards in a grid
+            cols = st.columns(3)
+            for idx, b in enumerate(filtered):
+                with cols[idx % 3]:
+                    with st.container(border=True):
+                        st.markdown(f"### {b['id']}")
+                        st.caption(f"**Sex:** {b['sex']} | **Status:** `{b['status']}`")
+                        st.write(f"**Variety:** {b['variety']}")
+                        st.write(f"**Lineage:** {b['lineage']}")
+                        st.write(f"**DOB:** {b['dob']}")
+                        
+                        if b['notes']:
+                            st.info(f"**Notes:** {b['notes']}")
+                        
+                        # Render photo directly if image URL exists
+                        if b['photo_id']:
+                            # Direct Google Drive thumbnail view URL for Streamlit
+                            img_src = f"https://drive.google.com/thumbnail?id={b['photo_id']}&sz=w600"
+                            st.image(img_src, use_container_width=True)
+                        else:
+                            st.caption("📷 *No Photo Available*")
