@@ -14,7 +14,7 @@ from modules.spawn_manager import (
 def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
     """
     Sources and renders breeder images as styled HTML.
-    Applies the global `.spawn-card-img` CSS class to ensure correct sizing and glow effects.
+    Forces image styling to expand and fit 100% of its parent column width.
     """
     if not image_url or not isinstance(image_url, str):
         st.markdown(
@@ -25,7 +25,8 @@ def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
                 padding: 12px; 
                 text-align: center; 
                 background-color: #1A1D24; 
-                margin-bottom: 8px;">
+                margin-bottom: 8px;
+                width: 100%;">
                 <span style="font-size: 20px;">🐟</span><br/>
                 <span style="color: #888888; font-size: 11px; font-weight: 500;">No {gender_label} Image</span>
             </div>
@@ -53,10 +54,10 @@ def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
     if file_id:
         url = f"https://drive.google.com/thumbnail?id={file_id}&sz=w800"
 
-    # Render image using raw HTML to leverage `.spawn-card-img` styling
+    # Render image styled to fill 100% width of the column
     if url.startswith("http://") or url.startswith("https://"):
         st.markdown(
-            f'<img src="{url}" class="spawn-card-img" alt="{gender_label} Betta" />',
+            f'<img src="{url}" class="spawn-card-img" style="width: 100%; max-width: 100%; height: auto; aspect-ratio: 1/1; object-fit: cover; border-radius: 8px;" alt="{gender_label} Betta" />',
             unsafe_allow_html=True
         )
     else:
@@ -68,7 +69,8 @@ def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
                 padding: 12px; 
                 text-align: center; 
                 background-color: #1A1D24; 
-                margin-bottom: 8px;">
+                margin-bottom: 8px;
+                width: 100%;">
                 <span style="font-size: 20px;">🖼️</span><br/>
                 <span style="color: #888888; font-size: 11px; font-weight: 500;">Invalid Source</span>
             </div>
@@ -125,8 +127,8 @@ def render_spawn_page():
 
                     st.divider()
 
-                    # 4-Column Layout: Male Info | Male Picture | Female Info | Female Picture
-                    col_m_info, col_m_img, col_f_info, col_f_img = st.columns([2, 1, 2, 1])
+                    # 4-Column Layout: Male Info (Col 1) | Male Img (Col 2) | Female Info (Col 3) | Female Img (Col 4)
+                    col_m_info, col_m_img, col_f_info, col_f_img = st.columns([2, 1.5, 2, 1.5])
 
                     # --- Column 1: Male Details ---
                     with col_m_info:
@@ -135,7 +137,7 @@ def render_spawn_page():
                         st.markdown(f"**Variety:** {male.get('variety', 'N/A')}")
                         st.markdown(f"**Grade:** `{male.get('grade', 'N/A')}`")
 
-                    # --- Column 2: Male Picture ---
+                    # --- Column 2: Male Picture (Fills column width) ---
                     with col_m_img:
                         male_img_src = (
                             male.get("photo_id") or 
@@ -153,7 +155,7 @@ def render_spawn_page():
                         st.markdown(f"**Variety:** {female.get('variety', 'N/A')}")
                         st.markdown(f"**Grade:** `{female.get('grade', 'N/A')}`")
 
-                    # --- Column 4: Female Picture ---
+                    # --- Column 4: Female Picture (Fills column width) ---
                     with col_f_img:
                         female_img_src = (
                             female.get("photo_id") or 
