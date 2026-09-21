@@ -1,3 +1,4 @@
+import re
 import datetime
 import streamlit as st
 from modules.spawn_manager import (
@@ -12,32 +13,66 @@ from modules.spawn_manager import (
 
 def display_breeder_image(image_url: str):
     """
-    Safely renders breeder images.
-    Prevents MediaFileStorageError when image_url is missing, a raw Google Drive ID, 
-    or an invalid file path.
+    Safely renders breeder images with support for Google Drive link formats 
+    and displays a styled placeholder card if no valid image exists.
     """
     if not image_url or not isinstance(image_url, str):
-        st.info("🖼️ No image available")
+        st.markdown(
+            """
+            <div style="
+                border: 2px dashed #e0e0e0; 
+                border-radius: 8px; 
+                padding: 24px 10px; 
+                text-align: center; 
+                background-color: #fafafa; 
+                margin-bottom: 12px;">
+                <span style="font-size: 32px;">🐟</span><br/>
+                <span style="color: #888888; font-size: 13px; font-weight: 500;">No Photo Uploaded</span>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
         return
 
     url = image_url.strip()
 
-    # Convert raw Google Drive view links to direct viewable web URLs
+    # 1. Extract Google Drive ID from various share link patterns
+    file_id = None
     if "drive.google.com/file/d/" in url:
         file_id = url.split("/d/")[1].split("/")[0]
-        url = f"https://drive.google.com/uc?id={file_id}"
     elif "drive.google.com/open?id=" in url:
         file_id = url.split("id=")[1].split("&")[0]
-        url = f"https://drive.google.com/uc?id={file_id}"
+    elif "drive.google.com/uc?id=" in url:
+        file_id = url.split("id=")[1].split("&")[0]
+    elif re.match(r'^[a-zA-Z0-9_-]{25,50}$', url):
+        file_id = url
 
-    # Only pass to st.image if it is a valid web URL
+    # Convert Drive ID to high-resolution direct thumbnail URL
+    if file_id:
+        url = f"https://drive.google.com/thumbnail?id={file_id}&sz=w800"
+
+    # 2. Render image if valid HTTP/HTTPS URL
     if url.startswith("http://") or url.startswith("https://"):
         try:
             st.image(url, use_container_width=True)
         except Exception:
-            st.warning("⚠️ Image could not be loaded")
+            st.warning("⚠️ Image URL failed to load.")
     else:
-        st.caption("ℹ️ Invalid image link")
+        st.markdown(
+            """
+            <div style="
+                border: 2px dashed #e0e0e0; 
+                border-radius: 8px; 
+                padding: 24px 10px; 
+                text-align: center; 
+                background-color: #fafafa; 
+                margin-bottom: 12px;">
+                <span style="font-size: 32px;">🖼️</span><br/>
+                <span style="color: #888888; font-size: 13px; font-weight: 500;">Invalid Image URL</span>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
 
 
 def render_spawn_page():
