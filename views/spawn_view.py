@@ -10,6 +10,36 @@ from modules.spawn_manager import (
     mark_pairing_failed
 )
 
+def display_breeder_image(image_url: str):
+    """
+    Safely renders breeder images.
+    Prevents MediaFileStorageError when image_url is missing, a raw Google Drive ID, 
+    or an invalid file path.
+    """
+    if not image_url or not isinstance(image_url, str):
+        st.info("🖼️ No image available")
+        return
+
+    url = image_url.strip()
+
+    # Convert raw Google Drive view links to direct viewable web URLs
+    if "drive.google.com/file/d/" in url:
+        file_id = url.split("/d/")[1].split("/")[0]
+        url = f"https://drive.google.com/uc?id={file_id}"
+    elif "drive.google.com/open?id=" in url:
+        file_id = url.split("id=")[1].split("&")[0]
+        url = f"https://drive.google.com/uc?id={file_id}"
+
+    # Only pass to st.image if it is a valid web URL
+    if url.startswith("http://") or url.startswith("https://"):
+        try:
+            st.image(url, use_container_width=True)
+        except Exception:
+            st.warning("⚠️ Image could not be loaded")
+    else:
+        st.caption("ℹ️ Invalid image link")
+
+
 def render_spawn_page():
     st.title("🧬 Pair & Spawn Tracker")
 
@@ -63,16 +93,14 @@ def render_spawn_page():
 
                     with col_male:
                         st.markdown("#### ♂️ Male Breeder")
-                        if male.get("image_url"):
-                            st.image(male["image_url"], use_container_width=True)
+                        display_breeder_image(male.get("image_url", ""))
                         st.markdown(f"**ID:** `{male.get('id', spawn['male_id'])}`")
                         st.markdown(f"**Variety:** {male.get('variety', 'N/A')}")
                         st.markdown(f"**Grade:** `{male.get('grade', 'N/A')}`")
 
                     with col_female:
                         st.markdown("#### ♀️ Female Breeder")
-                        if female.get("image_url"):
-                            st.image(female["image_url"], use_container_width=True)
+                        display_breeder_image(female.get("image_url", ""))
                         st.markdown(f"**ID:** `{female.get('id', spawn['female_id'])}`")
                         st.markdown(f"**Variety:** {female.get('variety', 'N/A')}")
                         st.markdown(f"**Grade:** `{female.get('grade', 'N/A')}`")
