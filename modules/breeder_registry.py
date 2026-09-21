@@ -52,6 +52,7 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     file_id = uploaded.get('id')
     web_link = uploaded.get('webViewLink')
 
+    # Grant public read access so Streamlit can render the thumbnail directly
     try:
         drive_service.permissions().create(
             fileId=file_id,
@@ -65,9 +66,8 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
 def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     """
     1. Generates a unique Breeder ID.
-    2. Creates and uploads a QR Code image to Drive.
-    3. Uploads the breeder photo to Drive.
-    4. Records the breeder row in Google Sheets ('Breeders' tab).
+    2. Uploads QR Code and Photo directly to Google Drive.
+    3. Saves raw Drive File IDs in Google Sheets.
     """
     drive_service, sheets_service = get_google_services()
 
@@ -75,7 +75,7 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     breeder_id = f"{prefix}-{timestamp}"
 
-    # 1. Upload Photo (if provided)
+    # 1. Upload Photo to Drive
     photo_id, photo_url = "", ""
     if photo_path:
         try:
@@ -84,7 +84,7 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
         except Exception as e:
             print(f"Warning: Photo upload failed: {e}")
 
-    # 2. Upload QR Code
+    # 2. Upload QR Code to Drive
     qr_id, qr_url = "", ""
     try:
         qr_stream = generate_qr_code(breeder_id)
@@ -93,12 +93,10 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     except Exception as e:
         print(f"Warning: QR upload failed: {e}")
 
-    photo_cell = f'=HYPERLINK("{photo_url}", "View Photo")' if photo_url else "No Photo"
-    qr_cell = f'=HYPERLINK("{qr_url}", "View QR")' if qr_url else "No QR"
-
     dob_str = str(dob) if dob else ""
     date_registered = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # Store raw Drive IDs directly in columns G and H
     row = [
         breeder_id,            # A: Breeder ID
         sex.capitalize(),      # B: Sex
@@ -106,8 +104,8 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
         lineage,               # D: Lineage / Breeder
         dob_str,               # E: DOB
         "Available",           # F: Status
-        photo_cell,            # G: Photo Link
-        qr_cell,               # H: QR Code Link
+        photo_id,              # G: Raw Photo File ID
+        qr_id,                 # H: Raw QR Code File ID
         notes,                 # I: Notes
         date_registered        # J: Date Registered
     ]
@@ -124,36 +122,39 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
 
     return {
         "breeder_id": breeder_id,
-        "photo_url": photo_url,
-        "qr_url": qr_url,
+        "photo_id": photo_id,
+        "qr_id": qr_id,
         "direct_photo_url": direct_photo_url,
         "direct_qr_url": direct_qr_url
     }
 
-def extract_file_id(val):
-    """Robustly extracts a Google Drive File ID from formulas, URLs, or plain strings."""
-    if not val:
+def clean_drive_id(val):
+    """Cleans up formula leftovers or extracts plain Drive File IDs."""
+    if not val or "No Photo" in val or "No QR" in val:
         return ""
     
-    match_id = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', val)
-    if match_id:
-        return match_id.group(1)
-        
-    match_d = re.search(r'/d/([a-zA-Z0-9_-]+)', val)
-    if match_d:
-        return match_d.group(1)
-        
+    match = re.search(r'([a-zA-Z0-9_-]{25,})', val)
+    if match:
+        return match.group(1)
     return ""
 
+def format_excel_date(date_val):
+    """Converts Excel serial dates (e.g. 46286) to YYYY-MM-DD."""
+    try:
+        val = float(date_val)
+        base_date = datetime.datetime(1899, 12, 30)
+        return (base_date + datetime.timedelta(days=val)).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return str(date_val)
+
 def get_all_breeders():
-    """Fetches all registered breeders from Google Sheets for the Streamlit Gallery."""
+    """Fetches all registered breeders from Google Sheets."""
     _, sheets_service = get_google_services()
     
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Breeders!A2:J',
-            valueRenderOption='FORMULA'
+            range='Breeders!A2:J'
         ).execute()
         
         rows = result.get('values', [])
@@ -163,20 +164,21 @@ def get_all_breeders():
             if not row or len(row) == 0:
                 continue
 
-            photo_val = str(row[6]) if len(row) > 6 else ""
-            qr_val = str(row[7]) if len(row) > 7 else ""
+            # Ensure all columns exist up to J
+            while len(row) < 10:
+                row.append("")
 
             breeders.append({
-                "id": str(row[0]) if len(row) > 0 else "",
-                "sex": str(row[1]) if len(row) > 1 else "",
-                "variety": str(row[2]) if len(row) > 2 else "",
-                "lineage": str(row[3]) if len(row) > 3 else "",
-                "dob": str(row[4]) if len(row) > 4 else "",
-                "status": str(row[5]) if len(row) > 5 else "Available",
-                "photo_id": extract_file_id(photo_val),
-                "qr_id": extract_file_id(qr_val),
-                "notes": str(row[8]) if len(row) > 8 else "",
-                "date_registered": str(row[9]) if len(row) > 9 else ""
+                "id": str(row[0]),
+                "sex": str(row[1]),
+                "variety": str(row[2]),
+                "lineage": str(row[3]),
+                "dob": format_excel_date(row[4]),
+                "status": str(row[5]) if row[5] else "Available",
+                "photo_id": clean_drive_id(str(row[6])),
+                "qr_id": clean_drive_id(str(row[7])),
+                "notes": str(row[8]),
+                "date_registered": str(row[9])
             })
             
         return breeders
