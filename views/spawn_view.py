@@ -2,92 +2,167 @@
 import datetime
 import streamlit as st
 from modules.spawn_manager import (
+    get_available_breeders,
+    get_all_spawns,
     get_active_pairings_with_details,
+    create_new_spawn,
     mark_pairing_success_pending,
     mark_free_swimming,
     mark_pairing_failed
 )
 
-def render_active_pairings_view():
-    st.title("🐟 Currently Paired Fish")
+def render_spawn_page():
+    st.title("🧬 Pair & Spawn Tracker")
 
-    active_pairs = get_active_pairings_with_details()
+    tab1, tab2, tab3 = st.tabs([
+        "💞 Active Pairings", 
+        "➕ Start New Pairing", 
+        "📜 All Spawn History"
+    ])
 
-    if not active_pairs:
-        st.info("No fish are currently in active pairing.")
-        return
+    # ==========================================
+    # TAB 1: ACTIVE PAIRINGS (WITH BREEDER DETAILS)
+    # ==========================================
+    with tab1:
+        st.subheader("Currently Active Pairings")
+        
+        if st.button("🔄 Refresh Active Pairs", key="btn_refresh_spawns"):
+            st.rerun()
 
-    for item in active_pairs:
-        spawn = item["spawn"]
-        male = item["male"]
-        female = item["female"]
+        active_pairs = get_active_pairings_with_details()
 
-        spawn_id = spawn["id"]
-        status = spawn["status"]
-        pairing_date = spawn["pairing_date"]
+        if not active_pairs:
+            st.info("No active pairings at the moment. Start a new pair in the 'Start New Pairing' tab!")
+        else:
+            for item in active_pairs:
+                spawn = item["spawn"]
+                male = item["male"]
+                female = item["female"]
 
-        # Calculate days together
-        try:
-            days_paired = (datetime.date.today() - datetime.date.fromisoformat(pairing_date)).days
-        except Exception:
-            days_paired = 0
+                spawn_id = spawn["id"]
+                status = spawn["status"]
+                pairing_date = spawn["pairing_date"]
 
-        with st.container(border=True):
-            # Banner Header
-            st.markdown(f"### 🧪 Spawn Record: `{spawn_id}`")
-            st.caption(f"📍 **Tank:** {spawn['tank']} | 📅 **Paired Date:** {pairing_date} ({days_paired} days active) | 🏷️ **Status:** `{status}`")
+                try:
+                    days_paired = (datetime.date.today() - datetime.date.fromisoformat(pairing_date)).days
+                except Exception:
+                    days_paired = 0
 
-            if spawn.get("line_goal"):
-                st.write(f"🎯 **Goal:** {spawn['line_goal']}")
+                with st.container(border=True):
+                    # Header Info
+                    st.markdown(f"### 🧪 Spawn: `{spawn_id}`")
+                    st.caption(f"📍 **Tank:** {spawn['tank']} | 📅 **Paired:** {pairing_date} ({days_paired} days ago) | 🏷️ **Status:** `{status}`")
 
-            st.divider()
+                    if spawn.get("line_goal"):
+                        st.write(f"🎯 **Goal:** {spawn['line_goal']}")
+                    if spawn.get("notes"):
+                        st.info(f"**Notes:** {spawn['notes']}")
 
-            # Side-by-side Parent Display
-            col_male, col_female = st.columns(2)
+                    st.divider()
 
-            # MALE BREEDER CARD
-            with col_male:
-                st.markdown("#### ♂️ Male Breeder")
-                if male.get("image_url"):
-                    st.image(male["image_url"], use_container_width=True)
-                
-                st.markdown(f"**ID:** `{male.get('id', spawn['male_id'])}`")
-                st.markdown(f"**Variety:** {male.get('variety', 'N/A')}")
-                st.markdown(f"**Grade:** `{male.get('grade', 'N/A')}`")
+                    # Side-by-side Male & Female Visual Cards
+                    col_male, col_female = st.columns(2)
 
-            # FEMALE BREEDER CARD
-            with col_female:
-                st.markdown("#### ♀️ Female Breeder")
-                if female.get("image_url"):
-                    st.image(female["image_url"], use_container_width=True)
+                    with col_male:
+                        st.markdown("#### ♂️ Male Breeder")
+                        if male.get("image_url"):
+                            st.image(male["image_url"], use_container_width=True)
+                        st.markdown(f"**ID:** `{male.get('id', spawn['male_id'])}`")
+                        st.markdown(f"**Variety:** {male.get('variety', 'N/A')}")
+                        st.markdown(f"**Grade:** `{male.get('grade', 'N/A')}`")
 
-                st.markdown(f"**ID:** `{female.get('id', spawn['female_id'])}`")
-                st.markdown(f"**Variety:** {female.get('variety', 'N/A')}")
-                st.markdown(f"**Grade:** `{female.get('grade', 'N/A')}`")
+                    with col_female:
+                        st.markdown("#### ♀️ Female Breeder")
+                        if female.get("image_url"):
+                            st.image(female["image_url"], use_container_width=True)
+                        st.markdown(f"**ID:** `{female.get('id', spawn['female_id'])}`")
+                        st.markdown(f"**Variety:** {female.get('variety', 'N/A')}")
+                        st.markdown(f"**Grade:** `{female.get('grade', 'N/A')}`")
 
-            # Action Controls
-            st.divider()
-            col_a, col_b, col_c = st.columns(3)
+                    st.divider()
 
-            with col_a:
-                if status == "In Pairing":
-                    if st.button("🥚 Eggs Dropped", key=f"egg_{spawn_id}"):
-                        mark_pairing_success_pending(spawn_id)
-                        st.success("Updated status to Pending (Success)!")
-                        st.rerun()
+                    # Quick Action Controls
+                    st.markdown("##### ⚡ Quick Actions")
+                    col_a, col_b, col_c = st.columns(3)
 
-            with col_b:
-                with st.popover("🏊 Mark Free Swimming"):
-                    batch_name = st.text_input("Batch Name", key=f"batch_{spawn_id}")
-                    fry_cnt = st.number_input("Estimated Fry", min_value=1, value=50, key=f"cnt_{spawn_id}")
-                    if st.button("Confirm Free Swim", key=f"confirm_swim_{spawn_id}"):
-                        if batch_name:
-                            mark_free_swimming(spawn_id, batch_name, fry_cnt)
-                            st.rerun()
+                    with col_a:
+                        if status == "In Pairing":
+                            if st.button("🥚 Eggs Dropped", key=f"egg_{spawn_id}", use_container_width=True):
+                                mark_pairing_success_pending(spawn_id)
+                                st.success("Status updated to Pending (Success)!")
+                                st.rerun()
 
-            with col_c:
-                with st.popover("❌ Mark Failed"):
-                    reason = st.text_input("Reason for Failure", key=f"fail_{spawn_id}")
-                    if st.button("Confirm Failure", key=f"confirm_fail_{spawn_id}"):
-                        mark_pairing_failed(spawn_id, reason)
-                        st.rerun()
+                    with col_b:
+                        with st.popover("🏊 Mark Free Swimming", use_container_width=True):
+                            batch_name = st.text_input("Batch Name", key=f"batch_{spawn_id}")
+                            fry_cnt = st.number_input("Estimated Fry", min_value=1, value=50, key=f"cnt_{spawn_id}")
+                            if st.button("Confirm Free Swim", key=f"confirm_swim_{spawn_id}"):
+                                if batch_name:
+                                    mark_free_swimming(spawn_id, batch_name, fry_cnt)
+                                    st.rerun()
+                                else:
+                                    st.error("Please enter a batch name.")
+
+                    with col_c:
+                        with st.popover("❌ Mark Failed", use_container_width=True):
+                            reason = st.selectbox("Reason", [
+                                "Aggression / Fighting",
+                                "Eaten Eggs",
+                                "Infertility / Unhatched Eggs",
+                                "Fungal / Mold Infection",
+                                "Other"
+                            ], key=f"fail_reason_{spawn_id}")
+                            if st.button("Confirm Failure", key=f"confirm_fail_{spawn_id}", type="primary"):
+                                mark_pairing_failed(spawn_id, reason)
+                                st.rerun()
+
+    # ==========================================
+    # TAB 2: START NEW PAIRING
+    # ==========================================
+    with tab2:
+        st.subheader("Pair Male & Female Breeder")
+        
+        males, females = get_available_breeders()
+
+        if not males or not females:
+            st.warning("You need at least one Available/Conditioning Male AND Female breeder to create a pair.")
+        else:
+            with st.form("new_pairing_form", clear_on_submit=True):
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    male_options = {m["label"]: m["id"] for m in males}
+                    selected_male_label = st.selectbox("Select Male Breeder", list(male_options.keys()))
+                    male_id = male_options[selected_male_label]
+
+                    tank = st.text_input("Tank Location", placeholder="e.g. Tank A1")
+
+                with col2:
+                    female_options = {f["label"]: f["id"] for f in females}
+                    selected_female_label = st.selectbox("Select Female Breeder", list(female_options.keys()))
+                    female_id = female_options[selected_female_label]
+
+                    line_goal = st.text_input("Line / Breeding Goal", placeholder="e.g. Improve caudal spread & clean dorsal")
+
+                notes = st.text_area("Pairing Notes", placeholder="e.g. Both pre-conditioned for 7 days on bloodworms")
+                submit_pair = st.form_submit_button("💞 Initiate Pairing")
+
+            if submit_pair:
+                if not tank:
+                    st.error("Please specify a Tank Location.")
+                else:
+                    with st.spinner("Setting up pairing..."):
+                        spawn_id = create_new_spawn(male_id, female_id, tank, line_goal, notes)
+                    st.success(f"Pairing initiated! Spawn ID: **{spawn_id}**")
+                    st.rerun()
+
+    # ==========================================
+    # TAB 3: ALL SPAWN HISTORY
+    # ==========================================
+    with tab3:
+        st.subheader("All Spawn Records")
+        spawns = get_all_spawns()
+        if spawns:
+            st.dataframe(spawns, use_container_width=True)
+        else:
+            st.info("No spawn history recorded yet.")
