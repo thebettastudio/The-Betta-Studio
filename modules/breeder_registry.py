@@ -26,14 +26,18 @@ def generate_qr_code(breeder_id):
     return img_stream
 
 def upload_to_drive(drive_service, file_data, file_name, mime_type):
-    """Uploads a file directly to the specified Google Drive folder."""
-    metadata = {'name': file_name}
-    
-    # Force upload to target Drive Folder if defined
-    if DRIVE_FOLDER_ID:
-        metadata['parents'] = [DRIVE_FOLDER_ID]
+    """Uploads a file directly to the shared Google Drive folder using parent quota."""
+    if not DRIVE_FOLDER_ID:
+        raise ValueError(
+            "DRIVE_FOLDER_ID is missing! Service accounts cannot store files in their own quota. "
+            "Set DRIVE_FOLDER_ID to a Google Drive folder shared with the Service Account email."
+        )
 
-    # Handle Streamlit UploadedFile, BytesIO, or file paths
+    metadata = {
+        'name': file_name,
+        'parents': [DRIVE_FOLDER_ID]  # Critical: consumes storage from the folder owner's quota
+    }
+
     if isinstance(file_data, str):
         media = MediaFileUpload(file_data, mimetype=mime_type, resumable=False)
     else:
@@ -50,17 +54,19 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     uploaded = drive_service.files().create(
         body=metadata,
         media_body=media,
-        fields='id, webViewLink'
+        fields='id, webViewLink',
+        supportsAllDrives=True
     ).execute()
     
     file_id = uploaded.get('id')
     web_link = uploaded.get('webViewLink')
 
-    # Grant public reader permission so Streamlit & Google Sheets can access the file
+    # Set public read access so Streamlit can load the thumbnails
     try:
         drive_service.permissions().create(
             fileId=file_id,
-            body={'type': 'anyone', 'role': 'reader'}
+            body={'type': 'anyone', 'role': 'reader'},
+            supportsAllDrives=True
         ).execute()
     except Exception as e:
         print(f"Warning: Could not set public permission on file {file_id}: {e}")
