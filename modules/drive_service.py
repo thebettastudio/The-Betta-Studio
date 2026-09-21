@@ -1,8 +1,7 @@
 # modules/drive_service.py
-import os
+import json
 import streamlit as st
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 SCOPES = [
@@ -10,39 +9,19 @@ SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
-SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "YOUR_SPREADSHEET_ID_HERE")
-DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "YOUR_DRIVE_FOLDER_ID_HERE")
+SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")
+DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
 
 def get_google_services():
     """
-    Returns authenticated Drive and Sheets clients.
-    Handles automatic token refresh via google.auth.transport.requests.Request.
+    Returns authenticated Drive and Sheets clients using Service Account credentials.
+    Service Accounts never expire and require no user login or refresh tokens.
     """
-    creds = None
+    if "gcp_service_account" not in st.secrets:
+        raise ValueError("gcp_service_account missing from Streamlit secrets!")
 
-    # 1. Load from Streamlit Cloud Secrets
-    if "google_oauth" in st.secrets:
-        oauth_dict = dict(st.secrets["google_oauth"])
-        creds = Credentials.from_authorized_user_info(oauth_dict, SCOPES)
-
-    # 2. Fallback to local file for local development
-    else:
-        token_path = 'config/token.json' if os.path.exists('config/token.json') else 'token.json'
-        if os.path.exists(token_path):
-            creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-
-    if not creds:
-        raise FileNotFoundError(
-            "Google credentials not found! Configure st.secrets or provide token.json."
-        )
-
-    # 3. Refresh token if expired
-    if creds and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-        except Exception as e:
-            st.error("⚠️ Google OAuth Refresh Error: Your refresh token may be expired or invalid.")
-            raise e
+    service_account_info = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 
     drive_service = build('drive', 'v3', credentials=creds)
     sheets_service = build('sheets', 'v4', credentials=creds)
