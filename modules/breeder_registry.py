@@ -49,14 +49,17 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
         fields='id, webViewLink'
     ).execute()
     
-    return uploaded.get('id'), uploaded.get('webViewLink')
+    # Return both file ID and the direct view link
+    file_id = uploaded.get('id')
+    web_link = uploaded.get('webViewLink')
+    return file_id, web_link
 
 def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     """
     1. Generates a unique Breeder ID.
     2. Creates and uploads a QR Code image to Drive.
     3. Uploads the breeder photo to Drive.
-    4. Records the breeder row in Google Sheets ('Breeders' tab).
+    4. Records the breeder row in Google Sheets ('Breeders' tab) with IMAGE formulas.
     """
     drive_service, sheets_service = get_google_services()
 
@@ -65,35 +68,43 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     breeder_id = f"{prefix}-{timestamp}"
 
     # 1. Upload Photo (if provided)
-    photo_url = ""
+    photo_id, photo_url = "", ""
     if photo_path:
         try:
             photo_name = f"{breeder_id}_photo.jpg"
-            _, photo_url = upload_to_drive(drive_service, photo_path, photo_name, 'image/jpeg')
+            photo_id, photo_url = upload_to_drive(drive_service, photo_path, photo_name, 'image/jpeg')
         except Exception as e:
             print(f"Warning: Photo upload failed: {e}")
 
     # 2. Upload QR Code
-    qr_url = ""
+    qr_id, qr_url = "", ""
     try:
         qr_stream = generate_qr_code(breeder_id)
         qr_name = f"{breeder_id}_QR.png"
-        _, qr_url = upload_to_drive(drive_service, qr_stream, qr_name, 'image/png')
+        qr_id, qr_url = upload_to_drive(drive_service, qr_stream, qr_name, 'image/png')
     except Exception as e:
         print(f"Warning: QR upload failed: {e}")
 
-    # 3. Append to Google Sheets
+    # Construct direct image formula URLs for clean display in Google Sheets
+    photo_cell_val = f'=IMAGE("https://lh3.googleusercontent.com/d/{photo_id}")' if photo_id else photo_url
+    qr_cell_val = f'=IMAGE("https://lh3.googleusercontent.com/d/{qr_id}")' if qr_id else qr_url
+
+    # 3. Format date strings
+    dob_str = str(dob) if dob else ""
+    date_registered = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 4. Row layout aligned strictly to columns A through J
     row = [
-        breeder_id,
-        sex.capitalize(),
-        variety,
-        lineage,
-        dob,
-        "Available",
-        photo_url,
-        qr_url,
-        notes,
-        datetime.datetime.now().isoformat()
+        breeder_id,            # A: Breeder ID
+        sex.capitalize(),      # B: Sex
+        variety,               # C: Variety
+        lineage,               # D: Lineage / Breeder
+        dob_str,               # E: DOB
+        "Available",           # F: Status
+        photo_cell_val,        # G: Photo (Rendered Image)
+        qr_cell_val,           # H: QR Code (Rendered Image)
+        notes,                 # I: Notes
+        date_registered        # J: Date Registered
     ]
 
     sheets_service.spreadsheets().values().append(
