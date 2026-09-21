@@ -31,7 +31,7 @@ def render_breeder_page():
             if not variety or not lineage:
                 st.error("Please fill in the Variety and Lineage fields.")
             else:
-                with st.spinner("Uploading photos and saving breeder details..."):
+                with st.spinner("Uploading photos to Google Drive..."):
                     result = register_breeder(
                         sex=sex,
                         variety=variety,
@@ -86,7 +86,7 @@ def render_breeder_page():
                             st.info(f"**Notes:** {b['notes']}")
                         
                         if b['photo_id']:
-                            img_src = f"https://drive.google.com/thumbnail?id={b['photo_id']}&sz=w600"
+                            img_src = f"https://drive.google.com/thumbnail?id={b['photo_id']}&sz=w800"
                             st.image(img_src, use_container_width=True)
                         else:
                             st.caption("📷 *No Photo Available*")
