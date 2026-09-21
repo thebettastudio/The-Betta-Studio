@@ -1,88 +1,248 @@
-import io
 import datetime
-import streamlit as st
-from views.breeder_view import render_breeder_page
-from views.spawn_view import render_spawn_page
-from views.activity_log_view import render_activity_log_page
-from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
+from modules.drive_service import get_google_services, SPREADSHEET_ID
 
-st.set_page_config(page_title="The Betta Studio", page_icon="🐟", layout="wide")
+# ==========================================
+# 1. READ / FETCH DATA
+# ==========================================
 
-def run_google_diagnostic():
-    """Runs a live health check on Google Drive & Sheets connections."""
-    with st.sidebar.expander("🛠️ System Diagnostics"):
-        if st.button("Test Google Connection", use_container_width=True):
-            with st.status("Testing APIs...", expanded=True) as status:
-                # 1. Test OAuth Credentials
-                try:
-                    st.write("🔐 Refreshing OAuth tokens...")
-                    drive_service, sheets_service = get_google_services()
-                    st.write("✅ Credentials Valid")
-                except Exception as e:
-                    status.update(label="OAuth Failure", state="error")
-                    st.error(f"Authentication failed: {e}")
-                    return
+def get_breeder_details_map():
+    """Fetches all breeders and maps them by Breeder ID for fast lookup."""
+    _, sheets_service = get_google_services()
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Breeders!A2:J'
+    ).execute()
 
-                # 2. Test Google Sheets
-                try:
-                    st.write("📊 Checking Google Sheets...")
-                    result = sheets_service.spreadsheets().values().get(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range='Breeders!A1:J1'
-                    ).execute()
-                    headers = result.get('values', [])
-                    st.write(f"✅ Sheets Accessible ({len(headers[0]) if headers else 0} cols)")
-                except Exception as e:
-                    status.update(label="Sheets Read Failure", state="error")
-                    st.error(f"Spreadsheet error: {e}")
-                    return
+    rows = result.get('values', [])
+    breeders_map = {}
 
-                # 3. Test Google Drive
-                try:
-                    st.write("📁 Testing Drive Upload...")
-                    from googleapiclient.http import MediaIoBaseUpload
-                    test_bytes = f"Test stream {datetime.datetime.now()}".encode('utf-8')
-                    file_stream = io.BytesIO(test_bytes)
-                    
-                    metadata = {'name': 'temp_diagnostic.txt'}
-                    if DRIVE_FOLDER_ID:
-                        metadata['parents'] = [DRIVE_FOLDER_ID.strip()]
+    for idx, row in enumerate(rows, start=2):
+        if not row:
+            continue
+        breeder_id = row[0]
+        breeders_map[breeder_id] = {
+            "row_index": idx,
+            "id": breeder_id,
+            "sex": row[1] if len(row) > 1 else "",
+            "variety": row[2] if len(row) > 2 else "",
+            "grade": row[3] if len(row) > 3 else "N/A",
+            "image_url": row[4] if len(row) > 4 else "",
+            "status": row[5] if len(row) > 5 else "",
+            "tank": row[6] if len(row) > 6 else "",
+            "notes": row[7] if len(row) > 7 else ""
+        }
+    return breeders_map
 
-                    media = MediaIoBaseUpload(file_stream, mimetype='text/plain', resumable=False)
-                    uploaded = drive_service.files().create(
-                        body=metadata,
-                        media_body=media,
-                        fields='id'
-                    ).execute()
 
-                    file_id = uploaded.get('id')
-                    st.write("✅ Drive Upload Successful")
+def get_available_breeders():
+    """Fetches active male and female breeders ready for pairing."""
+    _, sheets_service = get_google_services()
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Breeders!A2:J'
+    ).execute()
 
-                    # Cleanup test file
-                    drive_service.files().delete(fileId=file_id).execute()
-                    st.write("🧹 Test file cleaned up")
-                except Exception as e:
-                    status.update(label="Drive Upload Failure", state="error")
-                    st.error(f"Drive error: {e}")
-                    return
+    rows = result.get('values', [])
+    males, females = [], []
 
-                status.update(label="All Services Operational!", state="complete")
+    for idx, row in enumerate(rows, start=2):
+        if len(row) < 6:
+            continue
+        breeder_id, sex, variety, status = row[0], row[1], row[2], row[5]
 
-# --- Sidebar Navigation ---
-st.sidebar.title("🐟 The Betta Studio")
-page = st.sidebar.radio("Navigation", [
-    "Breeder Registry",
-    "Pair & Spawn Tracker",
-    "Activity Log"
-])
+        if status in ["Available", "Conditioning"]:
+            label = f"{breeder_id} | {variety}"
+            item = {"row_index": idx, "id": breeder_id, "label": label}
+            if sex.lower() == "male":
+                males.append(item)
+            elif sex.lower() == "female":
+                females.append(item)
 
-st.sidebar.markdown("---")
-run_google_diagnostic()
+    return males, females
 
-# --- View Routing ---
-if page == "Breeder Registry":
-    render_breeder_page()
-elif page == "Pair & Spawn Tracker":
-    render_spawn_page()
-elif page == "Activity Log":
-    render_activity_log_page()
+
+def get_all_spawns():
+    """Fetches all spawn records for the UI manager."""
+    _, sheets_service = get_google_services()
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Spawns!A2:L'
+    ).execute()
+
+    rows = result.get('values', [])
+    spawns = []
+
+    for row in rows:
+        if not row:
+            continue
+        spawns.append({
+            "id": row[0] if len(row) > 0 else "",
+            "male_id": row[1] if len(row) > 1 else "",
+            "female_id": row[2] if len(row) > 2 else "",
+            "pairing_date": row[3] if len(row) > 3 else "",
+            "status": row[4] if len(row) > 4 else "In Pairing",
+            "batch_name": row[5] if len(row) > 5 else "",
+            "free_swim_date": row[6] if len(row) > 6 else "",
+            "fry_count": row[7] if len(row) > 7 else "0",
+            "failure_reason": row[8] if len(row) > 8 else "",
+            "tank": row[9] if len(row) > 9 else "",
+            "line_goal": row[10] if len(row) > 10 else "",
+            "notes": row[11] if len(row) > 11 else ""
+        })
+    return spawns
+
+
+def get_active_pairings_with_details():
+    """Fetches active pairings enriched with full breeder details."""
+    all_spawns = get_all_spawns()
+    breeders_map = get_breeder_details_map()
+    
+    active_statuses = ["In Pairing", "Pending (Success)"]
+    active_pairs = []
+
+    for spawn in all_spawns:
+        if spawn.get("status") in active_statuses:
+            male_info = breeders_map.get(spawn["male_id"], {})
+            female_info = breeders_map.get(spawn["female_id"], {})
+            
+            active_pairs.append({
+                "spawn": spawn,
+                "male": male_info,
+                "female": female_info
+            })
+
+    return active_pairs
+
+
+# ==========================================
+# 2. CREATE SPAWN
+# ==========================================
+
+def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goal="", notes=""):
+    """Creates a new Spawn record and sets both parents' statuses to 'In Pairing'."""
+    _, sheets_service = get_google_services()
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    spawn_id = f"SPN-{timestamp}"
+    pairing_date = datetime.date.today().isoformat()
+
+    row = [
+        spawn_id,
+        male_breeder_id,
+        female_breeder_id,
+        pairing_date,
+        "In Pairing",
+        "",  # Batch Name
+        "",  # Free Swim Date
+        0,   # Fry Count
+        "",  # Failure Reason
+        tank_location,
+        line_goal,
+        notes
+    ]
+
+    sheets_service.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Spawns!A:L',
+        valueInputOption='USER_ENTERED',
+        body={'values': [row]}
+    ).execute()
+
+    _update_breeder_status(sheets_service, male_breeder_id, "In Pairing")
+    _update_breeder_status(sheets_service, female_breeder_id, "In Pairing")
+
+    return spawn_id
+
+
+# ==========================================
+# 3. LIFECYCLE STATE TRANSITIONS
+# ==========================================
+
+def mark_pairing_success_pending(spawn_id):
+    """Transition 1: Eggs dropped. Set status to 'Pending (Success)'."""
+    _, sheets_service = get_google_services()
+    row_idx, _ = _find_spawn_by_id(sheets_service, spawn_id)
+    if row_idx:
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f'Spawns!E{row_idx}',
+            valueInputOption='USER_ENTERED',
+            body={'values': [["Pending (Success)"]]}
+        ).execute()
+
+
+def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
+    """Transition 2: Fry free swimming. Sets status and resets parents to 'Available'."""
+    _, sheets_service = get_google_services()
+    row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
+    if row_idx:
+        male_id, female_id = spawn_data[1], spawn_data[2]
+        free_swim_date = datetime.date.today().isoformat()
+
+        update_values = [["Free Swimming", batch_name, free_swim_date, est_fry_count]]
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f'Spawns!E{row_idx}:H{row_idx}',
+            valueInputOption='USER_ENTERED',
+            body={'values': update_values}
+        ).execute()
+
+        _update_breeder_status(sheets_service, male_id, "Available")
+        _update_breeder_status(sheets_service, female_id, "Available")
+
+
+def mark_pairing_failed(spawn_id, failure_reason):
+    """Transition 3: Pairing failed. Logs reason and resets parents to 'Available'."""
+    _, sheets_service = get_google_services()
+    row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
+    if row_idx:
+        male_id, female_id = spawn_data[1], spawn_data[2]
+
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f'Spawns!E{row_idx}',
+            valueInputOption='USER_ENTERED',
+            body={'values': [["Failed"]]}
+        ).execute()
+
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f'Spawns!I{row_idx}',
+            valueInputOption='USER_ENTERED',
+            body={'values': [[failure_reason]]}
+        ).execute()
+
+        _update_breeder_status(sheets_service, male_id, "Available")
+        _update_breeder_status(sheets_service, female_id, "Available")
+
+
+# ==========================================
+# 4. INTERNAL HELPERS
+# ==========================================
+
+def _find_spawn_by_id(sheets_service, spawn_id):
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Spawns!A2:L'
+    ).execute()
+    rows = result.get('values', [])
+    for idx, row in enumerate(rows, start=2):
+        if row and row[0] == spawn_id:
+            return idx, row
+    return None, None
+
+
+def _update_breeder_status(sheets_service, breeder_id, new_status):
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Breeders!A2:F'
+    ).execute()
+    rows = result.get('values', [])
+    for idx, row in enumerate(rows, start=2):
+        if row and row[0] == breeder_id:
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f'Breeders!F{idx}',
+                valueInputOption='USER_ENTERED',
+                body={'values': [[new_status]]}
+            ).execute()
+            break
