@@ -1,6 +1,7 @@
 # modules/breeder_registry.py
 import os
 import io
+import re
 import datetime
 import qrcode
 from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
@@ -124,14 +125,32 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
         "qr_url": qr_url
     }
 
+def extract_file_id(val):
+    """Robustly extracts a Google Drive File ID from formulas, URLs, or plain strings."""
+    if not val:
+        return ""
+    
+    # Matches 'id=1ABC_XYZ' or '/d/1ABC_XYZ'
+    match_id = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', val)
+    if match_id:
+        return match_id.group(1)
+        
+    match_d = re.search(r'/d/([a-zA-Z0-9_-]+)', val)
+    if match_d:
+        return match_d.group(1)
+        
+    return ""
+
 def get_all_breeders():
     """Fetches all registered breeders from Google Sheets for the Streamlit Gallery."""
     _, sheets_service = get_google_services()
     
     try:
+        # Request UNFORMATTED_VALUE so Google Sheets returns raw formulas or URLs
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Breeders!A2:J'
+            range='Breeders!A2:J',
+            valueRenderOption='FORMULA'
         ).execute()
         
         rows = result.get('values', [])
@@ -140,28 +159,21 @@ def get_all_breeders():
         for row in rows:
             if not row or len(row) == 0:
                 continue
-                
-            def extract_file_id(val):
-                if 'id=' in val:
-                    return val.split('id=')[1].split('"')[0].split('&')[0]
-                elif '/d/' in val:
-                    return val.split('/d/')[1].split('"')[0].split('/')[0]
-                return ""
 
-            photo_val = row[6] if len(row) > 6 else ""
-            qr_val = row[7] if len(row) > 7 else ""
+            photo_val = str(row[6]) if len(row) > 6 else ""
+            qr_val = str(row[7]) if len(row) > 7 else ""
 
             breeders.append({
-                "id": row[0] if len(row) > 0 else "",
-                "sex": row[1] if len(row) > 1 else "",
-                "variety": row[2] if len(row) > 2 else "",
-                "lineage": row[3] if len(row) > 3 else "",
-                "dob": row[4] if len(row) > 4 else "",
-                "status": row[5] if len(row) > 5 else "Available",
+                "id": str(row[0]) if len(row) > 0 else "",
+                "sex": str(row[1]) if len(row) > 1 else "",
+                "variety": str(row[2]) if len(row) > 2 else "",
+                "lineage": str(row[3]) if len(row) > 3 else "",
+                "dob": str(row[4]) if len(row) > 4 else "",
+                "status": str(row[5]) if len(row) > 5 else "Available",
                 "photo_id": extract_file_id(photo_val),
                 "qr_id": extract_file_id(qr_val),
-                "notes": row[8] if len(row) > 8 else "",
-                "date_registered": row[9] if len(row) > 9 else ""
+                "notes": str(row[8]) if len(row) > 8 else "",
+                "date_registered": str(row[9]) if len(row) > 9 else ""
             })
             
         return breeders
