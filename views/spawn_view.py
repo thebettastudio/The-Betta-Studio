@@ -11,14 +11,15 @@ from modules.spawn_manager import (
     mark_pairing_failed
 )
 
-def display_breeder_image(image_url: str):
+def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
     """
-    Safely renders breeder images with support for Google Drive link formats 
-    and displays a styled placeholder card if no valid image exists.
+    Sources and renders breeder images.
+    Converts Google Drive view links to direct thumbnail URLs 
+    and displays a formatted placeholder if no image source is found.
     """
     if not image_url or not isinstance(image_url, str):
         st.markdown(
-            """
+            f"""
             <div style="
                 border: 2px dashed #e0e0e0; 
                 border-radius: 8px; 
@@ -27,7 +28,7 @@ def display_breeder_image(image_url: str):
                 background-color: #fafafa; 
                 margin-bottom: 12px;">
                 <span style="font-size: 32px;">🐟</span><br/>
-                <span style="color: #888888; font-size: 13px; font-weight: 500;">No Photo Uploaded</span>
+                <span style="color: #888888; font-size: 13px; font-weight: 500;">No {gender_label} Image Sourced</span>
             </div>
             """, 
             unsafe_allow_html=True
@@ -36,7 +37,7 @@ def display_breeder_image(image_url: str):
 
     url = image_url.strip()
 
-    # 1. Extract Google Drive ID from various share link patterns
+    # Automatically extract file ID from Google Drive URLs
     file_id = None
     if "drive.google.com/file/d/" in url:
         file_id = url.split("/d/")[1].split("/")[0]
@@ -47,19 +48,19 @@ def display_breeder_image(image_url: str):
     elif re.match(r'^[a-zA-Z0-9_-]{25,50}$', url):
         file_id = url
 
-    # Convert Drive ID to high-resolution direct thumbnail URL
+    # If it's a Google Drive ID, convert it to a direct thumbnail source
     if file_id:
         url = f"https://drive.google.com/thumbnail?id={file_id}&sz=w800"
 
-    # 2. Render image if valid HTTP/HTTPS URL
+    # Render image source
     if url.startswith("http://") or url.startswith("https://"):
         try:
             st.image(url, use_container_width=True)
         except Exception:
-            st.warning("⚠️ Image URL failed to load.")
+            st.warning(f"⚠️ Unable to load {gender_label} image from source URL.")
     else:
         st.markdown(
-            """
+            f"""
             <div style="
                 border: 2px dashed #e0e0e0; 
                 border-radius: 8px; 
@@ -68,7 +69,7 @@ def display_breeder_image(image_url: str):
                 background-color: #fafafa; 
                 margin-bottom: 12px;">
                 <span style="font-size: 32px;">🖼️</span><br/>
-                <span style="color: #888888; font-size: 13px; font-weight: 500;">Invalid Image URL</span>
+                <span style="color: #888888; font-size: 13px; font-weight: 500;">Invalid {gender_label} Image Source</span>
             </div>
             """, 
             unsafe_allow_html=True
@@ -126,16 +127,22 @@ def render_spawn_page():
                     # Side-by-side Breeder Cards
                     col_male, col_female = st.columns(2)
 
+                    # --- Male Breeder Image & Details ---
                     with col_male:
                         st.markdown("#### ♂️ Male Breeder")
-                        display_breeder_image(male.get("image_url", ""))
+                        # Sources the male image URL (tries 'image_url', 'image', or 'photo')
+                        male_img_src = male.get("image_url") or male.get("image") or male.get("photo") or ""
+                        display_breeder_image(male_img_src, gender_label="Male")
                         st.markdown(f"**ID:** `{male.get('id', spawn['male_id'])}`")
                         st.markdown(f"**Variety:** {male.get('variety', 'N/A')}")
                         st.markdown(f"**Grade:** `{male.get('grade', 'N/A')}`")
 
+                    # --- Female Breeder Image & Details ---
                     with col_female:
                         st.markdown("#### ♀️ Female Breeder")
-                        display_breeder_image(female.get("image_url", ""))
+                        # Sources the female image URL (tries 'image_url', 'image', or 'photo')
+                        female_img_src = female.get("image_url") or female.get("image") or female.get("photo") or ""
+                        display_breeder_image(female_img_src, gender_label="Female")
                         st.markdown(f"**ID:** `{female.get('id', spawn['female_id'])}`")
                         st.markdown(f"**Variety:** {female.get('variety', 'N/A')}")
                         st.markdown(f"**Grade:** `{female.get('grade', 'N/A')}`")
