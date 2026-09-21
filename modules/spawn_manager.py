@@ -170,15 +170,21 @@ def get_breeder_details_map():
         if not row:
             continue
         breeder_id = row[0]
+
+        # Col A (0): ID | Col B (1): Sex | Col C (2): Variety | Col D (3): Status
+        # Col E (4): Tank | Col F (5): Grade | Col G (6): Photo ID / Image URL | Col H (7): Notes
+        photo_val = row[6] if len(row) > 6 else ""
+
         breeders_map[breeder_id] = {
             "row_index": idx,
             "id": breeder_id,
             "sex": row[1] if len(row) > 1 else "",
             "variety": row[2] if len(row) > 2 else "",
-            "grade": row[3] if len(row) > 3 else "N/A",
-            "image_url": row[4] if len(row) > 4 else "",
-            "status": row[5] if len(row) > 5 else "",
-            "tank": row[6] if len(row) > 6 else "",
+            "status": row[3] if len(row) > 3 else "",
+            "tank": row[4] if len(row) > 4 else "",
+            "grade": row[5] if len(row) > 5 else "N/A",
+            "photo_id": photo_val,
+            "image_url": photo_val,
             "notes": row[7] if len(row) > 7 else ""
         }
     return breeders_map
@@ -196,9 +202,9 @@ def get_available_breeders():
     males, females = [], []
 
     for idx, row in enumerate(rows, start=2):
-        if len(row) < 6:
+        if len(row) < 4:
             continue
-        breeder_id, sex, variety, status = row[0], row[1], row[2], row[5]
+        breeder_id, sex, variety, status = row[0], row[1], row[2], row[3]
 
         if status in ["Available", "Conditioning"]:
             label = f"{breeder_id} | {variety}"
@@ -246,7 +252,7 @@ def get_active_pairings_with_details():
     """Fetches active pairings enriched with full breeder details."""
     all_spawns = get_all_spawns()
     breeders_map = get_breeder_details_map()
-    
+
     active_statuses = ["In Pairing", "Pending (Success)"]
     active_pairs = []
 
@@ -254,7 +260,7 @@ def get_active_pairings_with_details():
         if spawn.get("status") in active_statuses:
             male_info = breeders_map.get(spawn["male_id"], {})
             female_info = breeders_map.get(spawn["female_id"], {})
-            
+
             active_pairs.append({
                 "spawn": spawn,
                 "male": male_info,
@@ -382,14 +388,14 @@ def _find_spawn_by_id(sheets_service, spawn_id):
 def _update_breeder_status(sheets_service, breeder_id, new_status):
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range='Breeders!A2:F'
+        range='Breeders!A2:D'
     ).execute()
     rows = result.get('values', [])
     for idx, row in enumerate(rows, start=2):
         if row and row[0] == breeder_id:
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f'Breeders!F{idx}',
+                range=f'Breeders!D{idx}',
                 valueInputOption='USER_ENTERED',
                 body={'values': [[new_status]]}
             ).execute()
