@@ -10,7 +10,7 @@ from modules.spawn_manager import format_spawns_sheet
 st.set_page_config(page_title="The Betta Studio", page_icon="🐟", layout="wide")
 
 # ==============================================================================
-# GLOBAL STYLING: Applies Deep Midnight Dark Theme & Micro-Glow to ALL Pages
+# GLOBAL STYLING: Applies Deep Midnight Dark Theme & Half-Sized Image Glow (40px)
 # ==============================================================================
 st.markdown("""
 <style>
@@ -38,39 +38,39 @@ st.markdown("""
       background-color: #1A1D24;
       border: 1px solid #282C37;
       border-radius: 12px;
-      padding: 16px;
+      padding: 12px 16px;
       display: flex;
       align-items: center;
-      gap: 16px;
+      gap: 12px;
       margin-bottom: 12px;
   }
 
-  /* 5. Betta Image - Compact Size & Cyan Hover Glow */
+  /* 5. Betta Image - Scaled Down to Half Size (40px) with Cyan Glow */
   .spawn-card-img {
-      width: 80px;
-      height: 80px;
+      width: 40px;
+      height: 40px;
       object-fit: cover;
-      border-radius: 10px;
-      border: 2px solid #2A303F;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 10px rgba(0, 210, 255, 0.15);
+      border-radius: 6px;
+      border: 1.5px solid #2A303F;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4), 0 0 6px rgba(0, 210, 255, 0.15);
       transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
   }
 
   .spawn-card-img:hover {
-      transform: scale(1.05);
-      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.6), 0 0 15px rgba(0, 210, 255, 0.5);
+      transform: scale(1.08);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6), 0 0 10px rgba(0, 210, 255, 0.5);
       border-color: #00D2FF;
   }
 
   .spawn-details h4 {
-      margin: 0 0 6px 0;
+      margin: 0 0 4px 0;
       color: #00D2FF;
   }
 
   .spawn-details p {
-      margin: 2px 0;
+      margin: 1px 0;
       color: #E6E8EB;
-      font-size: 14px;
+      font-size: 13px;
   }
 </style>
 """, unsafe_allow_html=True)
