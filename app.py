@@ -5,11 +5,12 @@ from views.breeder_view import render_breeder_page
 from views.spawn_view import render_spawn_page
 from views.activity_log_view import render_activity_log_page
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
+from modules.spawn_manager import format_spawns_sheet
 
 st.set_page_config(page_title="The Betta Studio", page_icon="🐟", layout="wide")
 
 def run_google_diagnostic():
-    """Runs a live health check on Google Drive & Sheets connections."""
+    """Runs a live health check on Google Drive & Sheets connections and provides formatting utilities."""
     with st.sidebar.expander("🛠️ System Diagnostics"):
         if st.button("Test Google Connection", use_container_width=True):
             with st.status("Testing APIs...", expanded=True) as status:
@@ -67,6 +68,17 @@ def run_google_diagnostic():
                     return
 
                 status.update(label="All Services Operational!", state="complete")
+
+        st.divider()
+
+        # One-click sheet formatter button
+        if st.button("✨ Format Google Sheet", use_container_width=True):
+            with st.spinner("Applying theme, headers, and colors to Spawns sheet..."):
+                try:
+                    format_spawns_sheet()
+                    st.success("Google Sheet styled & formatted successfully!")
+                except Exception as e:
+                    st.error(f"Failed to format sheet: {e}")
 
 # --- Sidebar Navigation ---
 st.sidebar.title("🐟 The Betta Studio")
