@@ -1,8 +1,13 @@
+# modules/spawn_manager.py
 import datetime
 from modules.drive_service import get_google_services, SPREADSHEET_ID
 
+# ==========================================
+# 1. READ / FETCH DATA
+# ==========================================
+
 def get_available_breeders():
-    """Fetches all active breeders eligible for pairing."""
+    """Fetches active male and female breeders ready for pairing."""
     _, sheets_service = get_google_services()
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
@@ -27,8 +32,44 @@ def get_available_breeders():
 
     return males, females
 
+
+def get_all_spawns():
+    """Fetches all spawn records for the UI manager."""
+    _, sheets_service = get_google_services()
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Spawns!A2:L'
+    ).execute()
+
+    rows = result.get('values', [])
+    spawns = []
+
+    for row in rows:
+        if not row:
+            continue
+        spawns.append({
+            "id": row[0] if len(row) > 0 else "",
+            "male_id": row[1] if len(row) > 1 else "",
+            "female_id": row[2] if len(row) > 2 else "",
+            "pairing_date": row[3] if len(row) > 3 else "",
+            "status": row[4] if len(row) > 4 else "In Pairing",
+            "batch_name": row[5] if len(row) > 5 else "",
+            "free_swim_date": row[6] if len(row) > 6 else "",
+            "fry_count": row[7] if len(row) > 7 else "0",
+            "failure_reason": row[8] if len(row) > 8 else "",
+            "tank": row[9] if len(row) > 9 else "",
+            "line_goal": row[10] if len(row) > 10 else "",
+            "notes": row[11] if len(row) > 11 else ""
+        })
+    return spawns
+
+
+# ==========================================
+# 2. CREATE SPAWN
+# ==========================================
+
 def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goal="", notes=""):
-    """Creates a new Spawn record and sets parent statuses to 'In Pairing'."""
+    """Creates a new Spawn record and sets both parents' statuses to 'In Pairing'."""
     _, sheets_service = get_google_services()
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     spawn_id = f"SPN-{timestamp}"
@@ -56,14 +97,19 @@ def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goa
         body={'values': [row]}
     ).execute()
 
-    # Update parent statuses
+    # Mark parents as 'In Pairing'
     _update_breeder_status(sheets_service, male_breeder_id, "In Pairing")
     _update_breeder_status(sheets_service, female_breeder_id, "In Pairing")
 
     return spawn_id
 
+
+# ==========================================
+# 3. LIFECYCLE STATE TRANSITIONS
+# ==========================================
+
 def mark_pairing_success_pending(spawn_id):
-    """Updates spawn status to 'Pending (Success)' when eggs drop."""
+    """Transition 1: Eggs dropped. Set status to 'Pending (Success)' while eggs hatch."""
     _, sheets_service = get_google_services()
     row_idx, _ = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
@@ -74,8 +120,12 @@ def mark_pairing_success_pending(spawn_id):
             body={'values': [["Pending (Success)"]]}
         ).execute()
 
+
 def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
-    """Sets spawn status to 'Free Swimming', assigns batch name, and resets parents to 'Available'."""
+    """
+    Transition 2: Fry are free swimming.
+    Assigns Batch Name, sets status to 'Free Swimming', and resets parents to 'Available'.
+    """
     _, sheets_service = get_google_services()
     row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
@@ -90,12 +140,16 @@ def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
             body={'values': update_values}
         ).execute()
 
-        # Reset parents
+        # Reset parent stock to Available for future pairings
         _update_breeder_status(sheets_service, male_id, "Available")
         _update_breeder_status(sheets_service, female_id, "Available")
 
+
 def mark_pairing_failed(spawn_id, failure_reason):
-    """Marks spawn as 'Failed', logs the reason, and resets parents to 'Available'."""
+    """
+    Transition 3: Pairing failed.
+    Logs failure reason, sets status to 'Failed', and resets parents to 'Available'.
+    """
     _, sheets_service = get_google_services()
     row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
@@ -120,7 +174,11 @@ def mark_pairing_failed(spawn_id, failure_reason):
         _update_breeder_status(sheets_service, male_id, "Available")
         _update_breeder_status(sheets_service, female_id, "Available")
 
-# --- Helper Functions ---
+
+# ==========================================
+# 4. INTERNAL HELPERS
+# ==========================================
+
 def _find_spawn_by_id(sheets_service, spawn_id):
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
@@ -131,6 +189,7 @@ def _find_spawn_by_id(sheets_service, spawn_id):
         if row and row[0] == spawn_id:
             return idx, row
     return None, None
+
 
 def _update_breeder_status(sheets_service, breeder_id, new_status):
     result = sheets_service.spreadsheets().values().get(
