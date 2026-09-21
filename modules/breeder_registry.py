@@ -4,6 +4,7 @@ import io
 import re
 import datetime
 import qrcode
+import streamlit as st
 from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
 
@@ -25,22 +26,25 @@ def generate_qr_code(breeder_id):
     return img_stream
 
 def upload_to_drive(drive_service, file_data, file_name, mime_type):
-    """Uploads a file to Google Drive and sets public read permissions."""
+    """Uploads a file directly to the specified Google Drive folder."""
     metadata = {'name': file_name}
+    
+    # Force upload to target Drive Folder if defined
     if DRIVE_FOLDER_ID:
         metadata['parents'] = [DRIVE_FOLDER_ID]
 
+    # Handle Streamlit UploadedFile, BytesIO, or file paths
     if isinstance(file_data, str):
         media = MediaFileUpload(file_data, mimetype=mime_type, resumable=False)
     else:
         if hasattr(file_data, 'getvalue'):
-            stream = io.BytesIO(file_data.getvalue())
+            file_bytes = file_data.getvalue()
         elif hasattr(file_data, 'read'):
-            stream = io.BytesIO(file_data.read())
+            file_bytes = file_data.read()
         else:
-            stream = file_data
-            stream.seek(0)
+            file_bytes = file_data.read()
             
+        stream = io.BytesIO(file_bytes)
         media = MediaIoBaseUpload(stream, mimetype=mime_type, resumable=False)
 
     uploaded = drive_service.files().create(
@@ -52,7 +56,7 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     file_id = uploaded.get('id')
     web_link = uploaded.get('webViewLink')
 
-    # Grant public read access so Streamlit can render the thumbnail directly
+    # Grant public reader permission so Streamlit & Google Sheets can access the file
     try:
         drive_service.permissions().create(
             fileId=file_id,
@@ -77,12 +81,12 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
 
     # 1. Upload Photo to Drive
     photo_id, photo_url = "", ""
-    if photo_path:
+    if photo_path is not None:
         try:
             photo_name = f"{breeder_id}_photo.jpg"
             photo_id, photo_url = upload_to_drive(drive_service, photo_path, photo_name, 'image/jpeg')
         except Exception as e:
-            print(f"Warning: Photo upload failed: {e}")
+            st.error(f"Photo upload error: {e}")
 
     # 2. Upload QR Code to Drive
     qr_id, qr_url = "", ""
@@ -91,12 +95,11 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
         qr_name = f"{breeder_id}_QR.png"
         qr_id, qr_url = upload_to_drive(drive_service, qr_stream, qr_name, 'image/png')
     except Exception as e:
-        print(f"Warning: QR upload failed: {e}")
+        st.error(f"QR Code upload error: {e}")
 
     dob_str = str(dob) if dob else ""
     date_registered = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Store raw Drive IDs directly in columns G and H
     row = [
         breeder_id,            # A: Breeder ID
         sex.capitalize(),      # B: Sex
@@ -104,8 +107,8 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
         lineage,               # D: Lineage / Breeder
         dob_str,               # E: DOB
         "Available",           # F: Status
-        photo_id,              # G: Raw Photo File ID
-        qr_id,                 # H: Raw QR Code File ID
+        photo_id,              # G: Raw Photo Drive ID
+        qr_id,                 # H: Raw QR Code Drive ID
         notes,                 # I: Notes
         date_registered        # J: Date Registered
     ]
@@ -164,7 +167,6 @@ def get_all_breeders():
             if not row or len(row) == 0:
                 continue
 
-            # Ensure all columns exist up to J
             while len(row) < 10:
                 row.append("")
 
