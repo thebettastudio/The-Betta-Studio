@@ -1,4 +1,3 @@
-# modules/spawn_manager.py
 import datetime
 from modules.drive_service import get_google_services, SPREADSHEET_ID
 
@@ -94,10 +93,7 @@ def get_all_spawns():
 
 
 def get_active_pairings_with_details():
-    """
-    Fetches all active pairings ('In Pairing' or 'Pending (Success)')
-    enriched with full male and female breeder profile data.
-    """
+    """Fetches active pairings enriched with full breeder details."""
     all_spawns = get_all_spawns()
     breeders_map = get_breeder_details_map()
     
@@ -151,7 +147,6 @@ def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goa
         body={'values': [row]}
     ).execute()
 
-    # Mark parents as 'In Pairing'
     _update_breeder_status(sheets_service, male_breeder_id, "In Pairing")
     _update_breeder_status(sheets_service, female_breeder_id, "In Pairing")
 
@@ -163,7 +158,7 @@ def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goa
 # ==========================================
 
 def mark_pairing_success_pending(spawn_id):
-    """Transition 1: Eggs dropped. Set status to 'Pending (Success)' while eggs hatch."""
+    """Transition 1: Eggs dropped. Set status to 'Pending (Success)'."""
     _, sheets_service = get_google_services()
     row_idx, _ = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
@@ -176,10 +171,7 @@ def mark_pairing_success_pending(spawn_id):
 
 
 def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
-    """
-    Transition 2: Fry are free swimming.
-    Assigns Batch Name, sets status to 'Free Swimming', and resets parents to 'Available'.
-    """
+    """Transition 2: Fry free swimming. Sets status and resets parents to 'Available'."""
     _, sheets_service = get_google_services()
     row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
@@ -194,16 +186,12 @@ def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
             body={'values': update_values}
         ).execute()
 
-        # Reset parent stock to Available for future pairings
         _update_breeder_status(sheets_service, male_id, "Available")
         _update_breeder_status(sheets_service, female_id, "Available")
 
 
 def mark_pairing_failed(spawn_id, failure_reason):
-    """
-    Transition 3: Pairing failed.
-    Logs failure reason, sets status to 'Failed', and resets parents to 'Available'.
-    """
+    """Transition 3: Pairing failed. Logs reason and resets parents to 'Available'."""
     _, sheets_service = get_google_services()
     row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
