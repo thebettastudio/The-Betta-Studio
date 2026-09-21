@@ -26,14 +26,8 @@ def generate_qr_code(breeder_id):
     return img_stream
 
 def upload_to_drive(drive_service, file_data, file_name, mime_type):
-    """Uploads a file directly to the shared Google Drive folder."""
-    if not DRIVE_FOLDER_ID:
-        raise ValueError(
-            "DRIVE_FOLDER_ID is missing or empty! Service Accounts cannot store files in their own quota. "
-            "Please configure DRIVE_FOLDER_ID in Streamlit secrets."
-        )
-
-    # Safely extract bytes from Streamlit UploadedFile, BytesIO, or raw bytes
+    """Uploads a file directly to your personal Google Drive storage."""
+    # Extract raw bytes safely from Streamlit UploadedFile, BytesIO, or raw bytes
     if hasattr(file_data, 'getvalue'):
         raw_bytes = file_data.getvalue()
     elif hasattr(file_data, 'read'):
@@ -41,34 +35,30 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     else:
         raw_bytes = file_data
 
-    # Always reset the BytesIO stream before passing to MediaIoBaseUpload
+    # Always reset the BytesIO stream before uploading to prevent Broken Pipe errors
     stream = io.BytesIO(raw_bytes)
     stream.seek(0)
 
     media = MediaIoBaseUpload(stream, mimetype=mime_type, resumable=False)
 
-    metadata = {
-        'name': file_name,
-        'parents': [DRIVE_FOLDER_ID.strip()]
-    }
+    metadata = {'name': file_name}
+    if DRIVE_FOLDER_ID:
+        metadata['parents'] = [DRIVE_FOLDER_ID.strip()]
 
-    # CRITICAL: supportsAllDrives=True is required to upload into shared folders
     uploaded = drive_service.files().create(
         body=metadata,
         media_body=media,
-        fields='id, webViewLink',
-        supportsAllDrives=True
+        fields='id, webViewLink'
     ).execute()
     
     file_id = uploaded.get('id')
     web_link = uploaded.get('webViewLink')
 
-    # Grant public read permissions for Streamlit thumbnail previews
+    # Optional: Grant public read access so Streamlit can render thumbnail previews
     try:
         drive_service.permissions().create(
             fileId=file_id,
-            body={'type': 'anyone', 'role': 'reader'},
-            supportsAllDrives=True
+            body={'type': 'anyone', 'role': 'reader'}
         ).execute()
     except Exception as e:
         print(f"Warning: Could not set public permission on file {file_id}: {e}")
