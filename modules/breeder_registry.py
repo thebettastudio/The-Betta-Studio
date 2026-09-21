@@ -52,7 +52,7 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     file_id = uploaded.get('id')
     web_link = uploaded.get('webViewLink')
 
-    # Make file publicly readable so =IMAGE(...) in Google Sheets can load it
+    # Make file publicly readable so images load seamlessly inside Streamlit
     try:
         drive_service.permissions().create(
             fileId=file_id,
@@ -94,7 +94,7 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     except Exception as e:
         print(f"Warning: QR upload failed: {e}")
 
-    # HYPERLINK formula with preview link so clicking it opens the image in a browser tab
+    # HYPERLINK formula for Google Sheets fallback
     photo_cell = f'=HYPERLINK("{photo_url}", "View Photo")' if photo_url else "No Photo"
     qr_cell = f'=HYPERLINK("{qr_url}", "View QR")' if qr_url else "No QR"
 
@@ -110,8 +110,8 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
         lineage,               # D: Lineage / Breeder
         dob_str,               # E: DOB
         "Available",           # F: Status
-        photo_cell,            # G: Photo (Clickable Link)
-        qr_cell,               # H: QR Code (Clickable Link)
+        photo_cell,            # G: Photo Link
+        qr_cell,               # H: QR Code Link
         notes,                 # I: Notes
         date_registered        # J: Date Registered
     ]
@@ -128,3 +128,48 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
         "photo_url": photo_url,
         "qr_url": qr_url
     }
+
+def get_all_breeders():
+    """Fetches all registered breeders from Google Sheets for the in-app Streamlit Gallery."""
+    _, sheets_service = get_google_services()
+    
+    try:
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Breeders!A2:J'
+        ).execute()
+        
+        rows = result.get('values', [])
+        breeders = []
+        
+        for row in rows:
+            if not row or len(row) == 0:
+                continue
+                
+            def extract_file_id(val):
+                if 'id=' in val:
+                    return val.split('id=')[1].split('"')[0].split('&')[0]
+                elif '/d/' in val:
+                    return val.split('/d/')[1].split('"')[0].split('/')[0]
+                return ""
+
+            photo_val = row[6] if len(row) > 6 else ""
+            qr_val = row[7] if len(row) > 7 else ""
+
+            breeders.append({
+                "id": row[0] if len(row) > 0 else "",
+                "sex": row[1] if len(row) > 1 else "",
+                "variety": row[2] if len(row) > 2 else "",
+                "lineage": row[3] if len(row) > 3 else "",
+                "dob": row[4] if len(row) > 4 else "",
+                "status": row[5] if len(row) > 5 else "Available",
+                "photo_id": extract_file_id(photo_val),
+                "qr_id": extract_file_id(qr_val),
+                "notes": row[8] if len(row) > 8 else "",
+                "date_registered": row[9] if len(row) > 9 else ""
+            })
+            
+        return breeders
+    except Exception as e:
+        print(f"Error fetching breeders: {e}")
+        return []
