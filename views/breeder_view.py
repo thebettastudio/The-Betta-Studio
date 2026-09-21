@@ -7,6 +7,21 @@ from modules.breeder_registry import (
     delete_breeder
 )
 
+# Preset list of color pattern classes
+COLOR_PATTERN_OPTIONS = [
+    "Avatar",
+    "Multicolor Galaxy",
+    "Multicolor",
+    "Nemo Copper Semi Dumbo",
+    "Yellow Koi",
+    "Candy Nemo",
+    "Neon Green Eyes",
+    "Candy Koi",
+    "Regular",
+    "Yellow Koi Galaxy",
+    "Others"
+]
+
 def render_breeder_page():
     st.title("🐟 Betta Breeder Management")
 
@@ -21,7 +36,15 @@ def render_breeder_page():
             
             with col1:
                 sex = st.selectbox("Sex", ["Male", "Female"])
-                variety = st.text_input("Variety / Tail Type", placeholder="e.g. Yellow Koi Galaxy, Halfmoon")
+                
+                # Color / Pattern Class dropdown selector
+                pattern_class = st.selectbox("Color / Pattern Class", COLOR_PATTERN_OPTIONS)
+                
+                # Input field displayed if "Others" is selected
+                custom_pattern = ""
+                if pattern_class == "Others":
+                    custom_pattern = st.text_input("Specify Other Pattern", placeholder="e.g. Black Star")
+                    
                 lineage = st.text_input("Lineage / Breeder Source", placeholder="e.g. Peter Suson")
             
             with col2:
@@ -32,13 +55,19 @@ def render_breeder_page():
             submit = st.form_submit_button("📷 Register Breeder & Upload")
 
         if submit:
-            if not variety or not lineage:
-                st.error("Please fill in the Variety and Lineage fields.")
+            # Determine the selected pattern class
+            selected_pattern = custom_pattern.strip() if pattern_class == "Others" else pattern_class
+            
+            if not selected_pattern or not lineage:
+                st.error("Please fill in the Color / Pattern Class and Lineage fields.")
             else:
+                # Format standard variety value with hardcoded HMKP tail type
+                full_variety = f"HMKP - {selected_pattern}"
+
                 with st.spinner("Uploading photos to Google Drive..."):
                     result = register_breeder(
                         sex=sex,
-                        variety=variety,
+                        variety=full_variety,
                         lineage=lineage,
                         dob=str(dob),
                         photo_path=photo_file,
@@ -55,7 +84,7 @@ def render_breeder_page():
                 with c2:
                     st.subheader("Breeder Photo")
                     if photo_file:
-                        st.image(photo_file, caption=f"{variety} ({sex})", width=300)
+                        st.image(photo_file, caption=f"{full_variety} ({sex})", width=300)
 
     # TAB 2: BREEDER GALLERY / INVENTORY
     with tab2:
