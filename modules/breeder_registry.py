@@ -1,3 +1,4 @@
+# modules/breeder_registry.py
 import os
 import io
 import datetime
@@ -23,18 +24,19 @@ def generate_qr_code(breeder_id):
     return img_stream
 
 def upload_to_drive(drive_service, file_data, file_name, mime_type):
-    """Uploads a file stream or local path to Google Drive without resumable chunking."""
+    """Uploads a file stream or local path to Google Drive."""
     metadata = {'name': file_name}
     if DRIVE_FOLDER_ID:
         metadata['parents'] = [DRIVE_FOLDER_ID]
 
-    # Handle local file paths vs. binary streams / Streamlit UploadedFile objects
+    # Handle local paths vs BytesIO vs Streamlit UploadedFile objects
     if isinstance(file_data, str):
         media = MediaFileUpload(file_data, mimetype=mime_type, resumable=False)
     else:
-        # If passed an st.file_uploader object or BytesIO, ensure it's at position 0
         if hasattr(file_data, 'getvalue'):
             stream = io.BytesIO(file_data.getvalue())
+        elif hasattr(file_data, 'read'):
+            stream = io.BytesIO(file_data.read())
         else:
             stream = file_data
             stream.seek(0)
@@ -65,13 +67,20 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     # 1. Upload Photo (if provided)
     photo_url = ""
     if photo_path:
-        photo_name = f"{breeder_id}_photo.jpg"
-        _, photo_url = upload_to_drive(drive_service, photo_path, photo_name, 'image/jpeg')
+        try:
+            photo_name = f"{breeder_id}_photo.jpg"
+            _, photo_url = upload_to_drive(drive_service, photo_path, photo_name, 'image/jpeg')
+        except Exception as e:
+            print(f"Warning: Photo upload failed: {e}")
 
     # 2. Upload QR Code
-    qr_stream = generate_qr_code(breeder_id)
-    qr_name = f"{breeder_id}_QR.png"
-    _, qr_url = upload_to_drive(drive_service, qr_stream, qr_name, 'image/png')
+    qr_url = ""
+    try:
+        qr_stream = generate_qr_code(breeder_id)
+        qr_name = f"{breeder_id}_QR.png"
+        _, qr_url = upload_to_drive(drive_service, qr_stream, qr_name, 'image/png')
+    except Exception as e:
+        print(f"Warning: QR upload failed: {e}")
 
     # 3. Append to Google Sheets
     row = [
