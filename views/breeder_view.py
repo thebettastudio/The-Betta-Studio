@@ -43,12 +43,12 @@ def render_breeder_page():
 
                 st.success(f"Registered successfully! Breeder ID: **{result['breeder_id']}**")
                 
-                # Show images inline directly in Streamlit instead of external Google Drive links!
+                # Render uploaded photo and QR Code directly inside Streamlit
                 c1, c2 = st.columns(2)
                 with c1:
                     st.subheader("Tank Tag QR Code")
-                    if photo_file:
-                        st.image(result['qr_url'], width=220)
+                    if result.get("direct_qr_url"):
+                        st.image(result['direct_qr_url'], width=220)
                 with c2:
                     st.subheader("Breeder Photo")
                     if photo_file:
@@ -64,7 +64,6 @@ def render_breeder_page():
         if not breeders:
             st.info("No breeders registered yet. Add your first breeder in the Registration tab!")
         else:
-            # Filter by Sex or Search
             search_query = st.text_input("🔍 Search by ID, Variety, or Lineage:", "")
             
             filtered = [
@@ -74,7 +73,6 @@ def render_breeder_page():
                 or search_query.lower() in b['lineage'].lower()
             ]
 
-            # Display as visual cards in a grid
             cols = st.columns(3)
             for idx, b in enumerate(filtered):
                 with cols[idx % 3]:
@@ -88,9 +86,7 @@ def render_breeder_page():
                         if b['notes']:
                             st.info(f"**Notes:** {b['notes']}")
                         
-                        # Render photo directly if image URL exists
                         if b['photo_id']:
-                            # Direct Google Drive thumbnail view URL for Streamlit
                             img_src = f"https://drive.google.com/thumbnail?id={b['photo_id']}&sz=w600"
                             st.image(img_src, use_container_width=True)
                         else:
