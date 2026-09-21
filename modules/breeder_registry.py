@@ -30,10 +30,10 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     if not DRIVE_FOLDER_ID:
         raise ValueError(
             "DRIVE_FOLDER_ID is missing or empty! Service Accounts cannot store files in their own quota. "
-            "Please add DRIVE_FOLDER_ID to your Streamlit secrets."
+            "Please configure DRIVE_FOLDER_ID in Streamlit secrets."
         )
 
-    # Convert incoming Streamlit UploadedFile or BytesIO stream into a safe BytesIO object
+    # Safely extract bytes from Streamlit UploadedFile, BytesIO, or raw bytes
     if hasattr(file_data, 'getvalue'):
         raw_bytes = file_data.getvalue()
     elif hasattr(file_data, 'read'):
@@ -41,7 +41,7 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     else:
         raw_bytes = file_data
 
-    # Always reset memory stream pointer to prevent [Errno 32] Broken Pipe
+    # Always reset the BytesIO stream before passing to MediaIoBaseUpload
     stream = io.BytesIO(raw_bytes)
     stream.seek(0)
 
@@ -52,7 +52,7 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
         'parents': [DRIVE_FOLDER_ID.strip()]
     }
 
-    # supportsAllDrives=True avoids Service Account root quota errors
+    # CRITICAL: supportsAllDrives=True is required to upload into shared folders
     uploaded = drive_service.files().create(
         body=metadata,
         media_body=media,
@@ -63,7 +63,7 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     file_id = uploaded.get('id')
     web_link = uploaded.get('webViewLink')
 
-    # Grant public reader permission so Streamlit can render the thumbnail
+    # Grant public read permissions for Streamlit thumbnail previews
     try:
         drive_service.permissions().create(
             fileId=file_id,
