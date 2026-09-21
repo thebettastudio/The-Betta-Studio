@@ -1,8 +1,8 @@
 # modules/drive_service.py
 import os
-import json
 import streamlit as st
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 SCOPES = [
@@ -10,24 +10,22 @@ SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
-# Fetch spreadsheet & folder IDs from st.secrets if available, else local defaults
 SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "YOUR_SPREADSHEET_ID_HERE")
 DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "YOUR_DRIVE_FOLDER_ID_HERE")
-
 
 def get_google_services():
     """
     Returns authenticated Drive and Sheets clients.
-    Reads credentials from st.secrets (Streamlit Cloud) or token.json (local).
+    Handles automatic token refresh via google.auth.transport.requests.Request.
     """
     creds = None
 
-    # 1. Check if running on Streamlit Cloud using st.secrets
+    # 1. Load from Streamlit Cloud Secrets
     if "google_oauth" in st.secrets:
         oauth_dict = dict(st.secrets["google_oauth"])
         creds = Credentials.from_authorized_user_info(oauth_dict, SCOPES)
 
-    # 2. Otherwise, fallback to local token.json file for local testing
+    # 2. Fallback to local file for local development
     else:
         token_path = 'config/token.json' if os.path.exists('config/token.json') else 'token.json'
         if os.path.exists(token_path):
@@ -35,8 +33,16 @@ def get_google_services():
 
     if not creds:
         raise FileNotFoundError(
-            "Google credentials not found! Please configure st.secrets on Streamlit Cloud or provide a local token.json."
+            "Google credentials not found! Configure st.secrets or provide token.json."
         )
+
+    # 3. Refresh token if expired
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception as e:
+            st.error("⚠️ Google OAuth Refresh Error: Your refresh token may be expired or invalid.")
+            raise e
 
     drive_service = build('drive', 'v3', credentials=creds)
     sheets_service = build('sheets', 'v4', credentials=creds)
