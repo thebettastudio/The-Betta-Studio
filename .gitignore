@@ -1,7 +1,6 @@
-# Ignore secret Google credentials
+config/credentials.json
+config/token.json
 credentials.json
 token.json
-
-# Ignore Python virtual environments / caches
 __pycache__/
-.env
+*.pyc
