@@ -1,5 +1,155 @@
+# modules/spawn_manager.py
 import datetime
 from modules.drive_service import get_google_services, SPREADSHEET_ID
+
+# ==========================================
+# 0. SHEET FORMATTING & MOTIVATIONAL STYLING
+# ==========================================
+
+def format_spawns_sheet():
+    """
+    Applies professional, motivating formatting to the 'Spawns' sheet:
+    - Bold colorful Header Row with dark theme
+    - Conditional color formatting for lifecycle statuses
+    - Freeze header row & auto row height
+    - Proper column alignment
+    """
+    _, sheets_service = get_google_services()
+
+    # Get spreadsheet metadata to locate sheet ID for 'Spawns'
+    spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    spawns_sheet_id = None
+    for sheet in spreadsheet.get('sheets', []):
+        if sheet['properties']['title'] == 'Spawns':
+            spawns_sheet_id = sheet['properties']['sheetId']
+            break
+
+    if spawns_sheet_id is None:
+        return
+
+    # 1. Define standard headers
+    headers = [
+        ["Spawn ID", "Male ID", "Female ID", "Pairing Date", "Status", 
+         "Batch Name", "Free Swim Date", "Fry Count", "Failure Reason", 
+         "Tank Location", "Line Goal", "Notes"]
+    ]
+
+    # Write headers to Row 1
+    sheets_service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Spawns!A1:L1',
+        valueInputOption='USER_ENTERED',
+        body={'values': headers}
+    ).execute()
+
+    # 2. Batch styling requests
+    requests = [
+        # Header Styling: Dark Blue background, bold white text
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": spawns_sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 12
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.1, "green": 0.25, "blue": 0.45},
+                        "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "fontSize": 11},
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE"
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"
+            }
+        },
+        # Freeze top header row
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": spawns_sheet_id,
+                    "gridProperties": {"frozenRowCount": 1}
+                },
+                "fields": "gridProperties.frozenRowCount"
+            }
+        },
+        # Align center for dates, status, IDs, tank location
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": spawns_sheet_id,
+                    "startRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 10
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "verticalAlignment": "MIDDLE"
+                    }
+                },
+                "fields": "userEnteredFormat(verticalAlignment)"
+            }
+        },
+        # Set Row Height for Header
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": spawns_sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 0,
+                    "endIndex": 1
+                },
+                "properties": {"pixelSize": 38},
+                "fields": "pixelSize"
+            }
+        }
+    ]
+
+    # Add Conditional Formatting Rules for Status (Col E)
+    # Status "In Pairing" -> Warm Vibrant Amber/Yellow
+    # Status "Free Swimming" -> Lively Soft Green
+    # Status "Pending (Success)" -> Light Cyan/Blue
+    # Status "Failed" -> Soft Crimson Red
+    status_rules = [
+        ("In Pairing", {"red": 1.0, "green": 0.94, "blue": 0.8}, {"red": 0.6, "green": 0.4, "blue": 0.0}),
+        ("Free Swimming", {"red": 0.85, "green": 0.95, "blue": 0.85}, {"red": 0.1, "green": 0.5, "blue": 0.2}),
+        ("Pending (Success)", {"red": 0.85, "green": 0.92, "blue": 1.0}, {"red": 0.0, "green": 0.3, "blue": 0.7}),
+        ("Failed", {"red": 0.98, "green": 0.85, "blue": 0.85}, {"red": 0.6, "green": 0.1, "blue": 0.1})
+    ]
+
+    for val, bg, text_color in status_rules:
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": spawns_sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": 4,
+                        "endColumnIndex": 5
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "TEXT_EQ",
+                            "values": [{"userEnteredValue": val}]
+                        },
+                        "format": {
+                            "backgroundColor": bg,
+                            "textFormat": {"bold": True, "foregroundColor": text_color}
+                        }
+                    }
+                },
+                "index": 0
+            }
+        })
+
+    # Execute formatting
+    sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={"requests": requests}
+    ).execute()
+
 
 # ==========================================
 # 1. READ / FETCH DATA
@@ -62,7 +212,7 @@ def get_available_breeders():
 
 
 def get_all_spawns():
-    """Fetches all spawn records for the UI manager."""
+    """Fetches all spawn records from canonical range A2:L."""
     _, sheets_service = get_google_services()
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
@@ -119,7 +269,7 @@ def get_active_pairings_with_details():
 # ==========================================
 
 def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goal="", notes=""):
-    """Creates a new Spawn record and sets both parents' statuses to 'In Pairing'."""
+    """Appends clean 12-column spawn row under Spawns sheet."""
     _, sheets_service = get_google_services()
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     spawn_id = f"SPN-{timestamp}"
@@ -142,8 +292,9 @@ def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goa
 
     sheets_service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range='Spawns!A:L',
+        range='Spawns!A1:L1',
         valueInputOption='USER_ENTERED',
+        insertDataOption='INSERT_ROWS',
         body={'values': [row]}
     ).execute()
 
@@ -158,7 +309,6 @@ def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goa
 # ==========================================
 
 def mark_pairing_success_pending(spawn_id):
-    """Transition 1: Eggs dropped. Set status to 'Pending (Success)'."""
     _, sheets_service = get_google_services()
     row_idx, _ = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
@@ -171,7 +321,6 @@ def mark_pairing_success_pending(spawn_id):
 
 
 def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
-    """Transition 2: Fry free swimming. Sets status and resets parents to 'Available'."""
     _, sheets_service = get_google_services()
     row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
@@ -191,7 +340,6 @@ def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
 
 
 def mark_pairing_failed(spawn_id, failure_reason):
-    """Transition 3: Pairing failed. Logs reason and resets parents to 'Available'."""
     _, sheets_service = get_google_services()
     row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
