@@ -4,18 +4,20 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
+# Full Google Drive scope is required to upload into pre-existing shared folders
 SCOPES = [
-    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/drive',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
-SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")
-DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
+SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "1wYEjEyZgnWS7YEU_Xde4bjhQrOxMYfe2q-PV8YMVfIo")
+DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "1F0PmaZN_sUP5qDfIeSvsY6hSiYFSNO0y")
 
+@st.cache_resource
 def get_google_services():
     """
     Returns authenticated Drive and Sheets clients using Service Account credentials.
-    Service Accounts never expire and require no user login or refresh tokens.
+    Uses st.cache_resource to avoid re-authenticating on every app interaction.
     """
     if "gcp_service_account" not in st.secrets:
         raise ValueError("gcp_service_account missing from Streamlit secrets!")
