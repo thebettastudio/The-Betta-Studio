@@ -24,7 +24,7 @@ def generate_qr_code(breeder_id):
     return img_stream
 
 def upload_to_drive(drive_service, file_data, file_name, mime_type):
-    """Uploads a file stream or local path to Google Drive."""
+    """Uploads a file to Google Drive and sets public read permissions."""
     metadata = {'name': file_name}
     if DRIVE_FOLDER_ID:
         metadata['parents'] = [DRIVE_FOLDER_ID]
@@ -49,9 +49,18 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
         fields='id, webViewLink'
     ).execute()
     
-    # Return both file ID and the direct view link
     file_id = uploaded.get('id')
     web_link = uploaded.get('webViewLink')
+
+    # Make file publicly readable so =IMAGE(...) in Google Sheets can load it
+    try:
+        drive_service.permissions().create(
+            fileId=file_id,
+            body={'type': 'anyone', 'role': 'reader'}
+        ).execute()
+    except Exception as e:
+        print(f"Warning: Could not set public permission on file {file_id}: {e}")
+
     return file_id, web_link
 
 def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
@@ -59,7 +68,7 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     1. Generates a unique Breeder ID.
     2. Creates and uploads a QR Code image to Drive.
     3. Uploads the breeder photo to Drive.
-    4. Records the breeder row in Google Sheets ('Breeders' tab) with IMAGE formulas.
+    4. Records the breeder row in Google Sheets ('Breeders' tab) with clickable formulas.
     """
     drive_service, sheets_service = get_google_services()
 
@@ -85,9 +94,9 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     except Exception as e:
         print(f"Warning: QR upload failed: {e}")
 
-    # Construct direct image formula URLs for clean display in Google Sheets
-    photo_cell_val = f'=IMAGE("https://lh3.googleusercontent.com/d/{photo_id}")' if photo_id else photo_url
-    qr_cell_val = f'=IMAGE("https://lh3.googleusercontent.com/d/{qr_id}")' if qr_id else qr_url
+    # HYPERLINK formula with preview link so clicking it opens the image in a browser tab
+    photo_cell = f'=HYPERLINK("{photo_url}", "View Photo")' if photo_url else "No Photo"
+    qr_cell = f'=HYPERLINK("{qr_url}", "View QR")' if qr_url else "No QR"
 
     # 3. Format date strings
     dob_str = str(dob) if dob else ""
@@ -101,8 +110,8 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
         lineage,               # D: Lineage / Breeder
         dob_str,               # E: DOB
         "Available",           # F: Status
-        photo_cell_val,        # G: Photo (Rendered Image)
-        qr_cell_val,           # H: QR Code (Rendered Image)
+        photo_cell,            # G: Photo (Clickable Link)
+        qr_cell,               # H: QR Code (Clickable Link)
         notes,                 # I: Notes
         date_registered        # J: Date Registered
     ]
