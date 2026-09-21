@@ -5,7 +5,7 @@ import re
 import datetime
 import qrcode
 import streamlit as st
-from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseUpload
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
 
 def generate_qr_code(breeder_id):
@@ -26,31 +26,33 @@ def generate_qr_code(breeder_id):
     return img_stream
 
 def upload_to_drive(drive_service, file_data, file_name, mime_type):
-    """Uploads a file directly to the shared Google Drive folder using parent quota."""
+    """Uploads a file directly to the shared Google Drive folder."""
     if not DRIVE_FOLDER_ID:
         raise ValueError(
-            "DRIVE_FOLDER_ID is missing! Service accounts cannot store files in their own quota. "
-            "Set DRIVE_FOLDER_ID to a Google Drive folder shared with the Service Account email."
+            "DRIVE_FOLDER_ID is missing or empty! Service Accounts cannot store files in their own quota. "
+            "Please add DRIVE_FOLDER_ID to your Streamlit secrets."
         )
+
+    # Convert incoming Streamlit UploadedFile or BytesIO stream into a safe BytesIO object
+    if hasattr(file_data, 'getvalue'):
+        raw_bytes = file_data.getvalue()
+    elif hasattr(file_data, 'read'):
+        raw_bytes = file_data.read()
+    else:
+        raw_bytes = file_data
+
+    # Always reset memory stream pointer to prevent [Errno 32] Broken Pipe
+    stream = io.BytesIO(raw_bytes)
+    stream.seek(0)
+
+    media = MediaIoBaseUpload(stream, mimetype=mime_type, resumable=False)
 
     metadata = {
         'name': file_name,
-        'parents': [DRIVE_FOLDER_ID]  # Critical: consumes storage from the folder owner's quota
+        'parents': [DRIVE_FOLDER_ID.strip()]
     }
 
-    if isinstance(file_data, str):
-        media = MediaFileUpload(file_data, mimetype=mime_type, resumable=False)
-    else:
-        if hasattr(file_data, 'getvalue'):
-            file_bytes = file_data.getvalue()
-        elif hasattr(file_data, 'read'):
-            file_bytes = file_data.read()
-        else:
-            file_bytes = file_data.read()
-            
-        stream = io.BytesIO(file_bytes)
-        media = MediaIoBaseUpload(stream, mimetype=mime_type, resumable=False)
-
+    # supportsAllDrives=True avoids Service Account root quota errors
     uploaded = drive_service.files().create(
         body=metadata,
         media_body=media,
@@ -61,7 +63,7 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     file_id = uploaded.get('id')
     web_link = uploaded.get('webViewLink')
 
-    # Set public read access so Streamlit can load the thumbnails
+    # Grant public reader permission so Streamlit can render the thumbnail
     try:
         drive_service.permissions().create(
             fileId=file_id,
