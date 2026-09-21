@@ -18,6 +18,7 @@ def get_google_services():
 
     if "oauth_token" in st.secrets:
         token_info = dict(st.secrets["oauth_token"])
+        
         creds = Credentials(
             token=token_info.get("token"),
             refresh_token=token_info.get("refresh_token"),
@@ -27,9 +28,13 @@ def get_google_services():
             scopes=SCOPES
         )
 
-    # Refresh expired access token automatically using refresh_token
+    # Automatically fetch new access token using refresh_token
     if creds and (not creds.valid or creds.expired):
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except Exception as e:
+            st.error("OAuth token refresh failed. Please generate a new refresh_token from OAuth Playground.")
+            raise e
 
     if not creds:
         raise RuntimeError("Missing [oauth_token] configuration in Streamlit secrets.")
