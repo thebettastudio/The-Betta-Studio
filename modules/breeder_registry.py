@@ -23,15 +23,23 @@ def generate_qr_code(breeder_id):
     return img_stream
 
 def upload_to_drive(drive_service, file_data, file_name, mime_type):
-    """Uploads a file stream or local path to Google Drive."""
+    """Uploads a file stream or local path to Google Drive without resumable chunking."""
     metadata = {'name': file_name}
     if DRIVE_FOLDER_ID:
         metadata['parents'] = [DRIVE_FOLDER_ID]
 
+    # Handle local file paths vs. binary streams / Streamlit UploadedFile objects
     if isinstance(file_data, str):
-        media = MediaFileUpload(file_data, mimetype=mime_type, resumable=True)
+        media = MediaFileUpload(file_data, mimetype=mime_type, resumable=False)
     else:
-        media = MediaIoBaseUpload(file_data, mimetype=mime_type, resumable=True)
+        # If passed an st.file_uploader object or BytesIO, ensure it's at position 0
+        if hasattr(file_data, 'getvalue'):
+            stream = io.BytesIO(file_data.getvalue())
+        else:
+            stream = file_data
+            stream.seek(0)
+            
+        media = MediaIoBaseUpload(stream, mimetype=mime_type, resumable=False)
 
     uploaded = drive_service.files().create(
         body=metadata,
@@ -54,16 +62,18 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     breeder_id = f"{prefix}-{timestamp}"
 
-    # Upload Photo
-    photo_name = f"{breeder_id}_photo.jpg"
-    _, photo_url = upload_to_drive(drive_service, photo_path, photo_name, 'image/jpeg')
+    # 1. Upload Photo (if provided)
+    photo_url = ""
+    if photo_path:
+        photo_name = f"{breeder_id}_photo.jpg"
+        _, photo_url = upload_to_drive(drive_service, photo_path, photo_name, 'image/jpeg')
 
-    # Upload QR Code
+    # 2. Upload QR Code
     qr_stream = generate_qr_code(breeder_id)
     qr_name = f"{breeder_id}_QR.png"
     _, qr_url = upload_to_drive(drive_service, qr_stream, qr_name, 'image/png')
 
-    # Append to Sheets
+    # 3. Append to Google Sheets
     row = [
         breeder_id,
         sex.capitalize(),
