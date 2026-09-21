@@ -14,7 +14,7 @@ from modules.spawn_manager import (
 def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
     """
     Sources and renders breeder images.
-    Converts Google Drive view links to direct thumbnail URLs 
+    Converts Google Drive view links or raw File IDs to direct thumbnail URLs 
     and displays a formatted placeholder if no image source is found.
     """
     if not image_url or not isinstance(image_url, str):
@@ -37,18 +37,20 @@ def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
 
     url = image_url.strip()
 
-    # Automatically extract file ID from Google Drive URLs
+    # Prepend protocol if missing but contains a drive domain
+    if not url.startswith("http://") and not url.startswith("https://") and "drive.google.com" in url:
+        url = "https://" + url
+
+    # Automatically extract file ID from Google Drive URLs or raw IDs
     file_id = None
     if "drive.google.com/file/d/" in url:
-        file_id = url.split("/d/")[1].split("/")[0]
-    elif "drive.google.com/open?id=" in url:
-        file_id = url.split("id=")[1].split("&")[0]
-    elif "drive.google.com/uc?id=" in url:
+        file_id = url.split("/d/")[1].split("/")[0].split("?")[0]
+    elif "drive.google.com/open?id=" in url or "id=" in url:
         file_id = url.split("id=")[1].split("&")[0]
     elif re.match(r'^[a-zA-Z0-9_-]{25,50}$', url):
         file_id = url
 
-    # If it's a Google Drive ID, convert it to a direct thumbnail source
+    # If a Google Drive ID is detected, convert it to a direct high-res thumbnail link
     if file_id:
         url = f"https://drive.google.com/thumbnail?id={file_id}&sz=w800"
 
@@ -130,8 +132,14 @@ def render_spawn_page():
                     # --- Male Breeder Image & Details ---
                     with col_male:
                         st.markdown("#### ♂️ Male Breeder")
-                        # Sources the male image URL (tries 'image_url', 'image', or 'photo')
-                        male_img_src = male.get("image_url") or male.get("image") or male.get("photo") or ""
+                        # Priority check: 'photo_id' from breeder registry, then fallbacks
+                        male_img_src = (
+                            male.get("photo_id") or 
+                            male.get("image_url") or 
+                            male.get("image") or 
+                            male.get("photo") or 
+                            ""
+                        )
                         display_breeder_image(male_img_src, gender_label="Male")
                         st.markdown(f"**ID:** `{male.get('id', spawn['male_id'])}`")
                         st.markdown(f"**Variety:** {male.get('variety', 'N/A')}")
@@ -140,8 +148,14 @@ def render_spawn_page():
                     # --- Female Breeder Image & Details ---
                     with col_female:
                         st.markdown("#### ♀️ Female Breeder")
-                        # Sources the female image URL (tries 'image_url', 'image', or 'photo')
-                        female_img_src = female.get("image_url") or female.get("image") or female.get("photo") or ""
+                        # Priority check: 'photo_id' from breeder registry, then fallbacks
+                        female_img_src = (
+                            female.get("photo_id") or 
+                            female.get("image_url") or 
+                            female.get("image") or 
+                            female.get("photo") or 
+                            ""
+                        )
                         display_breeder_image(female_img_src, gender_label="Female")
                         st.markdown(f"**ID:** `{female.get('id', spawn['female_id'])}`")
                         st.markdown(f"**Variety:** {female.get('variety', 'N/A')}")
