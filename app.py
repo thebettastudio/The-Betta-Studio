@@ -9,6 +9,21 @@ from modules.spawn_manager import format_spawns_sheet
 
 st.set_page_config(page_title="The Betta Studio", page_icon="🐟", layout="wide")
 
+# --- Global UI Styling ---
+st.markdown("""
+<style>
+  .spawn-card-img {
+    width: 80px;
+    height: 80px;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid #e0e0e0;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  }
+</style>
+""", unsafe_allow_html=True)
+
+
 def run_google_diagnostic():
     """Runs a live health check on Google Drive & Sheets connections and provides formatting utilities."""
     with st.sidebar.expander("🛠️ System Diagnostics"):
