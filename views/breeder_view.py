@@ -1,7 +1,11 @@
 # views/breeder_view.py
 import datetime
 import streamlit as st
-from modules.breeder_registry import register_breeder, get_all_breeders
+from modules.breeder_registry import (
+    register_breeder,
+    get_all_breeders,
+    delete_breeder
+)
 
 def render_breeder_page():
     st.title("🐟 Betta Breeder Management")
@@ -74,9 +78,10 @@ def render_breeder_page():
 
             cols = st.columns(3)
             for idx, b in enumerate(filtered):
+                breeder_id = b['id']
                 with cols[idx % 3]:
                     with st.container(border=True):
-                        st.markdown(f"### {b['id']}")
+                        st.markdown(f"### {breeder_id}")
                         st.caption(f"**Sex:** {b['sex']} | **Status:** `{b['status']}`")
                         st.write(f"**Variety:** {b['variety']}")
                         st.write(f"**Lineage:** {b['lineage']}")
@@ -90,3 +95,32 @@ def render_breeder_page():
                             st.image(img_src, use_container_width=True)
                         else:
                             st.caption("📷 *No Photo Available*")
+
+                        st.divider()
+
+                        # DELETE BREEDER SECTION
+                        confirm_key = f"confirm_del_{breeder_id}"
+
+                        if st.session_state.get(confirm_key, False):
+                            st.warning("⚠️ Delete this breeder and associated media?")
+                            btn_col1, btn_col2 = st.columns(2)
+                            
+                            with btn_col1:
+                                if st.button("Yes, Delete", key=f"yes_{breeder_id}", type="primary", use_container_width=True):
+                                    with st.spinner("Deleting..."):
+                                        success = delete_breeder(breeder_id)
+                                    if success:
+                                        st.session_state[confirm_key] = False
+                                        st.success("Deleted!")
+                                        st.rerun()
+                                    else:
+                                        st.error("Failed to delete.")
+                            
+                            with btn_col2:
+                                if st.button("Cancel", key=f"no_{breeder_id}", use_container_width=True):
+                                    st.session_state[confirm_key] = False
+                                    st.rerun()
+                        else:
+                            if st.button("🗑️ Delete Breeder", key=f"del_btn_{breeder_id}", use_container_width=True):
+                                st.session_state[confirm_key] = True
+                                st.rerun()
