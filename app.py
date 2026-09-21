@@ -9,16 +9,68 @@ from modules.spawn_manager import format_spawns_sheet
 
 st.set_page_config(page_title="The Betta Studio", page_icon="🐟", layout="wide")
 
-# --- Global UI Styling ---
+# ==============================================================================
+# GLOBAL STYLING: Applies Deep Midnight Dark Theme & Micro-Glow to ALL Pages
+# ==============================================================================
 st.markdown("""
 <style>
+  /* 1. Base App Dark Background */
+  .stApp {
+    background-color: #0F1117;
+    color: #E6E8EB;
+  }
+  
+  /* 2. Sidebar Customization */
+  section[data-testid="stSidebar"] {
+    background-color: #161922 !important;
+    border-right: 1px solid #232733;
+  }
+
+  /* 3. Global Cards / Expanders / Containers */
+  div[data-testid="stExpander"], div.stCard, div[data-testid="stVerticalBlock"] > div[style*="background-color"] {
+    background: #1A1D24;
+    border: 1px solid #282C37;
+    border-radius: 12px;
+  }
+
+  /* 4. Global Spawn / Breeder Card Component */
+  .spawn-card {
+      background-color: #1A1D24;
+      border: 1px solid #282C37;
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 12px;
+  }
+
+  /* 5. Betta Image - Compact Size & Cyan Hover Glow */
   .spawn-card-img {
-    width: 80px;
-    height: 80px;
-    object-fit: cover;
-    border-radius: 8px;
-    border: 1px solid #e0e0e0;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+      width: 80px;
+      height: 80px;
+      object-fit: cover;
+      border-radius: 10px;
+      border: 2px solid #2A303F;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 10px rgba(0, 210, 255, 0.15);
+      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+  }
+
+  .spawn-card-img:hover {
+      transform: scale(1.05);
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.6), 0 0 15px rgba(0, 210, 255, 0.5);
+      border-color: #00D2FF;
+  }
+
+  .spawn-details h4 {
+      margin: 0 0 6px 0;
+      color: #00D2FF;
+  }
+
+  .spawn-details p {
+      margin: 2px 0;
+      color: #E6E8EB;
+      font-size: 14px;
   }
 </style>
 """, unsafe_allow_html=True)
