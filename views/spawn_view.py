@@ -1,4 +1,3 @@
-# views/spawn_view.py
 import datetime
 import streamlit as st
 from modules.spawn_manager import (
@@ -21,7 +20,7 @@ def render_spawn_page():
     ])
 
     # ==========================================
-    # TAB 1: ACTIVE PAIRINGS (WITH BREEDER DETAILS)
+    # TAB 1: ACTIVE PAIRINGS
     # ==========================================
     with tab1:
         st.subheader("Currently Active Pairings")
@@ -49,7 +48,6 @@ def render_spawn_page():
                     days_paired = 0
 
                 with st.container(border=True):
-                    # Header Info
                     st.markdown(f"### 🧪 Spawn: `{spawn_id}`")
                     st.caption(f"📍 **Tank:** {spawn['tank']} | 📅 **Paired:** {pairing_date} ({days_paired} days ago) | 🏷️ **Status:** `{status}`")
 
@@ -60,7 +58,7 @@ def render_spawn_page():
 
                     st.divider()
 
-                    # Side-by-side Male & Female Visual Cards
+                    # Side-by-side Breeder Cards
                     col_male, col_female = st.columns(2)
 
                     with col_male:
@@ -81,8 +79,7 @@ def render_spawn_page():
 
                     st.divider()
 
-                    # Quick Action Controls
-                    st.markdown("##### ⚡ Quick Actions")
+                    # Quick Controls
                     col_a, col_b, col_c = st.columns(3)
 
                     with col_a:
