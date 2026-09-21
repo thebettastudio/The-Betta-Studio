@@ -108,10 +108,6 @@ def format_spawns_sheet():
     ]
 
     # Add Conditional Formatting Rules for Status (Col E)
-    # Status "In Pairing" -> Warm Vibrant Amber/Yellow
-    # Status "Free Swimming" -> Lively Soft Green
-    # Status "Pending (Success)" -> Light Cyan/Blue
-    # Status "Failed" -> Soft Crimson Red
     status_rules = [
         ("In Pairing", {"red": 1.0, "green": 0.94, "blue": 0.8}, {"red": 0.6, "green": 0.4, "blue": 0.0}),
         ("Free Swimming", {"red": 0.85, "green": 0.95, "blue": 0.85}, {"red": 0.1, "green": 0.5, "blue": 0.2}),
@@ -171,7 +167,6 @@ def get_breeder_details_map():
             continue
         breeder_id = row[0]
 
-        # Column map:
         # Col A (0): ID | Col B (1): Sex | Col C (2): Variety | Col D (3): Status
         # Col E (4): Tank | Col F (5): Grade | Col G (6): Photo ID / Image URL | Col H (7): Notes
         photo_val = row[6] if len(row) > 6 else ""
@@ -348,7 +343,7 @@ def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
 
 def mark_pairing_failed(spawn_id, failure_reason):
     _, sheets_service = get_google_services()
-    row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
+    row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_data if 'spawn_data' in locals() else spawn_id)
     if row_idx:
         male_id, female_id = spawn_data[1], spawn_data[2]
 
