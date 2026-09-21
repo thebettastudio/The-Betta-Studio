@@ -10,8 +10,27 @@ SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
-DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", os.getenv("DRIVE_FOLDER_ID", ""))
-SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", os.getenv("SPREADSHEET_ID", ""))
+# Hardcode accurate fallbacks to safeguard against stale/cached secrets
+DEFAULT_SPREADSHEET_ID = "1wYEjEyZgnWS7YEU_Xde4bjhQrOxMYfe2q-PV8YMVfIo"
+DEFAULT_DRIVE_FOLDER_ID = "1F0PmaZN_sUP5qDfIeSvsY6hSiYFSNO0y"
+
+def get_spreadsheet_id() -> str:
+    """Dynamically retrieves and cleans the Spreadsheet ID."""
+    sid = st.secrets.get("SPREADSHEET_ID", os.getenv("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID))
+    sid = str(sid).strip()
+    # Fallback if the secrets value is somehow truncated or invalid
+    if len(sid) < 40:
+        return DEFAULT_SPREADSHEET_ID
+    return sid
+
+def get_drive_folder_id() -> str:
+    """Dynamically retrieves and cleans the Drive Folder ID."""
+    fid = st.secrets.get("DRIVE_FOLDER_ID", os.getenv("DRIVE_FOLDER_ID", DEFAULT_DRIVE_FOLDER_ID))
+    return str(fid).strip()
+
+# Global variables for backward compatibility across existing views
+SPREADSHEET_ID = get_spreadsheet_id()
+DRIVE_FOLDER_ID = get_drive_folder_id()
 
 def get_google_services():
     creds = None
