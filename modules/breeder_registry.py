@@ -29,7 +29,6 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     if DRIVE_FOLDER_ID:
         metadata['parents'] = [DRIVE_FOLDER_ID]
 
-    # Handle local paths vs BytesIO vs Streamlit UploadedFile objects
     if isinstance(file_data, str):
         media = MediaFileUpload(file_data, mimetype=mime_type, resumable=False)
     else:
@@ -52,7 +51,6 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     file_id = uploaded.get('id')
     web_link = uploaded.get('webViewLink')
 
-    # Make file publicly readable so images load seamlessly inside Streamlit
     try:
         drive_service.permissions().create(
             fileId=file_id,
@@ -68,7 +66,7 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     1. Generates a unique Breeder ID.
     2. Creates and uploads a QR Code image to Drive.
     3. Uploads the breeder photo to Drive.
-    4. Records the breeder row in Google Sheets ('Breeders' tab) with clickable formulas.
+    4. Records the breeder row in Google Sheets ('Breeders' tab).
     """
     drive_service, sheets_service = get_google_services()
 
@@ -94,15 +92,12 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     except Exception as e:
         print(f"Warning: QR upload failed: {e}")
 
-    # HYPERLINK formula for Google Sheets fallback
     photo_cell = f'=HYPERLINK("{photo_url}", "View Photo")' if photo_url else "No Photo"
     qr_cell = f'=HYPERLINK("{qr_url}", "View QR")' if qr_url else "No QR"
 
-    # 3. Format date strings
     dob_str = str(dob) if dob else ""
     date_registered = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 4. Row layout aligned strictly to columns A through J
     row = [
         breeder_id,            # A: Breeder ID
         sex.capitalize(),      # B: Sex
@@ -130,7 +125,7 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     }
 
 def get_all_breeders():
-    """Fetches all registered breeders from Google Sheets for the in-app Streamlit Gallery."""
+    """Fetches all registered breeders from Google Sheets for the Streamlit Gallery."""
     _, sheets_service = get_google_services()
     
     try:
