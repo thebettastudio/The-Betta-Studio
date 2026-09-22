@@ -214,14 +214,23 @@ def render_spawn_page():
 
                     with col_b:
                         with st.popover("🏊 Mark Free Swimming", use_container_width=True):
-                            # Concise batch code formatted for easy jarring & ID tagging (e.g. "DRG-F1")
-                            default_batch_name = f"{line_code}-{generation}" if line_code != "N/A" and generation != "N/A" else f"SP-{spawn_id}"
+                            # Ensure clean, short batch naming for jar indexing
+                            clean_line = line_code.strip() if line_code and line_code != "N/A" else ""
                             
+                            # Fallback to spawn_id if line_code contains long descriptions/brackets
+                            if len(clean_line) > 12 or "[" in clean_line or "]" in clean_line:
+                                batch_prefix = f"SP{spawn_id}"
+                            else:
+                                batch_prefix = clean_line or f"SP{spawn_id}"
+
+                            gen_suffix = f"-{generation}" if generation and generation != "N/A" else ""
+                            default_batch_name = f"{batch_prefix}{gen_suffix}"
+
                             batch_name = st.text_input(
                                 "Batch Name / Code", 
                                 value=default_batch_name, 
                                 key=f"batch_{spawn_id}",
-                                help="Short prefix used when jarring individual fish (e.g., DRG-F1-01)"
+                                help="Short prefix used when jarring individual fish (e.g. SP01-F1-01)"
                             )
                             fry_cnt = st.number_input("Estimated Fry", min_value=1, value=50, key=f"cnt_{spawn_id}")
                             if st.button("Confirm Free Swim", key=f"confirm_swim_{spawn_id}"):
