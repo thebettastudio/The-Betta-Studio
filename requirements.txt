@@ -4,3 +4,5 @@ google-auth-httplib2
 google-auth-oauthlib
 qrcode
 Pillow
+pandas
+plotly
