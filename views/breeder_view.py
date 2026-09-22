@@ -4,7 +4,7 @@ import streamlit as st
 from modules.breeder_registry import (
     register_breeder,
     get_all_breeders,
-    delete_breeder
+    retire_breeder  # Updated function import
 )
 
 # Preset list of color pattern classes
@@ -22,11 +22,22 @@ COLOR_PATTERN_OPTIONS = [
     "Others"
 ]
 
+# Retirement Reason Options
+RETIREMENT_REASONS = [
+    "Bad Parent (Egg / Fry Eater)",
+    "Sick / Damaged / Health Issue",
+    "Old Age / Natural Retirement",
+    "Aggressive / Killed Partner",
+    "Infertility / Low Hatch Rate",
+    "Sold / Transferred",
+    "Other"
+]
+
 def evaluate_grade(caudal_180, caudal_prop, dorsal_good, anal_good, ventral_good, pectoral_good, body_shape, color_good):
     """
     Evaluates fish grade based on physical traits and IBC show criteria:
     - Show Grade: Full 180° caudal spread, clean fin branching/proportion, 
-                 proper body shape (Bullet/Regular), clean dorsal/anal/ventral/pectoral fins, and good color.
+                  proper body shape (Bullet/Regular), clean dorsal/anal/ventral/pectoral fins, and good color.
     - Material Grade: Good color coverage and high-tier form features, but minor form flaws or spoonhead.
     - Pet Grade: Lacks core form criteria or key show traits.
     """
@@ -177,18 +188,20 @@ def render_breeder_page():
             cols = st.columns(3)
             for idx, b in enumerate(filtered):
                 breeder_id = b['id']
+                is_retired = b.get('status', 'Active').lower() == 'retired'
+
                 with cols[idx % 3]:
                     with st.container(border=True):
                         st.markdown(f"### {breeder_id}")
-                        st.caption(f"**Sex:** {b['sex']} | **Status:** `{b['status']}`")
+                        st.caption(f"**Sex:** {b['sex']} | **Status:** `{b.get('status', 'Active')}`")
                         st.write(f"**Variety:** {b['variety']}")
                         st.write(f"**Lineage:** {b['lineage']}")
                         st.write(f"**DOB:** {b['dob']}")
                         
-                        if b['notes']:
+                        if b.get('notes'):
                             st.info(f"**Notes:** {b['notes']}")
                         
-                        if b['photo_id']:
+                        if b.get('photo_id'):
                             img_src = f"https://drive.google.com/thumbnail?id={b['photo_id']}&sz=w800"
                             st.image(img_src, use_container_width=True)
                         else:
@@ -196,29 +209,31 @@ def render_breeder_page():
 
                         st.divider()
 
-                        # DELETE BREEDER SECTION
-                        confirm_key = f"confirm_del_{breeder_id}"
-
-                        if st.session_state.get(confirm_key, False):
-                            st.warning("⚠️ Delete this breeder and associated media?")
-                            btn_col1, btn_col2 = st.columns(2)
-                            
-                            with btn_col1:
-                                if st.button("Yes, Delete", key=f"yes_{breeder_id}", type="primary", use_container_width=True):
-                                    with st.spinner("Deleting..."):
-                                        success = delete_breeder(breeder_id)
+                        # RETIRE BREEDER SECTION (Replaces Delete)
+                        if is_retired:
+                            st.caption("🚫 *This breeder is currently retired.*")
+                        else:
+                            with st.popover("🚫 Retire Breeder", use_container_width=True):
+                                st.markdown("### Retire / Deactivate Breeder")
+                                st.caption("Select a reason for taking this breeder out of active breeding rotations.")
+                                
+                                reason = st.selectbox(
+                                    "Reason for Retirement",
+                                    RETIREMENT_REASONS,
+                                    key=f"retire_reason_{breeder_id}"
+                                )
+                                
+                                add_notes = st.text_area(
+                                    "Additional Context / Details",
+                                    placeholder="e.g. Ate eggs on 2 consecutive spawn attempts.",
+                                    key=f"retire_notes_{breeder_id}"
+                                )
+                                
+                                if st.button("Confirm Retirement", key=f"confirm_retire_{breeder_id}", type="primary", use_container_width=True):
+                                    with st.spinner("Updating status..."):
+                                        success = retire_breeder(breeder_id, reason=reason, notes=add_notes)
                                     if success:
-                                        st.session_state[confirm_key] = False
-                                        st.success("Deleted!")
+                                        st.success(f"Breeder {breeder_id} retired!")
                                         st.rerun()
                                     else:
-                                        st.error("Failed to delete.")
-                            
-                            with btn_col2:
-                                if st.button("Cancel", key=f"no_{breeder_id}", use_container_width=True):
-                                    st.session_state[confirm_key] = False
-                                    st.rerun()
-                        else:
-                            if st.button("🗑️ Delete Breeder", key=f"del_btn_{breeder_id}", use_container_width=True):
-                                st.session_state[confirm_key] = True
-                                st.rerun()
+                                        st.error("Failed to update status.")
