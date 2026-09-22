@@ -27,13 +27,19 @@ def generate_tank_qr(tank_id):
     img_stream.seek(0)
     return img_stream
 
-def upload_tank_qr_to_drive(drive_service, qr_stream, file_name):
-    """Uploads tank QR tag image to Google Drive."""
-    raw_bytes = qr_stream.getvalue()
+def upload_to_drive(drive_service, file_data, file_name, mime_type):
+    """Uploads a file directly to Google Drive."""
+    if hasattr(file_data, 'getvalue'):
+        raw_bytes = file_data.getvalue()
+    elif hasattr(file_data, 'read'):
+        raw_bytes = file_data.read()
+    else:
+        raw_bytes = file_data
+
     stream = io.BytesIO(raw_bytes)
     stream.seek(0)
 
-    media = MediaIoBaseUpload(stream, mimetype='image/png', resumable=False)
+    media = MediaIoBaseUpload(stream, mimetype=mime_type, resumable=False)
     folder_id = get_drive_folder_id()
 
     metadata = {'name': file_name}
@@ -54,58 +60,71 @@ def upload_tank_qr_to_drive(drive_service, qr_stream, file_name):
             body={'type': 'anyone', 'role': 'reader'}
         ).execute()
     except Exception as e:
-        print(f"Warning: Could not set permission for QR file {file_id}: {e}")
+        print(f"Warning: Could not set permission on file {file_id}: {e}")
 
     return file_id
 
-def register_tank(tank_type, location, capacity_liters, current_occupant="", notes=""):
+def register_tank(tank_type, location, capacity_liters, photo_file=None, current_occupant="", notes=""):
     """
-    Registers a new Tank/Container ID and logs it into Google Sheets.
-    Format: TNK-[TYPE_PREFIX]-[TIMESTAMP]
+    1. Generates a unique Tank ID upon submission.
+    2. Uploads container photo (if provided) and QR Tag to Google Drive.
+    3. Saves record in Google Sheets.
     """
     drive_service, sheets_service = get_google_services()
     spreadsheet_id = get_spreadsheet_id()
 
+    # Generate unique Tank ID dynamically upon submission
     type_prefix = tank_type.replace(" ", "")[:3].upper()
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     tank_id = f"TNK-{type_prefix}-{timestamp}"
 
-    # Generate & Upload Tank QR Tag (Optional usage)
+    # 1. Upload Container Photo (if uploaded)
+    photo_id = ""
+    if photo_file is not None:
+        try:
+            photo_name = f"{tank_id}_photo.jpg"
+            photo_id = upload_to_drive(drive_service, photo_file, photo_name, 'image/jpeg')
+        except Exception as e:
+            st.error(f"Failed to upload photo: {e}")
+
+    # 2. Upload Tank QR Code
     qr_id = ""
     try:
         qr_stream = generate_tank_qr(tank_id)
         qr_name = f"{tank_id}_QR.png"
-        qr_id = upload_tank_qr_to_drive(drive_service, qr_stream, qr_name)
+        qr_id = upload_to_drive(drive_service, qr_stream, qr_name, 'image/png')
     except Exception as e:
-        print(f"Warning: Failed to upload QR Code: {e}")
+        print(f"Warning: Failed to generate QR Code: {e}")
 
     date_registered = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     row = [
-        tank_id,               # A: Tank ID
+        tank_id,               # A: Tank System ID
         tank_type,             # B: Tank / Container Type
         location,              # C: Tape Code / Location Tag
         capacity_liters,       # D: Capacity (Liters)
-        "Active",              # E: Status (Active, Cleaning, Empty, Retired)
-        current_occupant,      # F: Current Occupant (Breeder / Spawn ID)
-        qr_id,                 # G: QR Code Drive ID
-        notes,                 # H: Notes
-        date_registered        # I: Date Registered
+        "Active",              # E: Status
+        current_occupant,      # F: Current Occupant
+        photo_id,              # G: Photo Drive ID
+        qr_id,                 # H: QR Code Drive ID
+        notes,                 # I: Notes
+        date_registered        # J: Date Registered
     ]
 
     sheets_service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
-        range='Tanks!A:I',
+        range='Tanks!A:J',
         valueInputOption='USER_ENTERED',
         body={'values': [row]}
     ).execute()
 
-    direct_qr_url = f"https://drive.google.com/thumbnail?id={qr_id}&sz=w800" if qr_id else None
+    direct_photo_url = f"https://drive.google.com/thumbnail?id={photo_id}&sz=w800" if photo_id else None
 
     return {
         "tank_id": tank_id,
+        "photo_id": photo_id,
         "qr_id": qr_id,
-        "direct_qr_url": direct_qr_url
+        "direct_photo_url": direct_photo_url
     }
 
 def get_all_tanks():
@@ -116,7 +135,7 @@ def get_all_tanks():
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range='Tanks!A2:I'
+            range='Tanks!A2:J'
         ).execute()
 
         rows = result.get('values', [])
@@ -125,7 +144,7 @@ def get_all_tanks():
         for row in rows:
             if not row:
                 continue
-            while len(row) < 9:
+            while len(row) < 10:
                 row.append("")
 
             tanks.append({
@@ -135,9 +154,10 @@ def get_all_tanks():
                 "capacity": str(row[3]),
                 "status": str(row[4]) if row[4] else "Active",
                 "occupant": str(row[5]),
-                "qr_id": str(row[6]),
-                "notes": str(row[7]),
-                "date_registered": str(row[8])
+                "photo_id": str(row[6]),
+                "qr_id": str(row[7]),
+                "notes": str(row[8]),
+                "date_registered": str(row[9])
             })
 
         return tanks
@@ -146,14 +166,14 @@ def get_all_tanks():
         return []
 
 def update_tank_status(tank_id: str, new_status: str, occupant: str = "", notes: str = "") -> bool:
-    """Updates tank status, current occupant, or maintenance notes."""
+    """Updates tank status, current occupant, or notes."""
     try:
         drive_service, sheets_service = get_google_services()
         spreadsheet_id = get_spreadsheet_id()
 
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range='Tanks!A:I'
+            range='Tanks!A:J'
         ).execute()
 
         rows = result.get('values', [])
@@ -169,9 +189,16 @@ def update_tank_status(tank_id: str, new_status: str, occupant: str = "", notes:
 
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f'Tanks!E{target_row}:H{target_row}',
+            range=f'Tanks!E{target_row}:F{target_row}',
             valueInputOption='USER_ENTERED',
-            body={'values': [[new_status, occupant, "", notes]]}
+            body={'values': [[new_status, occupant]]}
+        ).execute()
+
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f'Tanks!I{target_row}',
+            valueInputOption='USER_ENTERED',
+            body={'values': [[notes]]}
         ).execute()
 
         return True
