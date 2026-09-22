@@ -6,7 +6,7 @@ import streamlit as st
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
 
 # ------------------------------------------------------------------------------
-# Helper Functions: Sheet Initialization, Strains, Tanks & Grades
+# Helper Functions: Sheet Initialization, Tanks & Grades
 # ------------------------------------------------------------------------------
 
 def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
@@ -37,52 +37,11 @@ def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
 
 def ensure_fish_master_sheet_exists(sheets_service):
     headers = [
-        "Fish ID", "Variety / Strain", "Gender", "Grade", 
+        "Fish ID", "Variety / Type", "Gender", "Grade", 
         "Tank ID", "Seller", "Purchase Date", "Purchase Cost", 
         "Image URL", "Notes"
     ]
     ensure_sheet_exists(sheets_service, 'Fish_Master', headers)
-
-
-def get_registered_strains(sheets_service):
-    """Fetch list of saved strains from 'Master_Strains' sheet or return defaults."""
-    default_strains = [
-        "Yellow Koi Galaxy",
-        "Red Koi Galaxy",
-        "Blue Rim",
-        "Avatar",
-        "Black Star / Samurai",
-        "Red Dragon",
-        "Copper Light",
-        "Fancy Marble",
-        "Super Red",
-        "Super Black"
-    ]
-    try:
-        res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Master_Strains!A2:A'
-        ).execute()
-        rows = res.get('values', [])
-        strains = [r[0] for r in rows if r and r[0].strip()]
-        return sorted(list(set(default_strains + strains)))
-    except Exception:
-        return default_strains
-
-
-def add_new_strain_to_db(sheets_service, new_strain):
-    """Save a new strain to the 'Master_Strains' worksheet."""
-    try:
-        ensure_sheet_exists(sheets_service, 'Master_Strains', ["Strain Name"])
-        sheets_service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Master_Strains!A:A',
-            valueInputOption='USER_ENTERED',
-            body={'values': [[new_strain.strip()]]}
-        ).execute()
-        st.toast(f"✅ Saved '{new_strain}' to Strain Registry!", icon="✨")
-    except Exception as e:
-        st.error(f"Could not save strain to database ({e})")
 
 
 def get_available_tanks(sheets_service):
@@ -178,40 +137,6 @@ def render_fish_registry_page():
     with tab_register:
         st.subheader("🛒 Purchased / Imported Fish Details")
 
-        # Fetch existing strains from Google Sheets DB
-        strains_list = get_registered_strains(sheets_service)
-
-        # ----------------------------------------------------------------------
-        # Clean Add-Strain Popover (Outside Form for Instant Reload)
-        # ----------------------------------------------------------------------
-        strain_col_select, strain_col_btn = st.columns([4, 1])
-        
-        with strain_col_btn:
-            st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
-            with st.popover("➕ Add Strain"):
-                st.markdown("##### Add New Strain")
-                new_strain_val = st.text_input("Strain Name", placeholder="e.g. Copper Blue Star").strip()
-                if st.button("Save Strain", use_container_width=True, type="primary"):
-                    if new_strain_val:
-                        add_new_strain_to_db(sheets_service, new_strain_val)
-                        st.session_state["selected_strain"] = new_strain_val
-                        st.rerun()
-                    else:
-                        st.warning("Please enter a strain name.")
-
-        # Auto-select the newly created strain if saved in session_state
-        default_index = 0
-        if "selected_strain" in st.session_state and st.session_state["selected_strain"] in strains_list:
-            default_index = strains_list.index(st.session_state["selected_strain"])
-
-        with strain_col_select:
-            selected_strain = st.selectbox(
-                "Select Strain",
-                options=strains_list,
-                index=default_index,
-                key="select_strain_dropdown"
-            )
-
         # ----------------------------------------------------------------------
         # Registration Form
         # ----------------------------------------------------------------------
@@ -220,7 +145,7 @@ def render_fish_registry_page():
 
             with col1:
                 st.markdown("##### 🧬 Variety & Details")
-                form_type = st.text_input("Form / Type", value="HMPK", help="Default is HMPK (Halfmoon Plakat)")
+                form_type = st.text_input("Form / Type", value="HMPK", help="e.g. HMPK, Crown Tail, Halfmoon")
                 gender = st.selectbox("Gender", ["Male", "Female"])
                 seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder")
                 purchase_date = st.date_input("Purchase Date", datetime.date.today())
@@ -319,7 +244,7 @@ def render_fish_registry_page():
             # Prepare row data for Google Sheets
             new_fish_record = [
                 f"FISH-{datetime.datetime.now().strftime('%M%S')}",
-                f"{form_type} - {selected_strain}",
+                form_type,
                 gender,
                 computed_grade,
                 selected_tank_id,
@@ -339,7 +264,7 @@ def render_fish_registry_page():
                 ).execute()
 
                 st.balloons()
-                st.success(f"🎉 Fish ({selected_strain}) successfully registered as Grade: **{computed_grade}** assigned to **{selected_tank_id}**!")
+                st.success(f"🎉 Fish successfully registered as Grade: **{computed_grade}** assigned to **{selected_tank_id}**!")
             except Exception as e:
                 st.error(f"Error saving fish record: {e}")
 
