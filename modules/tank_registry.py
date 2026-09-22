@@ -310,7 +310,7 @@ def update_tank_status(tank_id: str, new_status: str, purpose: str = "", occupan
             }
         ]
 
-        sheets_service.spreadsheets().values().batchUpdate(
+        sheets_service.spreadsheets().values.batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={
                 'valueInputOption': 'USER_ENTERED',
@@ -321,4 +321,84 @@ def update_tank_status(tank_id: str, new_status: str, purpose: str = "", occupan
         return True
     except Exception as e:
         print(f"Error updating tank status: {e}")
+        return False
+
+def delete_tank(tank_id: str) -> bool:
+    """
+    Deletes a tank row from Google Sheets and deletes its associated photo and QR files from Google Drive.
+    """
+    try:
+        drive_service, sheets_service = get_google_services()
+        spreadsheet_id = get_spreadsheet_id()
+
+        ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
+
+        # 1. Fetch worksheet metadata to find the internal sheetId for 'Tanks'
+        sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        tanks_sheet_id = None
+        for s in sheet_metadata.get('sheets', []):
+            if s['properties']['title'] == 'Tanks':
+                tanks_sheet_id = s['properties']['sheetId']
+                break
+
+        if tanks_sheet_id is None:
+            st.error("Could not find 'Tanks' sheet tab.")
+            return False
+
+        # 2. Retrieve all rows (A:K) to locate target row index and Drive file IDs
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range='Tanks!A:K'
+        ).execute()
+
+        rows = result.get('values', [])
+        target_row_idx = None
+        photo_id = ""
+        qr_id = ""
+
+        for idx, row in enumerate(rows):
+            if row and str(row[0]).strip() == str(tank_id).strip():
+                target_row_idx = idx  # 0-indexed position
+                if len(row) > 7:
+                    photo_id = str(row[7])
+                if len(row) > 8:
+                    qr_id = str(row[8])
+                break
+
+        if target_row_idx is None:
+            st.error(f"Tank ID '{tank_id}' not found in Google Sheets.")
+            return False
+
+        # 3. Delete row via Google Sheets batchUpdate (deleteDimension request)
+        body = {
+            "requests": [
+                {
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": tanks_sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": target_row_idx,
+                            "endIndex": target_row_idx + 1
+                        }
+                    }
+                }
+            ]
+        }
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body=body
+        ).execute()
+
+        # 4. Cleanup media files from Google Drive if present
+        for file_id in [photo_id, qr_id]:
+            clean_file_id = file_id.strip()
+            if clean_file_id:
+                try:
+                    drive_service.files().delete(fileId=clean_file_id).execute()
+                except Exception as file_err:
+                    print(f"Warning: Could not delete Drive file {clean_file_id}: {file_err}")
+
+        return True
+    except Exception as e:
+        st.error(f"Error deleting tank: {e}")
         return False
