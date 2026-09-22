@@ -214,7 +214,14 @@ def render_spawn_page():
 
                     with col_b:
                         with st.popover("🏊 Mark Free Swimming", use_container_width=True):
-                            batch_name = st.text_input("Batch Name", key=f"batch_{spawn_id}")
+                            # Default batch name automatically combines line code and generation (e.g. "DRG-F1")
+                            default_batch_name = f"{line_code}-{generation}" if line_code != "N/A" and generation != "N/A" else ""
+                            
+                            batch_name = st.text_input(
+                                "Batch Name", 
+                                value=default_batch_name, 
+                                key=f"batch_{spawn_id}"
+                            )
                             fry_cnt = st.number_input("Estimated Fry", min_value=1, value=50, key=f"cnt_{spawn_id}")
                             if st.button("Confirm Free Swim", key=f"confirm_swim_{spawn_id}"):
                                 if batch_name:
