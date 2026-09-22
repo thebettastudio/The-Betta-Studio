@@ -11,7 +11,7 @@ from modules.drive_service import (
     get_drive_folder_id
 )
 
-def ensure_tanks_tab_exists(sheets_service, spreadsheet_id):
+def ensure_tanks_tab_exists(sheets_service, spreadsheet_id: str) -> None:
     """
     Ensures the 'Tanks' worksheet tab exists with proper headers in Google Sheets.
     """
@@ -57,7 +57,7 @@ def ensure_tanks_tab_exists(sheets_service, spreadsheet_id):
     except Exception as e:
         print(f"Warning: Failed during ensure_tanks_tab_exists execution: {e}")
 
-def get_next_tank_id(sheets_service, spreadsheet_id) -> str:
+def get_next_tank_id(sheets_service, spreadsheet_id: str) -> str:
     """Fetches existing IDs to compute the next sequential integer ID."""
     try:
         result = sheets_service.spreadsheets().values().get(
@@ -98,7 +98,7 @@ def generate_tape_code(tank_type: str) -> str:
     random_num = random.randint(1000, 9999)
     return f"{prefix}-{random_num}"
 
-def generate_tank_qr(tank_id):
+def generate_tank_qr(tank_id: str) -> io.BytesIO:
     """Generates a QR Code PNG stream for a given Tank ID."""
     qr = qrcode.QRCode(
         version=1,
@@ -115,7 +115,7 @@ def generate_tank_qr(tank_id):
     img_stream.seek(0)
     return img_stream
 
-def upload_to_drive(drive_service, file_data, file_name, mime_type):
+def upload_to_drive(drive_service, file_data, file_name: str, mime_type: str) -> str:
     """Uploads a file directly to Google Drive and makes it readable."""
     if hasattr(file_data, 'seek'):
         file_data.seek(0)
@@ -153,7 +153,7 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
 
     return file_id
 
-def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose", photo_file=None, current_occupant="", notes=""):
+def register_tank(tank_type: str, capacity_liters: float, purpose: str = "General / Multi-purpose", photo_file=None, current_occupant: str = "", notes: str = "") -> dict:
     """
     Registers a new container, auto-syncs status based on occupant presence, 
     uploads media (photo & QR) to Google Drive, and writes to Google Sheets.
@@ -210,7 +210,7 @@ def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose",
         "direct_photo_url": direct_photo_url
     }
 
-def get_all_tanks():
+def get_all_tanks() -> list:
     """Fetches all registered tank records from Google Sheets (Columns A through K)."""
     drive_service, sheets_service = get_google_services()
     spreadsheet_id = get_spreadsheet_id()
