@@ -67,11 +67,11 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
 
     return file_id, web_link
 
-def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
+def register_breeder(sex, variety, lineage, dob, photo_path, notes="", grade="Pet Grade"):
     """
     1. Generates a unique Breeder ID.
     2. Uploads QR Code and Photo directly to Google Drive.
-    3. Saves raw Drive File IDs in Google Sheets.
+    3. Saves raw Drive File IDs and Grade details in Google Sheets.
     """
     drive_service, sheets_service = get_google_services()
     spreadsheet_id = get_spreadsheet_id()
@@ -101,6 +101,9 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
     dob_str = str(dob) if dob else ""
     date_registered = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # Format notes to include evaluation grade if present
+    final_notes = f"[Grade: {grade}] {notes}".strip() if grade else notes
+
     row = [
         breeder_id,           # A: Breeder ID
         sex.capitalize(),     # B: Sex
@@ -110,7 +113,7 @@ def register_breeder(sex, variety, lineage, dob, photo_path, notes=""):
         "Available",          # F: Status
         photo_id,             # G: Raw Photo Drive ID
         qr_id,                # H: Raw QR Code Drive ID
-        notes,                # I: Notes
+        final_notes,          # I: Notes
         date_registered       # J: Date Registered
     ]
 
@@ -189,6 +192,44 @@ def get_all_breeders():
     except Exception as e:
         print(f"Error fetching breeders: {e}")
         return []
+
+def get_available_breeders():
+    """
+    Fetches active breeders that are NOT currently assigned to any tank container.
+    Used by tank dropdowns to list available occupants.
+    """
+    # Import inside function to prevent top-level circular dependency with tank_registry
+    try:
+        from modules.tank_registry import get_all_tanks
+        all_tanks = get_all_tanks()
+    except Exception as e:
+        print(f"Warning: Could not fetch tanks in get_available_breeders: {e}")
+        all_tanks = []
+
+    all_breeders = get_all_breeders()
+
+    # Collect IDs of occupants currently assigned to any tank
+    assigned_occupant_ids = set()
+    for t in all_tanks:
+        occupant_raw = str(t.get('occupant', '')).strip()
+        if occupant_raw and occupant_raw.lower() not in ["empty", "none", "n/a", ""]:
+            # Handle cases where occupant format is 'BRD-M-1234 | Variety' or raw ID 'BRD-M-1234'
+            occ_id = occupant_raw.split(" | ")[0].strip()
+            assigned_occupant_ids.add(occ_id)
+
+    # Filter breeders that are Active/Available and NOT assigned to a tank
+    available = []
+    for b in all_breeders:
+        status_clean = str(b.get('status', 'Available')).strip().lower()
+        breeder_id = str(b.get('id', '')).strip()
+
+        is_active = status_clean in ["available", "active"]
+        is_unassigned = breeder_id not in assigned_occupant_ids
+
+        if is_active and is_unassigned:
+            available.append(b)
+
+    return available
 
 def retire_breeder(breeder_id: str, reason: str, notes: str = "") -> bool:
     """
