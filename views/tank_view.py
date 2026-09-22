@@ -17,6 +17,18 @@ DEFAULT_CONTAINER_TYPES = [
     "➕ Other / Custom Container..."
 ]
 
+CONTAINER_PURPOSES = [
+    "🫙 Male / Female Individual Jarring",
+    "🥩 Breeder Conditioning",
+    "🥚 Spawning & Breeding Set-Up",
+    "🌿 Fry Nursery / Free Swimming",
+    "🪴 Fry / Juvenile Grow-Out",
+    "👑 Female Sorority Tank",
+    "🏥 Medical / Quarantine Treatment",
+    "🛒 Sales / Grooming Display",
+    "📦 General / Multi-purpose Storage"
+]
+
 def render_tank_page():
     st.title("🪣 Tank & Container Registry")
 
@@ -40,6 +52,7 @@ def render_tank_page():
                 capacity = st.number_input("Capacity (Liters)", min_value=0.1, max_value=500.0, value=6.0, step=0.5)
 
             with col2:
+                purpose = st.selectbox("Container Purpose / Role", CONTAINER_PURPOSES)
                 occupant = st.text_input("Current Occupant ID (Optional)", placeholder="e.g. BRD-M-20260920 or Spawn #001")
                 photo_file = st.file_uploader("📷 Container Photo (Optional)", type=["jpg", "jpeg", "png"])
                 notes = st.text_area("Notes / Setup Details", placeholder="e.g. Almond leaf tea water, sponge filter installed")
@@ -59,6 +72,7 @@ def render_tank_page():
                         tank_type=final_type,
                         location=location_code,
                         capacity_liters=capacity,
+                        purpose=purpose,
                         photo_file=photo_file,
                         current_occupant=occupant,
                         notes=notes
@@ -80,13 +94,14 @@ def render_tank_page():
         if not tanks:
             st.info("No containers registered yet.")
         else:
-            search_query = st.text_input("🔍 Search by ID, Tape Code, Type, or Occupant:", "").strip().lower()
+            search_query = st.text_input("🔍 Search by ID, Tape Code, Type, Purpose, or Occupant:", "").strip().lower()
 
             filtered = [
                 t for t in tanks
                 if search_query in t['id'].lower()
                 or search_query in t['type'].lower()
                 or search_query in t['location'].lower()
+                or search_query in t['purpose'].lower()
                 or search_query in t['occupant'].lower()
             ]
 
@@ -102,6 +117,7 @@ def render_tank_page():
                         st.markdown(f"### 🏷️ `{t['location']}`")
                         st.caption(f"**System ID:** `{tank_id}`")
                         st.write(f"🪣 **Type:** {t['type']}")
+                        st.write(f"🎯 **Purpose:** {t['purpose']}")
                         st.write(f"🧪 **Capacity:** {t['capacity']} L | **Status:** `{t['status']}`")
                         
                         if t['occupant']:
@@ -121,10 +137,23 @@ def render_tank_page():
                                 ["Active", "Cleaning / Quarantine", "Empty / Idle", "Retired"],
                                 key=f"status_{tank_id}"
                             )
+                            
+                            # Purpose index matching safely
+                            try:
+                                curr_p_idx = CONTAINER_PURPOSES.index(t['purpose'])
+                            except ValueError:
+                                curr_p_idx = 0
+
+                            new_purpose = st.selectbox(
+                                "Container Purpose",
+                                CONTAINER_PURPOSES,
+                                index=curr_p_idx,
+                                key=f"purpose_{tank_id}"
+                            )
                             new_occ = st.text_input("Current Occupant ID", value=t['occupant'], key=f"occ_{tank_id}")
                             new_notes = st.text_area("Notes", value=t['notes'], key=f"notes_{tank_id}")
 
                             if st.button("Save Changes", key=f"save_{tank_id}", type="primary"):
-                                if update_tank_status(tank_id, new_status, new_occ, new_notes):
+                                if update_tank_status(tank_id, new_status, new_purpose, new_occ, new_notes):
                                     st.success("Updated!")
                                     st.rerun()
