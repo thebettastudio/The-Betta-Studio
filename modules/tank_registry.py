@@ -154,7 +154,10 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
     return file_id
 
 def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose", photo_file=None, current_occupant="", notes=""):
-    """Registers a new tank in Google Sheets and uploads media to Google Drive."""
+    """
+    Registers a new container, auto-syncs status based on occupant presence, 
+    uploads media (photo & QR) to Google Drive, and writes to Google Sheets.
+    """
     drive_service, sheets_service = get_google_services()
     spreadsheet_id = get_spreadsheet_id()
 
@@ -162,6 +165,9 @@ def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose",
 
     tank_id = get_next_tank_id(sheets_service, spreadsheet_id)
     location_code = generate_tape_code(tank_type)
+
+    # Auto-determine status based on occupant presence
+    status = "Active" if current_occupant.strip() else "Empty / Idle"
 
     photo_id = ""
     if photo_file is not None:
@@ -182,8 +188,8 @@ def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose",
     date_registered = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     row = [
-        tank_id, tank_type, location_code, capacity_liters,
-        "Active", purpose, current_occupant, photo_id,
+        tank_id, tank_type, location_code, str(capacity_liters),
+        status, purpose, current_occupant.strip(), photo_id,
         qr_id, notes, date_registered
     ]
 
@@ -205,7 +211,7 @@ def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose",
     }
 
 def get_all_tanks():
-    """Fetches all registered tank records from Google Sheets."""
+    """Fetches all registered tank records from Google Sheets (Columns A through K)."""
     drive_service, sheets_service = get_google_services()
     spreadsheet_id = get_spreadsheet_id()
 
@@ -221,7 +227,7 @@ def get_all_tanks():
         tanks = []
 
         for row in rows:
-            if not row:
+            if not row or len(row) == 0:
                 continue
             while len(row) < 11:
                 row.append("")
@@ -231,7 +237,7 @@ def get_all_tanks():
                 "type": str(row[1]),
                 "location": str(row[2]),
                 "capacity": str(row[3]),
-                "status": str(row[4]) if row[4] else "Active",
+                "status": str(row[4]) if row[4] else "Empty / Idle",
                 "purpose": str(row[5]) if row[5] else "General / Multi-purpose",
                 "occupant": str(row[6]),
                 "photo_id": str(row[7]),
@@ -246,7 +252,11 @@ def get_all_tanks():
         return []
 
 def update_tank_status(tank_id: str, new_status: str, purpose: str = "", occupant: str = "", notes: str = "") -> bool:
-    """Updates tank status, purpose, current occupant, and notes."""
+    """
+    Locates tank row by ID and updates status, purpose, occupant, and notes across the 11-column schema.
+    Auto-syncs status to 'Active' if an occupant is assigned and status was 'Empty / Idle'.
+    Auto-syncs status to 'Empty / Idle' if occupant is removed and status was 'Active'.
+    """
     try:
         drive_service, sheets_service = get_google_services()
         spreadsheet_id = get_spreadsheet_id()
@@ -262,17 +272,27 @@ def update_tank_status(tank_id: str, new_status: str, purpose: str = "", occupan
         target_row = None
 
         for idx, row in enumerate(rows):
-            if row and str(row[0]).strip() == str(tank_id).strip():
+            if row and len(row) > 0 and str(row[0]).strip() == str(tank_id).strip():
                 target_row = idx + 1
                 break
 
         if not target_row:
             return False
 
+        clean_occ = occupant.strip()
+
+        # Automatic status sync rule
+        if clean_occ and new_status == "Empty / Idle":
+            final_status = "Active"
+        elif not clean_occ and new_status == "Active":
+            final_status = "Empty / Idle"
+        else:
+            final_status = new_status
+
         data = [
             {
                 'range': f'Tanks!E{target_row}:G{target_row}',
-                'values': [[new_status, purpose, occupant]]
+                'values': [[final_status, purpose, clean_occ]]
             },
             {
                 'range': f'Tanks!J{target_row}',
