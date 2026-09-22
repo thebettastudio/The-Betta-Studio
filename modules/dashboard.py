@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from modules.tank_registry import get_all_tanks
-from modules.breeder_registry import get_all_breeders  # Updated import reference
+from modules.breeder_registry import get_all_breeders
 from modules.spawn_manager import get_all_spawns
 
 def render_dashboard():
@@ -21,31 +21,59 @@ def render_dashboard():
     df_breeders = pd.DataFrame(breeders) if breeders else pd.DataFrame()
     df_spawns = pd.DataFrame(spawns) if spawns else pd.DataFrame()
 
+    # Normalize column names to lowercase for safe access
+    if not df_tanks.empty:
+        df_tanks.columns = [str(c).strip().lower() for c in df_tanks.columns]
+    if not df_breeders.empty:
+        df_breeders.columns = [str(c).strip().lower() for c in df_breeders.columns]
+    if not df_spawns.empty:
+        df_spawns.columns = [str(c).strip().lower() for c in df_spawns.columns]
+
     # Normalize Tanks
     if not df_tanks.empty:
-        df_tanks['status'] = df_tanks['status'].fillna("Active").replace("", "Active")
-        df_tanks['type'] = df_tanks['type'].fillna("Unspecified").replace("", "Unspecified")
+        if 'status' not in df_tanks.columns:
+            df_tanks['status'] = "Active"
+        else:
+            df_tanks['status'] = df_tanks['status'].fillna("Active").replace("", "Active")
+        
+        if 'type' not in df_tanks.columns:
+            df_tanks['type'] = "Unspecified"
+        else:
+            df_tanks['type'] = df_tanks['type'].fillna("Unspecified").replace("", "Unspecified")
+
         total_tanks = len(df_tanks)
-        active_tanks = len(df_tanks[df_tanks['status'].str.lower() == 'active'])
-        available_tanks = len(df_tanks[df_tanks['status'].str.lower().isin(['available', 'empty', 'ready', 'idle'])])
+        active_tanks = len(df_tanks[df_tanks['status'].astype(str).str.lower() == 'active'])
+        available_tanks = len(df_tanks[df_tanks['status'].astype(str).str.lower().isin(['available', 'empty', 'ready', 'idle'])])
     else:
         total_tanks = active_tanks = available_tanks = 0
 
     # Normalize Breeders
     if not df_breeders.empty:
-        df_breeders['status'] = df_breeders['status'].fillna("Active").replace("", "Active")
-        df_breeders['gender'] = df_breeders['gender'].fillna("Unknown").replace("", "Unknown")
+        if 'status' not in df_breeders.columns:
+            df_breeders['status'] = "Active"
+        else:
+            df_breeders['status'] = df_breeders['status'].fillna("Active").replace("", "Active")
+
+        if 'gender' not in df_breeders.columns:
+            df_breeders['gender'] = "Unknown"
+        else:
+            df_breeders['gender'] = df_breeders['gender'].fillna("Unknown").replace("", "Unknown")
+
         total_breeders = len(df_breeders)
-        male_breeders = len(df_breeders[df_breeders['gender'].str.lower().isin(['male', 'm'])])
-        female_breeders = len(df_breeders[df_breeders['gender'].str.lower().isin(['female', 'f'])])
+        male_breeders = len(df_breeders[df_breeders['gender'].astype(str).str.lower().isin(['male', 'm'])])
+        female_breeders = len(df_breeders[df_breeders['gender'].astype(str).str.lower().isin(['female', 'f'])])
     else:
         total_breeders = male_breeders = female_breeders = 0
 
     # Normalize Spawns
     if not df_spawns.empty:
-        df_spawns['status'] = df_spawns['status'].fillna("Active").replace("", "Active")
+        if 'status' not in df_spawns.columns:
+            df_spawns['status'] = "Active"
+        else:
+            df_spawns['status'] = df_spawns['status'].fillna("Active").replace("", "Active")
+
         total_spawns = len(df_spawns)
-        active_spawns = len(df_spawns[df_spawns['status'].str.lower().isin(['active', 'pairing', 'eggs', 'free swimming'])])
+        active_spawns = len(df_spawns[df_spawns['status'].astype(str).str.lower().isin(['active', 'pairing', 'eggs', 'free swimming'])])
     else:
         total_spawns = active_spawns = 0
 
@@ -71,7 +99,7 @@ def render_dashboard():
 
     with chart_col1:
         st.markdown("**🪣 Tank Statuses**")
-        if not df_tanks.empty:
+        if not df_tanks.empty and 'status' in df_tanks.columns:
             tank_counts = df_tanks['status'].value_counts().reset_index()
             tank_counts.columns = ['Status', 'Count']
             fig_tanks = px.pie(
@@ -88,7 +116,7 @@ def render_dashboard():
 
     with chart_col2:
         st.markdown("**🐟 Breeder Gender Balance**")
-        if not df_breeders.empty:
+        if not df_breeders.empty and 'gender' in df_breeders.columns:
             breeder_counts = df_breeders['gender'].value_counts().reset_index()
             breeder_counts.columns = ['Gender', 'Count']
             fig_breeders = px.pie(
@@ -105,7 +133,7 @@ def render_dashboard():
 
     with chart_col3:
         st.markdown("**🧬 Active Spawning Stages**")
-        if not df_spawns.empty:
+        if not df_spawns.empty and 'status' in df_spawns.columns:
             spawn_counts = df_spawns['status'].value_counts().reset_index()
             spawn_counts.columns = ['Stage', 'Count']
             fig_spawns = px.bar(
@@ -132,20 +160,20 @@ def render_dashboard():
     with tab_tanks:
         if not df_tanks.empty:
             cols_to_show = [c for c in ['id', 'location', 'type', 'capacity', 'status', 'purpose', 'occupant', 'notes'] if c in df_tanks.columns]
-            st.dataframe(df_tanks[cols_to_show], use_container_width=True, hide_index=True)
+            st.dataframe(df_tanks[cols_to_show if cols_to_show else df_tanks.columns], use_container_width=True, hide_index=True)
         else:
             st.write("No registered tanks.")
 
     with tab_breeders:
         if not df_breeders.empty:
             cols_to_show = [c for c in ['id', 'tag_code', 'type', 'gender', 'status', 'variety', 'location', 'notes'] if c in df_breeders.columns]
-            st.dataframe(df_breeders[cols_to_show], use_container_width=True, hide_index=True)
+            st.dataframe(df_breeders[cols_to_show if cols_to_show else df_breeders.columns], use_container_width=True, hide_index=True)
         else:
             st.write("No registered breeders.")
 
     with tab_spawns:
         if not df_spawns.empty:
             cols_to_show = [c for c in ['id', 'spawn_code', 'male_id', 'female_id', 'tank_id', 'status', 'pairing_date', 'notes'] if c in df_spawns.columns]
-            st.dataframe(df_spawns[cols_to_show], use_container_width=True, hide_index=True)
+            st.dataframe(df_spawns[cols_to_show if cols_to_show else df_spawns.columns], use_container_width=True, hide_index=True)
         else:
             st.write("No active spawns.")
