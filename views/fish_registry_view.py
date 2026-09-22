@@ -6,8 +6,45 @@ import streamlit as st
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
 
 # ------------------------------------------------------------------------------
-# Helper Functions: Strain, Tank & Grade Management
+# Helper Functions: Sheet Initialization, Strains, Tanks & Grades
 # ------------------------------------------------------------------------------
+
+def ensure_fish_master_sheet_exists(sheets_service):
+    """Ensures that the 'Fish_Master' tab exists in Google Sheets with proper headers."""
+    try:
+        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        sheets = spreadsheet.get('sheets', [])
+        sheet_titles = [s['properties']['title'] for s in sheets]
+
+        if 'Fish_Master' not in sheet_titles:
+            # Create the sheet tab
+            requests = [{
+                'addSheet': {
+                    'properties': {
+                        'title': 'Fish_Master'
+                    }
+                }
+            }]
+            sheets_service.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={'requests': requests}
+            ).execute()
+
+            # Add header row
+            headers = [
+                "Fish ID", "Variety / Strain", "Gender", "Grade", 
+                "Tank ID", "Seller", "Purchase Date", "Purchase Cost", 
+                "Image URL", "Notes"
+            ]
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range='Fish_Master!A1:J1',
+                valueInputOption='USER_ENTERED',
+                body={'values': [headers]}
+            ).execute()
+    except Exception as e:
+        st.warning(f"Note: Auto-creation check for 'Fish_Master' sheet failed ({e})")
+
 
 def get_registered_strains(sheets_service):
     """Fetch list of saved strains from 'Master_Strains' sheet or return defaults."""
@@ -242,6 +279,9 @@ def render_fish_registry_page():
 
         # Handle Form Submission Logic
         if submit:
+            # Ensure the worksheet tab exists before executing append queries
+            ensure_fish_master_sheet_exists(sheets_service)
+
             final_strain = new_strain_input if selected_strain_option == "➕ Add New Strain..." else selected_strain_option
             
             if selected_strain_option == "➕ Add New Strain..." and new_strain_input.strip():
