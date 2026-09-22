@@ -1,4 +1,3 @@
-# modules/dashboard.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -43,12 +42,15 @@ def render_dashboard():
 
         total_tanks = len(df_tanks)
         active_tanks = len(df_tanks[df_tanks['status'].astype(str).str.lower() == 'active'])
-        available_tanks = len(df_tanks[df_tanks['status'].astype(str).str.lower().isin(['available', 'empty', 'ready', 'idle'])])
+        available_tanks = len(df_tanks[df_tanks['status'].astype(str).str.lower().isin(['available', 'empty', 'ready', 'idle', 'empty / idle'])])
     else:
         total_tanks = active_tanks = available_tanks = 0
 
-    # Normalize Breeders
+    # Normalize Breeders (handles both 'gender' and 'sex' keys)
     if not df_breeders.empty:
+        if 'sex' in df_breeders.columns and 'gender' not in df_breeders.columns:
+            df_breeders['gender'] = df_breeders['sex']
+
         if 'status' not in df_breeders.columns:
             df_breeders['status'] = "Active"
         else:
@@ -68,12 +70,14 @@ def render_dashboard():
     # Normalize Spawns
     if not df_spawns.empty:
         if 'status' not in df_spawns.columns:
-            df_spawns['status'] = "Active"
+            df_spawns['status'] = "In Pairing"
         else:
-            df_spawns['status'] = df_spawns['status'].fillna("Active").replace("", "Active")
+            df_spawns['status'] = df_spawns['status'].fillna("In Pairing").replace("", "In Pairing")
 
         total_spawns = len(df_spawns)
-        active_spawns = len(df_spawns[df_spawns['status'].astype(str).str.lower().isin(['active', 'pairing', 'eggs', 'free swimming'])])
+        active_spawns = len(df_spawns[df_spawns['status'].astype(str).str.lower().isin([
+            'active', 'in pairing', 'pending (success)', 'free swimming', 'pairing', 'eggs'
+        ])])
     else:
         total_spawns = active_spawns = 0
 
@@ -166,14 +170,18 @@ def render_dashboard():
 
     with tab_breeders:
         if not df_breeders.empty:
-            cols_to_show = [c for c in ['id', 'tag_code', 'type', 'gender', 'status', 'variety', 'location', 'notes'] if c in df_breeders.columns]
+            cols_to_show = [c for c in ['id', 'tag_code', 'type', 'gender', 'sex', 'line_code', 'generation', 'status', 'variety', 'location', 'tank', 'notes'] if c in df_breeders.columns]
             st.dataframe(df_breeders[cols_to_show if cols_to_show else df_breeders.columns], use_container_width=True, hide_index=True)
         else:
             st.write("No registered breeders.")
 
     with tab_spawns:
         if not df_spawns.empty:
-            cols_to_show = [c for c in ['id', 'spawn_code', 'male_id', 'female_id', 'tank_id', 'status', 'pairing_date', 'notes'] if c in df_spawns.columns]
+            cols_to_show = [c for c in [
+                'id', 'line_code', 'generation', 'male_id', 'female_id', 
+                'pairing_date', 'status', 'batch_name', 'free_swim_date', 
+                'fry_count', 'failure_reason', 'tank', 'line_goal', 'notes'
+            ] if c in df_spawns.columns]
             st.dataframe(df_spawns[cols_to_show if cols_to_show else df_spawns.columns], use_container_width=True, hide_index=True)
         else:
             st.write("No active spawns.")
