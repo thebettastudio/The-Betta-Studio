@@ -1,299 +1,193 @@
 import io
 import datetime
 import streamlit as st
-
-# Import Drive & Sheets services
+from views.breeder_view import render_breeder_page
+from views.fish_registry_view import render_fish_registry_page  # Fish Master Registry View
+from views.spawn_view import render_spawn_page
+from views.activity_log_view import render_activity_log_page
+from views.tank_view import render_tank_page       # Tank Registry View
+from views.search_view import render_search_page   # Global Search View
+from modules.dashboard import render_dashboard      # Main Studio Dashboard View
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
+from modules.spawn_manager import format_spawns_sheet
 
-# ------------------------------------------------------------------------------
-# Helper Functions: Strain, Tank & Grade Management
-# ------------------------------------------------------------------------------
+st.set_page_config(
+    page_title="The Betta Studio", 
+    page_icon="🐟", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-def get_registered_strains(sheets_service):
-    """Fetch list of saved strains from 'Master_Strains' sheet or return defaults."""
-    default_strains = [
-        "Yellow Koi Galaxy",
-        "Red Koi Galaxy",
-        "Blue Rim",
-        "Avatar",
-        "Black Star / Samurai",
-        "Red Dragon",
-        "Copper Light",
-        "Fancy Marble",
-        "Super Red",
-        "Super Black"
-    ]
-    try:
-        res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Master_Strains!A2:A'
-        ).execute()
-        rows = res.get('values', [])
-        strains = [r[0] for r in rows if r and r[0].strip()]
-        return sorted(list(set(default_strains + strains)))
-    except Exception:
-        return default_strains
+# ==============================================================================
+# GLOBAL STYLING: Applies Clean Light Theme
+# ==============================================================================
+st.markdown("""
+<style>
+  /* 1. Base App Light Background & Dark Text */
+  .stApp {
+    background-color: #FFFFFF;
+    color: #1E2022;
+  }
+  
+  /* Force global text elements to remain dark */
+  .stApp p, .stApp span, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6 {
+    color: #1E2022 !important;
+  }
 
+  /* 2. Sidebar Customization */
+  section[data-testid="stSidebar"] {
+    background-color: #F8F9FA !important;
+    border-right: 1px solid #E2E8F0;
+  }
 
-def add_new_strain_to_db(sheets_service, new_strain):
-    """Save a new strain to the 'Master_Strains' worksheet."""
-    try:
-        sheets_service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Master_Strains!A:A',
-            valueInputOption='USER_ENTERED',
-            body={'values': [[new_strain.strip()]]}
-        ).execute()
-        st.toast(f"✅ Added '{new_strain}' to Strain Registry!", icon="✨")
-    except Exception as e:
-        st.warning(f"Note: Could not save strain to persistent sheet ({e})")
+  /* 3. Global Cards / Expanders / Containers */
+  div[data-testid="stExpander"], div.stCard, div[data-testid="stVerticalBlock"] > div[style*="background-color"] {
+    background: #FFFFFF !important;
+    border: 1px solid #E2E8F0 !important;
+    border-radius: 12px;
+  }
 
+  /* 4. Global Spawn / Breeder Card Component */
+  .spawn-card {
+      background-color: #F8F9FA;
+      border: 1px solid #E2E8F0;
+      border-radius: 12px;
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+  }
 
-def get_available_tanks(sheets_service):
-    """Fetch tanks with status 'Available' along with their container type."""
-    try:
-        res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Tanks!A2:E'
-        ).execute()
-        rows = res.get('values', [])
-        tanks = []
-        for r in rows:
-            if len(r) >= 3:
-                tank_id = r[0]
-                container_type = r[1] if len(r) > 1 else "Standard"
-                status = r[2] if len(r) > 2 else "Available"
-                if status.strip().lower() in ["available", "vacant", "empty", "free"]:
-                    tanks.append({"id": tank_id, "type": container_type, "status": status})
-        return tanks
-    except Exception:
-        # Fallback dummy tanks if sheet is empty/unreachable
-        return [
-            {"id": "Jar M-01", "type": "Empi Jar", "status": "Available"},
-            {"id": "Jar M-02", "type": "Empi Jar", "status": "Available"},
-            {"id": "B-01", "type": "6L Bottle", "status": "Available"},
-            {"id": "T-01", "type": "Tubo Container", "status": "Available"},
-        ]
+  /* 5. Betta Image Styling */
+  .spawn-card-img {
+      width: 44px;
+      height: 44px;
+      object-fit: cover;
+      border-radius: 8px;
+      border: 1.5px solid #CBD5E1;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+  }
 
+  .spawn-card-img:hover {
+      transform: scale(1.08);
+      box-shadow: 0 4px 12px rgba(0, 150, 255, 0.25);
+      border-color: #0072FF;
+  }
 
-def upload_image_to_drive(drive_service, image_bytes, filename_prefix="fish_"):
-    """Upload photo bytes to Google Drive and return public file ID / URL."""
-    from googleapiclient.http import MediaIoBaseUpload
-    
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"{filename_prefix}{timestamp}.jpg"
-    
-    file_stream = io.BytesIO(image_bytes)
-    metadata = {'name': file_name}
-    if DRIVE_FOLDER_ID:
-        metadata['parents'] = [DRIVE_FOLDER_ID.strip()]
+  .spawn-details h4 {
+      margin: 0 0 4px 0;
+      color: #0072FF !important;
+  }
 
-    media = MediaIoBaseUpload(file_stream, mimetype='image/jpeg', resumable=False)
-    uploaded = drive_service.files().create(
-        body=metadata,
-        media_body=media,
-        fields='id'
-    ).execute()
-    
-    file_id = uploaded.get('id')
-    return file_id, f"https://lh3.googleusercontent.com/d/{file_id}"
+  .spawn-details p {
+      margin: 1px 0;
+      color: #4A5568 !important;
+      font-size: 13px;
+  }
+</style>
+""", unsafe_allow_html=True)
 
 
-def calculate_form_grade(checks: dict, body_shape: str) -> tuple[str, int]:
-    """
-    Calculates grade and total score based on fin criteria checkboxes and body shape.
-    
-    Each checked fin criterion adds 15 points (Max 90 pts).
-    Body Shape weighting:
-      - Bullet Head: +10 pts
-      - Regular: +8 pts
-      - Spoonhead: +5 pts
-    """
-    total_score = sum(15 for matched in checks.values() if matched)
-    
-    shape_scores = {
-        "Bullet Head": 10,
-        "Regular": 8,
-        "Spoonhead": 5
-    }
-    total_score += shape_scores.get(body_shape, 8)
-    
-    if total_score >= 95:
-        grade = "Show Grade"
-    elif total_score >= 80:
-        grade = "High Grade"
-    elif total_score >= 60:
-        grade = "Breeder Grade"
-    else:
-        grade = "Pet Grade"
-        
-    return grade, total_score
+def run_google_diagnostic():
+    """Runs a live health check on Google Drive & Sheets connections and provides formatting utilities."""
+    with st.sidebar.expander("🛠️ System Diagnostics"):
+        if st.button("Test Google Connection", use_container_width=True):
+            with st.status("Testing APIs...", expanded=True) as status:
+                # 1. Test OAuth Credentials
+                try:
+                    st.write("🔐 Refreshing OAuth tokens...")
+                    drive_service, sheets_service = get_google_services()
+                    st.write("✅ Credentials Valid")
+                except Exception as e:
+                    status.update(label="OAuth Failure", state="error")
+                    st.error(f"Authentication failed: {e}")
+                    return
 
+                # 2. Test Google Sheets
+                try:
+                    st.write("📊 Checking Google Sheets...")
+                    result = sheets_service.spreadsheets().values().get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range='Breeders!A1:J1'
+                    ).execute()
+                    headers = result.get('values', [])
+                    st.write(f"✅ Sheets Accessible ({len(headers[0]) if headers else 0} cols)")
+                except Exception as e:
+                    status.update(label="Sheets Read Failure", state="error")
+                    st.error(f"Spreadsheet error: {e}")
+                    return
 
-# ------------------------------------------------------------------------------
-# Main Page Render Function
-# ------------------------------------------------------------------------------
+                # 3. Test Google Drive
+                try:
+                    st.write("📁 Testing Drive Upload...")
+                    from googleapiclient.http import MediaIoBaseUpload
+                    test_bytes = f"Test stream {datetime.datetime.now()}".encode('utf-8')
+                    file_stream = io.BytesIO(test_bytes)
+                    
+                    metadata = {'name': 'temp_diagnostic.txt'}
+                    if DRIVE_FOLDER_ID:
+                        metadata['parents'] = [DRIVE_FOLDER_ID.strip()]
 
-def render_fish_registry_page():
-    st.header("🐠 Fish Master Registry")
-    st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
+                    media = MediaIoBaseUpload(file_stream, mimetype='text/plain', resumable=False)
+                    uploaded = drive_service.files().create(
+                        body=metadata,
+                        media_body=media,
+                        fields='id'
+                    ).execute()
 
-    # Initialize Google Services
-    try:
-        drive_service, sheets_service = get_google_services()
-    except Exception as e:
-        st.error(f"Failed to connect to Google Services: {e}")
-        return
+                    file_id = uploaded.get('id')
+                    st.write("✅ Drive Upload Successful")
 
-    # Tabs for Registration and View Registry
-    tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
+                    # Cleanup test file
+                    drive_service.files().delete(fileId=file_id).execute()
+                    st.write("🧹 Test file cleaned up")
+                except Exception as e:
+                    status.update(label="Drive Upload Failure", state="error")
+                    st.error(f"Drive error: {e}")
+                    return
 
-    with tab_register:
-        st.subheader("🛒 Purchased / Imported Fish Details")
+                status.update(label="All Services Operational!", state="complete")
 
-        with st.form("register_fish_form", clear_on_submit=False):
-            col1, col2 = st.columns(2)
+        st.divider()
 
-            with col1:
-                # 1. Variety / Type & Strain Selection
-                st.markdown("##### 🧬 Variety & Strain")
-                form_type = st.text_input("Form / Type", value="HMPK", help="Default is HMPK (Halfmoon Plakat)")
-                
-                existing_strains = get_registered_strains(sheets_service)
-                strain_options = existing_strains + ["➕ Add New Strain..."]
-                selected_strain_option = st.selectbox("Select Strain", options=strain_options, index=0)
+        # One-click sheet formatter button
+        if st.button("✨ Format Google Sheet", use_container_width=True):
+            with st.spinner("Applying theme, headers, and colors to Spawns sheet..."):
+                try:
+                    format_spawns_sheet()
+                    st.success("Google Sheet styled & formatted successfully!")
+                except Exception as e:
+                    st.error(f"Failed to format sheet: {e}")
 
-                new_strain_input = ""
-                if selected_strain_option == "➕ Add New Strain...":
-                    new_strain_input = st.text_input("Enter New Strain Name", placeholder="e.g. Yellow Red Dragon Fancy")
+# --- Sidebar Navigation ---
+st.sidebar.title("🐟 The Betta Studio")
+page = st.sidebar.radio("Navigation", [
+    "📊 Studio Dashboard",
+    "🔍 Global Search Studio",
+    "🐠 Fish Master Registry",
+    "🐟 Breeder Registry",
+    "🪣 Tank & Container Registry",
+    "❤️ Pair & Spawn Tracker",
+    "📝 Activity Log"
+])
 
-                gender = st.selectbox("Gender", ["Male", "Female"])
-                seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder")
-                purchase_date = st.date_input("Purchase Date", datetime.date.today())
-                purchase_cost = st.number_input("Purchase Cost (₱)", min_value=0.0, value=0.0, step=50.0)
+st.sidebar.markdown("---")
+run_google_diagnostic()
 
-            with col2:
-                # 2. Dynamic Tank Selection with Filter
-                st.markdown("##### 🪣 Tank & Container Assignment")
-                
-                all_available_tanks = get_available_tanks(sheets_service)
-                container_types = ["All Types"] + sorted(list(set(t["type"] for t in all_available_tanks)))
-                
-                selected_type_filter = st.selectbox("Filter Tank Type", options=container_types)
-                
-                if selected_type_filter != "All Types":
-                    filtered_tanks = [t for t in all_available_tanks if t["type"] == selected_type_filter]
-                else:
-                    filtered_tanks = all_available_tanks
-
-                tank_options = [f"{t['id']} ({t['type']})" for t in filtered_tanks] if filtered_tanks else ["No Available Tanks"]
-                selected_tank_str = st.selectbox("Select Available Tank / Jar Location", options=tank_options)
-
-            st.divider()
-
-            # 3. Form Evaluation Criteria Checklist & Body Shape
-            st.markdown("### 🏆 Form Evaluation Criteria")
-            
-            chk_col, shape_col = st.columns([3, 2])
-            
-            with chk_col:
-                caudal_spread = st.checkbox("Caudal Fin Spread 180°", value=True)
-                caudal_prop = st.checkbox("Caudal Fin Proportion (Good branching, no damage)", value=True)
-                dorsal_struct = st.checkbox("Dorsal Fin Structure (Broad base & clean overlapping)", value=True)
-                anal_struct = st.checkbox("Anal Fin Structure (Parallel & proper length)", value=True)
-                ventral_fins = st.checkbox("Ventral Fins (Straight, broad, no curl)", value=True)
-                pectoral_fins = st.checkbox("Pectoral Fins (Full & undamaged)", value=True)
-
-            with shape_col:
-                body_shape = st.selectbox(
-                    "Body Shape",
-                    options=["Bullet Head", "Regular", "Spoonhead"],
-                    index=0,
-                    help="Select the head profile/body shape structure."
-                )
-
-            evaluation_checks = {
-                "caudal_spread": caudal_spread,
-                "caudal_prop": caudal_prop,
-                "dorsal_struct": dorsal_struct,
-                "anal_struct": anal_struct,
-                "ventral_fins": ventral_fins,
-                "pectoral_fins": pectoral_fins,
-            }
-
-            computed_grade, total_points = calculate_form_grade(evaluation_checks, body_shape)
-            st.info(f"🏆 Calculated Grade: **{computed_grade}** (Score: **{total_points}/100**)")
-
-            st.divider()
-
-            # 4. Direct Photo Capture / Upload & Fallback URL
-            st.markdown("##### 📷 Fish Photo Capture / Upload")
-            
-            img_col1, img_col2 = st.columns(2)
-            with img_col1:
-                camera_photo = st.camera_input("Take a Live Photo of Fish")
-            with img_col2:
-                uploaded_photo = st.file_uploader("Or Upload Photo File", type=["jpg", "jpeg", "png"])
-                manual_image_url = st.text_input("Or Paste Existing Drive ID / Image URL", placeholder="Paste direct link or Drive ID")
-
-            notes = st.text_area("Notes / Characteristics", placeholder="e.g. Strong dorsal, solid iridescence, aggressive disposition")
-
-            submit = st.form_submit_button("💾 Register Fish", use_container_width=True)
-
-        # Handle Form Submission Logic
-        if submit:
-            final_strain = new_strain_input if selected_strain_option == "➕ Add New Strain..." else selected_strain_option
-            
-            if selected_strain_option == "➕ Add New Strain..." and new_strain_input.strip():
-                add_new_strain_to_db(sheets_service, new_strain_input.strip())
-
-            # Handle Image Upload to Google Drive
-            final_image_val = manual_image_url
-            photo_bytes = None
-            if camera_photo is not None:
-                photo_bytes = camera_photo.getvalue()
-            elif uploaded_photo is not None:
-                photo_bytes = uploaded_photo.getvalue()
-
-            if photo_bytes:
-                with st.spinner("Uploading photo to Google Drive..."):
-                    try:
-                        file_id, img_url = upload_image_to_drive(drive_service, photo_bytes)
-                        final_image_val = img_url
-                        st.success(f"Image uploaded successfully! (Drive ID: {file_id})")
-                    except Exception as err:
-                        st.error(f"Image upload failed: {err}")
-
-            # Selected Tank ID
-            selected_tank_id = selected_tank_str.split(" (")[0] if selected_tank_str != "No Available Tanks" else ""
-
-            # Prepare row data for Google Sheets
-            new_fish_record = [
-                f"FISH-{datetime.datetime.now().strftime('%M%S')}",
-                f"{form_type} - {final_strain}",
-                gender,
-                computed_grade,
-                selected_tank_id,
-                seller,
-                str(purchase_date),
-                purchase_cost,
-                final_image_val,
-                f"Body Shape: {body_shape}. {notes}".strip()
-            ]
-
-            try:
-                # Append row to 'Fish_Master' sheet
-                sheets_service.spreadsheets().values().append(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range='Fish_Master!A:J',
-                    valueInputOption='USER_ENTERED',
-                    body={'values': [new_fish_record]}
-                ).execute()
-
-                st.balloons()
-                st.success(f"🎉 Fish successfully registered as Grade: **{computed_grade}** assigned to **{selected_tank_id}**!")
-            except Exception as e:
-                st.error(f"Error saving fish record: {e}")
-
-    with tab_view:
-        st.write("Displaying registered fish list from `Fish_Master` worksheet...")
+# --- View Routing ---
+if page == "📊 Studio Dashboard":
+    render_dashboard()
+elif page == "🔍 Global Search Studio":
+    render_search_page()
+elif page == "🐠 Fish Master Registry":
+    render_fish_registry_page()
+elif page == "🐟 Breeder Registry":
+    render_breeder_page()
+elif page == "🪣 Tank & Container Registry":
+    render_tank_page()
+elif page == "❤️ Pair & Spawn Tracker":
+    render_spawn_page()
+elif page == "📝 Activity Log":
+    render_activity_log_page()
