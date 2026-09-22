@@ -39,8 +39,12 @@ def clean_text_for_matching(text: str) -> str:
 def get_purpose_index(stored_purpose: str) -> int:
     """Matches stored purpose string against CONTAINER_PURPOSES safely."""
     clean_stored = clean_text_for_matching(stored_purpose)
+    if not clean_stored:
+        return 0
+    
     for idx, purpose in enumerate(CONTAINER_PURPOSES):
-        if clean_text_for_matching(purpose) in clean_stored or clean_stored in clean_text_for_matching(purpose):
+        clean_p = clean_text_for_matching(purpose)
+        if clean_p in clean_stored or clean_stored in clean_p:
             return idx
     return 0
 
@@ -101,6 +105,7 @@ def render_tank_page():
                         notes=notes
                     )
 
+                st.cache_data.clear()  # Clear cache after registering
                 st.success("Container Successfully Registered!")
                 st.markdown(f"""
                 <div style="background-color: #FEF3C7; border: 2px dashed #D97706; padding: 16px; border-radius: 12px; text-align: center; margin: 12px 0;">
@@ -117,6 +122,7 @@ def render_tank_page():
     with tab2:
         st.subheader("Container Inventory")
         if st.button("🔄 Refresh Containers"):
+            st.cache_data.clear()
             st.rerun()
 
         tanks = get_all_tanks()
@@ -216,10 +222,14 @@ def render_tank_page():
                                     key=f"occ_sel_{tank_id}"
                                 )
 
+                                status_options = ["Empty / Idle", "Active", "Cleaning / Quarantine", "Retired"]
+                                curr_status = str(t.get('status', 'Empty / Idle')).title()
+                                status_index = next((i for i, s in enumerate(status_options) if s.lower() in curr_status.lower()), 0)
+
                                 new_status = st.selectbox(
                                     "Status",
-                                    ["Active", "Cleaning / Quarantine", "Empty / Idle", "Retired"],
-                                    index=0 if curr_occ else 2,
+                                    status_options,
+                                    index=status_index,
                                     key=f"status_{tank_id}"
                                 )
                                 
@@ -242,9 +252,11 @@ def render_tank_page():
                                     else:
                                         final_occ = selected_occ_opt.split(" | ")[0]
 
-                                    if update_tank_status(tank_id, new_status, new_purpose, final_occ, new_notes):
-                                        st.success("Updated!")
-                                        st.rerun()
+                                    with st.spinner("Saving changes to sheet..."):
+                                        if update_tank_status(tank_id, new_status, new_purpose, final_occ, new_notes):
+                                            st.cache_data.clear()  # Invalidate Streamlit sheet cache
+                                            st.success("Updated successfully!")
+                                            st.rerun()
 
                                 # DELETE / REMOVE SECTION
                                 st.divider()
@@ -275,5 +287,6 @@ def render_tank_page():
                                 ):
                                     with st.spinner("Deleting record..."):
                                         if delete_tank(tank_id):
+                                            st.cache_data.clear()  # Invalidate Streamlit sheet cache
                                             st.success(f"Container {t['location']} removed successfully!")
                                             st.rerun()
