@@ -214,6 +214,51 @@ def mark_tank_occupied(sheets_service, tank_id: str):
         st.warning(f"Note: Could not update tank '{tank_id}' status to Occupied: {e}")
 
 
+def transfer_or_assign_tank(sheets_service, fish_id: str, old_tank_id: str, new_tank_id: str) -> bool:
+    """Updates tank assignment in Fish_Master and toggles tank status in Tanks sheet."""
+    try:
+        # 1. Update Fish_Master sheet with new Tank ID
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Fish_Master!A2:E'
+        ).execute()
+        rows = res.get('values', [])
+
+        for idx, r in enumerate(rows, start=2):
+            if r and r[0].strip().lower() == fish_id.strip().lower():
+                sheets_service.spreadsheets().values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f'Fish_Master!E{idx}',
+                    valueInputOption='USER_ENTERED',
+                    body={'values': [[new_tank_id]]}
+                ).execute()
+                break
+
+        # 2. Set old tank back to Available if applicable
+        if old_tank_id and old_tank_id != "Unassigned":
+            tanks_res = sheets_service.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range='Tanks!A2:C'
+            ).execute()
+            tank_rows = tanks_res.get('values', [])
+            for idx, r in enumerate(tank_rows, start=2):
+                if r and r[0].strip().lower() == old_tank_id.strip().lower():
+                    sheets_service.spreadsheets().values().update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f'Tanks!C{idx}',
+                        valueInputOption='USER_ENTERED',
+                        body={'values': [["Available"]]}
+                    ).execute()
+                    break
+
+        # 3. Mark new tank as Occupied
+        mark_tank_occupied(sheets_service, new_tank_id)
+        return True
+    except Exception as e:
+        st.error(f"Failed to transfer tank: {e}")
+        return False
+
+
 def get_all_fish_records(sheets_service):
     """Fetch all registered fish from 'Fish_Master' sheet (Range A1:J)."""
     try:
@@ -389,7 +434,7 @@ def render_fish_registry_page():
                 else:
                     filtered_tanks = all_available_tanks
 
-                tank_options = [f"{t['id']} ({t['type']})" for t in filtered_tanks] if filtered_tanks else ["No Available Tanks"]
+                tank_options = ["Leave Unassigned"] + [f"{t['id']} ({t['type']})" for t in filtered_tanks]
                 selected_tank_str = st.selectbox("Select Available Tank / Jar Location", options=tank_options)
 
             st.divider()
@@ -458,14 +503,16 @@ def render_fish_registry_page():
                     except Exception as err:
                         st.error(f"Image upload failed: {err}")
 
-            selected_tank_id = selected_tank_str.split(" (")[0] if selected_tank_str != "No Available Tanks" else ""
+            selected_tank_id = ""
+            if selected_tank_str != "Leave Unassigned":
+                selected_tank_id = selected_tank_str.split(" (")[0]
 
             new_fish_record = [
                 assigned_fish_id,
                 f"{form_type} - {selected_strain}",
                 gender,
                 computed_grade,
-                selected_tank_id,
+                selected_tank_id if selected_tank_id else "Unassigned",
                 seller,
                 str(purchase_date),
                 purchase_cost,
@@ -474,7 +521,6 @@ def render_fish_registry_page():
             ]
 
             try:
-                # Appends to Range A:J
                 sheets_service.spreadsheets().values().append(
                     spreadsheetId=SPREADSHEET_ID,
                     range='Fish_Master!A:J',
@@ -482,12 +528,11 @@ def render_fish_registry_page():
                     body={'values': [new_fish_record]}
                 ).execute()
 
-                # Mark Tank as Occupied if assigned
                 if selected_tank_id:
                     mark_tank_occupied(sheets_service, selected_tank_id)
 
                 st.balloons()
-                st.success(f"🎉 Fish **#{assigned_fish_id}** ({selected_strain}) successfully registered! Grade: **{computed_grade}**.")
+                st.success(f"🎉 Fish **#{assigned_fish_id}** ({selected_strain}) successfully registered!")
                 st.rerun()
             except Exception as e:
                 st.error(f"Error saving fish record: {e}")
@@ -503,7 +548,6 @@ def render_fish_registry_page():
         if df.empty:
             st.info("No fish records found in `Fish_Master`. Register your first fish above!")
         else:
-            # Metrics Overview Row
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Total Registered", len(df))
             m2.metric("Males", len(df[df["Gender"] == "Male"])) if "Gender" in df else None
@@ -512,7 +556,50 @@ def render_fish_registry_page():
 
             st.divider()
 
-            # Filters Bar
+            st.markdown("### 🔄 Tank Location Management")
+            
+            with st.expander("🛠️ Assign or Transfer Fish Tank Location", expanded=False):
+                col_f, col_t, col_act = st.columns([2, 2, 1])
+
+                fish_options = {
+                    f"{row['Fish ID']} - {row['Variety / Strain']} (Current: {row['Tank ID'] if row['Tank ID'] else 'Unassigned'})": (row['Fish ID'], row['Tank ID'])
+                    for _, row in df.iterrows()
+                }
+
+                with col_f:
+                    selected_fish_label = st.selectbox("Select Fish to Move", options=list(fish_options.keys()))
+                    target_fish_id, current_tank_id = fish_options[selected_fish_label]
+
+                with col_t:
+                    available_tanks = get_available_tanks(sheets_service)
+                    avail_tank_opts = [f"{t['id']} ({t['type']})" for t in available_tanks]
+                    
+                    if not avail_tank_opts:
+                        st.warning("No vacant tanks available!")
+                        selected_new_tank = None
+                    else:
+                        selected_new_tank = st.selectbox("Select New Vacant Tank", options=avail_tank_opts)
+
+                with col_act:
+                    st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+                    action_btn_label = "📥 Assign Tank" if not current_tank_id or current_tank_id == "Unassigned" else "🔄 Transfer Tank"
+                    
+                    if st.button(action_btn_label, type="primary", use_container_width=True, disabled=not selected_new_tank):
+                        new_tank_id = selected_new_tank.split(" (")[0]
+                        
+                        with st.spinner("Updating tank assignments in database..."):
+                            success = transfer_or_assign_tank(
+                                sheets_service, 
+                                target_fish_id, 
+                                current_tank_id, 
+                                new_tank_id
+                            )
+                            if success:
+                                st.toast(f"✅ {target_fish_id} moved from '{current_tank_id}' to '{new_tank_id}'!", icon="🎉")
+                                st.rerun()
+
+            st.divider()
+
             st.markdown("##### 🔍 Filter Database")
             f_col1, f_col2, f_col3 = st.columns(3)
 
@@ -537,7 +624,6 @@ def render_fish_registry_page():
                     default=[]
                 )
 
-            # Apply Filters
             filtered_df = df.copy()
             if gender_filter:
                 filtered_df = filtered_df[filtered_df["Gender"].isin(gender_filter)]
@@ -546,11 +632,11 @@ def render_fish_registry_page():
             if strain_filter:
                 filtered_df = filtered_df[filtered_df["Variety / Strain"].isin(strain_filter)]
 
-            # Interactive Table
             st.dataframe(
                 filtered_df,
                 column_config={
                     "Fish ID": st.column_config.TextColumn("Fish ID"),
+                    "Tank ID": st.column_config.TextColumn("Tank ID"),
                     "Image URL": st.column_config.ImageColumn("Photo Preview"),
                     "Purchase Cost": st.column_config.NumberColumn("Cost (₱)", format="₱%.2f"),
                     "Notes": st.column_config.TextColumn("Notes", width="large"),
