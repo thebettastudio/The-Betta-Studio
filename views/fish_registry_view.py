@@ -6,7 +6,7 @@ import streamlit as st
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
 
 # ------------------------------------------------------------------------------
-# Helper Functions: Sheet Initialization, Strains, Tanks & Grades
+# Helper Functions: Sheet Initialization, Strains, Tanks, Grades & ID
 # ------------------------------------------------------------------------------
 
 def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
@@ -44,6 +44,29 @@ def ensure_fish_master_sheet_exists(sheets_service):
     ensure_sheet_exists(sheets_service, 'Fish_Master', headers)
 
 
+def generate_next_fish_id(sheets_service) -> str:
+    """Fetch all existing Fish IDs and return the next sequential integer ID starting at 1."""
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Fish_Master!A2:A'
+        ).execute()
+        rows = res.get('values', [])
+        
+        max_id = 0
+        for r in rows:
+            if r and r[0].strip():
+                raw_id = r[0].strip()
+                # Handle numeric IDs or strip potential legacy 'FISH-' prefixes
+                val_str = raw_id.replace("FISH-", "").strip()
+                if val_str.isdigit():
+                    max_id = max(max_id, int(val_str))
+                    
+        return str(max_id + 1)
+    except Exception:
+        return "1"
+
+
 def get_registered_strains(sheets_service):
     """Fetch list of saved strains from 'Master_Strains' sheet or return defaults."""
     default_strains = [
@@ -66,7 +89,7 @@ def get_registered_strains(sheets_service):
         rows = res.get('values', [])
         strains = [r[0] for r in rows if r and r[0].strip()]
         
-        # Combine default and sheet strains, removing those marked as removed
+        # Combine default and sheet strains
         all_strains = set(default_strains + strains)
         
         # Exclude strains stored in session state for dynamic removals
@@ -84,7 +107,6 @@ def add_new_strain_to_db(sheets_service, new_strain):
     try:
         ensure_sheet_exists(sheets_service, 'Master_Strains', ["Strain Name"])
         
-        # Unmark from session removed set if re-added
         if "removed_strains_list" in st.session_state:
             st.session_state["removed_strains_list"].discard(new_strain.strip())
             
@@ -101,7 +123,6 @@ def add_new_strain_to_db(sheets_service, new_strain):
 
 def delete_strain_from_db(sheets_service, strain_to_remove):
     """Delete a strain row from 'Master_Strains' or soft-delete from local registry."""
-    # Store in local session removal set
     if "removed_strains_list" not in st.session_state:
         st.session_state["removed_strains_list"] = set()
     st.session_state["removed_strains_list"].add(strain_to_remove)
@@ -122,7 +143,6 @@ def delete_strain_from_db(sheets_service, strain_to_remove):
             ).execute()
             rows = res.get('values', [])
             
-            # Find matching row indices (1-indexed for sheets)
             delete_requests = []
             for idx, r in enumerate(rows):
                 if r and r[0].strip().lower() == strain_to_remove.strip().lower():
@@ -137,7 +157,6 @@ def delete_strain_from_db(sheets_service, strain_to_remove):
                         }
                     })
 
-            # Execute deletion in reverse order to avoid index shifts
             if delete_requests:
                 delete_requests.reverse()
                 sheets_service.spreadsheets().batchUpdate(
@@ -243,6 +262,11 @@ def render_fish_registry_page():
     with tab_register:
         st.subheader("🛒 Purchased / Imported Fish Details")
 
+        # Get Next Sequential Fish ID
+        ensure_fish_master_sheet_exists(sheets_service)
+        next_fish_id = generate_next_fish_id(sheets_service)
+        st.info(f"📌 Next Assigned Fish ID: **#{next_fish_id}**")
+
         # Fetch existing active strains from Google Sheets DB
         strains_list = get_registered_strains(sheets_service)
 
@@ -277,14 +301,12 @@ def render_fish_registry_page():
                         )
                         if st.button("Delete Strain", use_container_width=True, type="primary", key="btn_delete_strain"):
                             delete_strain_from_db(sheets_service, strain_to_delete)
-                            # Reset selection if active strain was deleted
                             if st.session_state.get("selected_strain") == strain_to_delete:
                                 st.session_state.pop("selected_strain", None)
                             st.rerun()
                     else:
                         st.info("No strains available to remove.")
 
-        # Determine default selected index safely
         default_index = 0
         if "selected_strain" in st.session_state and st.session_state["selected_strain"] in strains_list:
             default_index = strains_list.index(st.session_state["selected_strain"])
@@ -379,7 +401,8 @@ def render_fish_registry_page():
 
         # Handle Form Submission Logic
         if submit:
-            ensure_fish_master_sheet_exists(sheets_service)
+            # Re-verify latest sequential ID before submission
+            assigned_fish_id = generate_next_fish_id(sheets_service)
 
             # Handle Image Upload to Google Drive
             final_image_val = manual_image_url
@@ -403,7 +426,7 @@ def render_fish_registry_page():
 
             # Prepare row data for Google Sheets
             new_fish_record = [
-                f"FISH-{datetime.datetime.now().strftime('%M%S')}",
+                assigned_fish_id,  # Clean simple integer ID (1, 2, 3...)
                 f"{form_type} - {selected_strain}",
                 gender,
                 computed_grade,
@@ -424,7 +447,8 @@ def render_fish_registry_page():
                 ).execute()
 
                 st.balloons()
-                st.success(f"🎉 Fish ({selected_strain}) successfully registered as Grade: **{computed_grade}** assigned to **{selected_tank_id}**!")
+                st.success(f"🎉 Fish **#{assigned_fish_id}** ({selected_strain}) successfully registered! Grade: **{computed_grade}** in **{selected_tank_id}**.")
+                st.rerun()
             except Exception as e:
                 st.error(f"Error saving fish record: {e}")
 
