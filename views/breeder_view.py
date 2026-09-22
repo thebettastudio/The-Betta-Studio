@@ -1,5 +1,6 @@
 # views/breeder_view.py
 import datetime
+import pandas as pd
 import streamlit as st
 from modules.breeder_registry import (
     register_breeder,
@@ -65,12 +66,121 @@ def evaluate_grade(caudal_180, caudal_prop, dorsal_good, anal_good, ventral_good
         return "Pet Grade"
 
 
+def render_breeder_gallery_grid(breeders_list: list):
+    """Renders breeder cards in a 3-column grid with Retirement popovers."""
+    if not breeders_list:
+        st.info("No breeders found in this category.")
+        return
+
+    cols = st.columns(3)
+    for idx, b in enumerate(breeders_list):
+        breeder_id = b['id']
+        is_retired = b.get('status', 'Active').lower() == 'retired'
+
+        with cols[idx % 3]:
+            with st.container(border=True):
+                st.markdown(f"### {breeder_id}")
+                st.caption(f"**Sex:** {b['sex']} | **Status:** `{b.get('status', 'Active')}`")
+                st.write(f"**Variety:** {b['variety']}")
+                st.write(f"**Lineage:** {b['lineage']}")
+                st.write(f"**DOB:** {b['dob']}")
+                
+                if b.get('notes'):
+                    st.info(f"**Notes:** {b['notes']}")
+                
+                if b.get('photo_id'):
+                    img_src = f"https://drive.google.com/thumbnail?id={b['photo_id']}&sz=w800"
+                    st.image(img_src, use_container_width=True)
+                else:
+                    st.caption("📷 *No Photo Available*")
+
+                st.divider()
+
+                # RETIRE BREEDER SECTION
+                if is_retired:
+                    st.caption("🚫 *This breeder is currently retired.*")
+                else:
+                    with st.popover("🚫 Retire Breeder", use_container_width=True):
+                        st.markdown("### Retire / Deactivate Breeder")
+                        st.caption("Select a reason for taking this breeder out of active breeding rotations.")
+                        
+                        reason = st.selectbox(
+                            "Reason for Retirement",
+                            RETIREMENT_REASONS,
+                            key=f"retire_reason_{breeder_id}"
+                        )
+                        
+                        add_notes = st.text_area(
+                            "Additional Context / Details",
+                            placeholder="e.g. Ate eggs on 2 consecutive spawn attempts.",
+                            key=f"retire_notes_{breeder_id}"
+                        )
+                        
+                        if st.button("Confirm Retirement", key=f"confirm_retire_{breeder_id}", type="primary", use_container_width=True):
+                            with st.spinner("Updating status..."):
+                                success = retire_breeder(breeder_id, reason=reason, notes=add_notes)
+                            if success:
+                                st.success(f"Breeder {breeder_id} retired!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to update status.")
+
+
+def render_breeder_inventory_table(breeders_list: list, gender_label: str):
+    """Renders interactive inventory table and summary metrics for breeders."""
+    if not breeders_list:
+        st.info(f"No {gender_label.lower()} breeders registered in inventory.")
+        return
+
+    df = pd.DataFrame(breeders_list)
+    
+    # Mapping columns for standard schema display
+    rename_dict = {
+        "id": "Breeder ID",
+        "sex": "Sex",
+        "variety": "Variety / Pattern",
+        "lineage": "Lineage / Source",
+        "dob": "Date of Birth",
+        "status": "Current Status",
+        "notes": "Notes / Traits"
+    }
+    
+    available_cols = [col for col in rename_dict.keys() if col in df.columns]
+    display_df = df[available_cols].rename(columns=rename_dict)
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # Metrics Summary
+    col1, col2 = st.columns(2)
+    col1.metric(f"Total {gender_label}s", len(breeders_list))
+    
+    active_count = sum(1 for b in breeders_list if str(b.get('status', '')).lower() == 'active')
+    col2.metric(f"Active {gender_label}s", active_count)
+
+
 def render_breeder_page():
     st.title("🐟 Betta Breeder Management")
 
-    tab1, tab2 = st.tabs(["➕ Register New Breeder", "📋 Breeder Gallery & Inventory"])
+    tab1, tab2, tab3 = st.tabs([
+        "➕ Register New Breeder", 
+        "🖼️ Breeder Gallery", 
+        "📋 Breeder Inventory"
+    ])
 
+    # Fetch all breeders once for views
+    breeders = get_all_breeders()
+
+    # Split dataset by sex
+    males_list = [b for b in breeders if str(b.get("sex", "")).strip().lower() in ["male", "m", "♂️ male"]]
+    females_list = [b for b in breeders if str(b.get("sex", "")).strip().lower() in ["female", "f", "♀️ female"]]
+
+    # ====================================================
     # TAB 1: REGISTER BREEDER
+    # ====================================================
     with tab1:
         st.subheader("Register a New Breeder")
         
@@ -166,74 +276,60 @@ def render_breeder_page():
                     if photo_file:
                         st.image(photo_file, caption=f"{full_variety} ({sex}) — {grade}", width=300)
 
-    # TAB 2: BREEDER GALLERY / INVENTORY
+    # ====================================================
+    # TAB 2: GALLERY (SEPARATED BY MALE / FEMALE)
+    # ====================================================
     with tab2:
-        st.subheader("Registered Breeders")
-        if st.button("🔄 Refresh Gallery"):
-            st.rerun()
+        col_title, col_btn = st.columns([4, 1])
+        with col_title:
+            st.subheader("Breeder Gallery")
+        with col_btn:
+            if st.button("🔄 Refresh", key="refresh_gallery"):
+                st.rerun()
 
-        breeders = get_all_breeders()
         if not breeders:
-            st.info("No breeders registered yet. Add your first breeder in the Registration tab!")
+            st.info("No breeders registered yet.")
         else:
-            search_query = st.text_input("🔍 Search by ID, Variety, or Lineage:", "")
+            search_query = st.text_input("🔍 Search Gallery by ID, Variety, or Lineage:", "", key="search_gallery")
             
-            filtered = [
-                b for b in breeders
+            # Apply search filter
+            filtered_males = [
+                b for b in males_list
+                if search_query.lower() in b['id'].lower()
+                or search_query.lower() in b['variety'].lower()
+                or search_query.lower() in b['lineage'].lower()
+            ]
+            
+            filtered_females = [
+                b for b in females_list
                 if search_query.lower() in b['id'].lower()
                 or search_query.lower() in b['variety'].lower()
                 or search_query.lower() in b['lineage'].lower()
             ]
 
-            cols = st.columns(3)
-            for idx, b in enumerate(filtered):
-                breeder_id = b['id']
-                is_retired = b.get('status', 'Active').lower() == 'retired'
+            gal_male_tab, gal_female_tab = st.tabs(["♂️ Male Breeders", "♀️ Female Breeders"])
 
-                with cols[idx % 3]:
-                    with st.container(border=True):
-                        st.markdown(f"### {breeder_id}")
-                        st.caption(f"**Sex:** {b['sex']} | **Status:** `{b.get('status', 'Active')}`")
-                        st.write(f"**Variety:** {b['variety']}")
-                        st.write(f"**Lineage:** {b['lineage']}")
-                        st.write(f"**DOB:** {b['dob']}")
-                        
-                        if b.get('notes'):
-                            st.info(f"**Notes:** {b['notes']}")
-                        
-                        if b.get('photo_id'):
-                            img_src = f"https://drive.google.com/thumbnail?id={b['photo_id']}&sz=w800"
-                            st.image(img_src, use_container_width=True)
-                        else:
-                            st.caption("📷 *No Photo Available*")
+            with gal_male_tab:
+                st.caption(f"Showing **{len(filtered_males)}** Male Breeders")
+                render_breeder_gallery_grid(filtered_males)
 
-                        st.divider()
+            with gal_female_tab:
+                st.caption(f"Showing **{len(filtered_females)}** Female Breeders")
+                render_breeder_gallery_grid(filtered_females)
 
-                        # RETIRE BREEDER SECTION (Replaces Delete)
-                        if is_retired:
-                            st.caption("🚫 *This breeder is currently retired.*")
-                        else:
-                            with st.popover("🚫 Retire Breeder", use_container_width=True):
-                                st.markdown("### Retire / Deactivate Breeder")
-                                st.caption("Select a reason for taking this breeder out of active breeding rotations.")
-                                
-                                reason = st.selectbox(
-                                    "Reason for Retirement",
-                                    RETIREMENT_REASONS,
-                                    key=f"retire_reason_{breeder_id}"
-                                )
-                                
-                                add_notes = st.text_area(
-                                    "Additional Context / Details",
-                                    placeholder="e.g. Ate eggs on 2 consecutive spawn attempts.",
-                                    key=f"retire_notes_{breeder_id}"
-                                )
-                                
-                                if st.button("Confirm Retirement", key=f"confirm_retire_{breeder_id}", type="primary", use_container_width=True):
-                                    with st.spinner("Updating status..."):
-                                        success = retire_breeder(breeder_id, reason=reason, notes=add_notes)
-                                    if success:
-                                        st.success(f"Breeder {breeder_id} retired!")
-                                        st.rerun()
-                                    else:
-                                        st.error("Failed to update status.")
+    # ====================================================
+    # TAB 3: INVENTORY (SEPARATED BY MALE / FEMALE)
+    # ====================================================
+    with tab3:
+        st.subheader("Breeder Inventory")
+
+        if not breeders:
+            st.info("No breeders registered in inventory.")
+        else:
+            inv_male_tab, inv_female_tab = st.tabs(["♂️ Male Inventory", "♀️ Female Inventory"])
+
+            with inv_male_tab:
+                render_breeder_inventory_table(males_list, "Male")
+
+            with inv_female_tab:
+                render_breeder_inventory_table(females_list, "Female")
