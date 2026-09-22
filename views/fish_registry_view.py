@@ -1,222 +1,299 @@
-# views/fish_registry_view.py
+import io
 import datetime
 import streamlit as st
-import pandas as pd
-from modules.fish_manager import (
-    get_all_fish,
-    register_new_fish,
-    promote_fish_to_breeder,
-    generate_purchased_fish_id,
-    generate_batch_fish_id,
-    get_existing_fish_ids
-)
-from modules.spawn_manager import get_all_spawns, get_breeder_details_map
-from views.spawn_view import display_breeder_image
+
+# Import Drive & Sheets services
+from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
+
+# ------------------------------------------------------------------------------
+# Helper Functions: Strain, Tank & Grade Management
+# ------------------------------------------------------------------------------
+
+def get_registered_strains(sheets_service):
+    """Fetch list of saved strains from 'Master_Strains' sheet or return defaults."""
+    default_strains = [
+        "Yellow Koi Galaxy",
+        "Red Koi Galaxy",
+        "Blue Rim",
+        "Avatar",
+        "Black Star / Samurai",
+        "Red Dragon",
+        "Copper Light",
+        "Fancy Marble",
+        "Super Red",
+        "Super Black"
+    ]
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Master_Strains!A2:A'
+        ).execute()
+        rows = res.get('values', [])
+        strains = [r[0] for r in rows if r and r[0].strip()]
+        return sorted(list(set(default_strains + strains)))
+    except Exception:
+        return default_strains
+
+
+def add_new_strain_to_db(sheets_service, new_strain):
+    """Save a new strain to the 'Master_Strains' worksheet."""
+    try:
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Master_Strains!A:A',
+            valueInputOption='USER_ENTERED',
+            body={'values': [[new_strain.strip()]]}
+        ).execute()
+        st.toast(f"✅ Added '{new_strain}' to Strain Registry!", icon="✨")
+    except Exception as e:
+        st.warning(f"Note: Could not save strain to persistent sheet ({e})")
+
+
+def get_available_tanks(sheets_service):
+    """Fetch tanks with status 'Available' along with their container type."""
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Tanks!A2:E'
+        ).execute()
+        rows = res.get('values', [])
+        tanks = []
+        for r in rows:
+            if len(r) >= 3:
+                tank_id = r[0]
+                container_type = r[1] if len(r) > 1 else "Standard"
+                status = r[2] if len(r) > 2 else "Available"
+                if status.strip().lower() in ["available", "vacant", "empty", "free"]:
+                    tanks.append({"id": tank_id, "type": container_type, "status": status})
+        return tanks
+    except Exception:
+        # Fallback dummy tanks if sheet is empty/unreachable
+        return [
+            {"id": "Jar M-01", "type": "Empi Jar", "status": "Available"},
+            {"id": "Jar M-02", "type": "Empi Jar", "status": "Available"},
+            {"id": "B-01", "type": "6L Bottle", "status": "Available"},
+            {"id": "T-01", "type": "Tubo Container", "status": "Available"},
+        ]
+
+
+def upload_image_to_drive(drive_service, image_bytes, filename_prefix="fish_"):
+    """Upload photo bytes to Google Drive and return public file ID / URL."""
+    from googleapiclient.http import MediaIoBaseUpload
+    
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name = f"{filename_prefix}{timestamp}.jpg"
+    
+    file_stream = io.BytesIO(image_bytes)
+    metadata = {'name': file_name}
+    if DRIVE_FOLDER_ID:
+        metadata['parents'] = [DRIVE_FOLDER_ID.strip()]
+
+    media = MediaIoBaseUpload(file_stream, mimetype='image/jpeg', resumable=False)
+    uploaded = drive_service.files().create(
+        body=metadata,
+        media_body=media,
+        fields='id'
+    ).execute()
+    
+    file_id = uploaded.get('id')
+    return file_id, f"https://lh3.googleusercontent.com/d/{file_id}"
+
+
+def calculate_form_grade(checks: dict, body_shape: str) -> tuple[str, int]:
+    """
+    Calculates grade and total score based on fin criteria checkboxes and body shape.
+    
+    Each checked fin criterion adds 15 points (Max 90 pts).
+    Body Shape weighting:
+      - Bullet Head: +10 pts
+      - Regular: +8 pts
+      - Spoonhead: +5 pts
+    """
+    total_score = sum(15 for matched in checks.values() if matched)
+    
+    shape_scores = {
+        "Bullet Head": 10,
+        "Regular": 8,
+        "Spoonhead": 5
+    }
+    total_score += shape_scores.get(body_shape, 8)
+    
+    if total_score >= 95:
+        grade = "Show Grade"
+    elif total_score >= 80:
+        grade = "High Grade"
+    elif total_score >= 60:
+        grade = "Breeder Grade"
+    else:
+        grade = "Pet Grade"
+        
+    return grade, total_score
+
+
+# ------------------------------------------------------------------------------
+# Main Page Render Function
+# ------------------------------------------------------------------------------
 
 def render_fish_registry_page():
-    st.title("🐟 Individual Fish Master Registry")
+    st.header("🐠 Fish Master Registry")
+    st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
 
-    tab1, tab2 = st.tabs(["➕ Register Fish", "📋 Master Fish Inventory"])
+    # Initialize Google Services
+    try:
+        drive_service, sheets_service = get_google_services()
+    except Exception as e:
+        st.error(f"Failed to connect to Google Services: {e}")
+        return
 
-    # ==========================================
-    # TAB 1: REGISTER NEW INDIVIDUAL FISH
-    # ==========================================
-    with tab1:
-        st.subheader("Register Individual Fish")
-        
-        origin_type = st.radio(
-            "Select Origin Type", 
-            ["Purchased / External", "Recorded Batch Fry"], 
-            horizontal=True,
-            key="radio_origin_type"
-        )
+    # Tabs for Registration and View Registry
+    tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
 
-        existing_ids = get_existing_fish_ids()
+    with tab_register:
+        st.subheader("🛒 Purchased / Imported Fish Details")
 
-        if origin_type == "Purchased / External":
-            st.markdown("#### 🛒 Purchased / Imported Fish Details")
-            
+        with st.form("register_fish_form", clear_on_submit=False):
             col1, col2 = st.columns(2)
+
             with col1:
-                variety = st.text_input("Variety / Type", value="Halfmoon Plakat", help="e.g. Red Dragon HMPK, Blue Rim")
-                gender = st.selectbox("Gender", ["Male", "Female", "Unsexed"])
-                grade = st.selectbox("Grade", ["Show Grade", "High Grade", "Pet Grade", "Breeder Grade"])
-                location = st.text_input("Tank / Jar Location", value="Jar M-01")
-            
-            with col2:
-                seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder")
-                purchase_date = st.date_input("Purchase Date", value=datetime.date.today())
-                purchase_cost = st.number_input("Purchase Cost", min_value=0.0, value=0.0, step=5.0)
-                image_url = st.text_input("Image URL / Google Drive File ID", placeholder="Paste direct link or Drive ID")
-
-            notes = st.text_area("Notes / Characteristics", placeholder="e.g. Strong dorsal, solid iridescence")
-
-            # Dynamic ID Generation Preview
-            suggested_id = generate_purchased_fish_id(variety, gender, existing_ids)
-            
-            st.info(f"🆔 **Assigned Fish ID:** `{suggested_id}` | 🧬 **Lineage:** `Untraceable (P1)`")
-
-            if st.button("💾 Register Purchased Fish", type="primary", use_container_width=True):
-                if not variety:
-                    st.error("Please specify a variety for the fish.")
-                else:
-                    fish_payload = {
-                        "fish_id": suggested_id,
-                        "origin": "Purchased",
-                        "batch_id": "N/A",
-                        "line_code": "UNK",
-                        "generation": "P1",
-                        "sire_id": "N/A",
-                        "dam_id": "N/A",
-                        "gender": gender,
-                        "variety": variety,
-                        "grade": grade,
-                        "image_url": image_url,
-                        "location": location,
-                        "purchase_date": purchase_date.isoformat(),
-                        "seller": seller,
-                        "purchase_cost": purchase_cost,
-                        "status": "Active",
-                        "notes": notes
-                    }
-                    new_id = register_new_fish(fish_payload)
-                    st.success(f"Fish registered successfully with ID: **{new_id}**!")
-                    st.rerun()
-
-        else:
-            # Recorded Batch Fry Logic
-            st.markdown("#### 🐣 Jar Fish from Recorded Batch Spawn")
-            
-            spawns = get_all_spawns()
-            # Filter for successful / free-swimming spawns or active ones
-            valid_spawns = [s for s in spawns if s.get("status") in ["Free Swimming", "In Pairing", "Pending (Success)"]]
-            
-            if not valid_spawns:
-                st.warning("⚠️ No recorded spawns found. Register a spawn in the Pair & Spawn Tracker first.")
-            else:
-                spawn_map = {}
-                for s in valid_spawns:
-                    label = f"Spawn {s['id']} | Line: {s.get('line_code', 'UNK')} ({s.get('generation', 'F1')}) | Batch: {s.get('batch_name', 'N/A')}"
-                    spawn_map[label] = s
-
-                selected_label = st.selectbox("Select Source Spawn Batch", list(spawn_map.keys()))
-                selected_spawn = spawn_map[selected_label]
-
-                # Fetch details from parents
-                batch_code = selected_spawn.get("batch_name") or f"SP{selected_spawn['id']}"
-                sire_id = selected_spawn.get("male_id", "N/A")
-                dam_id = selected_spawn.get("female_id", "N/A")
-                line_code = selected_spawn.get("line_code", "UNK")
-                generation = selected_spawn.get("generation", "F1")
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    gender = st.selectbox("Gender", ["Unsexed", "Male", "Female"])
-                    grade = st.selectbox("Grade", ["High Grade", "Show Grade", "Pet Grade", "Cull"])
-                    variety = st.text_input("Variety / Trait Description", value=f"{line_code} Betta")
+                # 1. Variety / Type & Strain Selection
+                st.markdown("##### 🧬 Variety & Strain")
+                form_type = st.text_input("Form / Type", value="HMPK", help="Default is HMPK (Halfmoon Plakat)")
                 
-                with col2:
-                    location = st.text_input("Jar / Tank Location", value="Jar 01")
-                    image_url = st.text_input("Image URL / Google Drive File ID", placeholder="Paste direct link or Drive ID")
+                existing_strains = get_registered_strains(sheets_service)
+                strain_options = existing_strains + ["➕ Add New Strain..."]
+                selected_strain_option = st.selectbox("Select Strain", options=strain_options, index=0)
 
-                notes = st.text_area("Notes / Growth Observation", placeholder="e.g. First pick from batch, good form")
+                new_strain_input = ""
+                if selected_strain_option == "➕ Add New Strain...":
+                    new_strain_input = st.text_input("Enter New Strain Name", placeholder="e.g. Yellow Red Dragon Fancy")
 
-                # Dynamic Batch ID Preview
-                suggested_id = generate_batch_fish_id(batch_code, existing_ids)
+                gender = st.selectbox("Gender", ["Male", "Female"])
+                seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder")
+                purchase_date = st.date_input("Purchase Date", datetime.date.today())
+                purchase_cost = st.number_input("Purchase Cost (₱)", min_value=0.0, value=0.0, step=50.0)
 
-                st.info(
-                    f"🆔 **Assigned Fish ID:** `{suggested_id}` | "
-                    f"🧬 **Line:** `{line_code}` (`{generation}`) | "
-                    f"♂️ **Sire:** `{sire_id}` | ♀️ **Dam:** `{dam_id}`"
+            with col2:
+                # 2. Dynamic Tank Selection with Filter
+                st.markdown("##### 🪣 Tank & Container Assignment")
+                
+                all_available_tanks = get_available_tanks(sheets_service)
+                container_types = ["All Types"] + sorted(list(set(t["type"] for t in all_available_tanks)))
+                
+                selected_type_filter = st.selectbox("Filter Tank Type", options=container_types)
+                
+                if selected_type_filter != "All Types":
+                    filtered_tanks = [t for t in all_available_tanks if t["type"] == selected_type_filter]
+                else:
+                    filtered_tanks = all_available_tanks
+
+                tank_options = [f"{t['id']} ({t['type']})" for t in filtered_tanks] if filtered_tanks else ["No Available Tanks"]
+                selected_tank_str = st.selectbox("Select Available Tank / Jar Location", options=tank_options)
+
+            st.divider()
+
+            # 3. Form Evaluation Criteria Checklist & Body Shape
+            st.markdown("### 🏆 Form Evaluation Criteria")
+            
+            chk_col, shape_col = st.columns([3, 2])
+            
+            with chk_col:
+                caudal_spread = st.checkbox("Caudal Fin Spread 180°", value=True)
+                caudal_prop = st.checkbox("Caudal Fin Proportion (Good branching, no damage)", value=True)
+                dorsal_struct = st.checkbox("Dorsal Fin Structure (Broad base & clean overlapping)", value=True)
+                anal_struct = st.checkbox("Anal Fin Structure (Parallel & proper length)", value=True)
+                ventral_fins = st.checkbox("Ventral Fins (Straight, broad, no curl)", value=True)
+                pectoral_fins = st.checkbox("Pectoral Fins (Full & undamaged)", value=True)
+
+            with shape_col:
+                body_shape = st.selectbox(
+                    "Body Shape",
+                    options=["Bullet Head", "Regular", "Spoonhead"],
+                    index=0,
+                    help="Select the head profile/body shape structure."
                 )
 
-                if st.button("💾 Register Batch Fry", type="primary", use_container_width=True):
-                    fish_payload = {
-                        "fish_id": suggested_id,
-                        "origin": "Batch Spawn",
-                        "batch_id": selected_spawn["id"],
-                        "line_code": line_code,
-                        "generation": generation,
-                        "sire_id": sire_id,
-                        "dam_id": dam_id,
-                        "gender": gender,
-                        "variety": variety,
-                        "grade": grade,
-                        "image_url": image_url,
-                        "location": location,
-                        "status": "Jarred",
-                        "notes": notes
-                    }
-                    new_id = register_new_fish(fish_payload)
-                    st.success(f"Fry jarred and registered successfully with ID: **{new_id}**!")
-                    st.rerun()
+            evaluation_checks = {
+                "caudal_spread": caudal_spread,
+                "caudal_prop": caudal_prop,
+                "dorsal_struct": dorsal_struct,
+                "anal_struct": anal_struct,
+                "ventral_fins": ventral_fins,
+                "pectoral_fins": pectoral_fins,
+            }
 
-    # ==========================================
-    # TAB 2: MASTER FISH INVENTORY & PROMOTION
-    # ==========================================
-    with tab2:
-        st.subheader("Master Fish Inventory")
-        all_fish = get_all_fish()
+            computed_grade, total_points = calculate_form_grade(evaluation_checks, body_shape)
+            st.info(f"🏆 Calculated Grade: **{computed_grade}** (Score: **{total_points}/100**)")
 
-        if not all_fish:
-            st.info("No fish registered in the inventory yet. Add one in the 'Register Fish' tab!")
-        else:
-            col_filter1, col_filter2 = st.columns([2, 2])
-            with col_filter1:
-                search_query = st.text_input("🔍 Search Fish ID / Variety / Line", placeholder="e.g. PUR-HMPK or DRG")
-            with col_filter2:
-                breeder_filter = st.selectbox("Filter by Role", ["All Fish", "Breeders Only", "Non-Breeders Only"])
+            st.divider()
 
-            # Filter logic
-            filtered_fish = all_fish
-            if search_query:
-                q = search_query.lower()
-                filtered_fish = [
-                    f for f in filtered_fish 
-                    if q in f["fish_id"].lower() or q in f["variety"].lower() or q in f["line_code"].lower()
-                ]
+            # 4. Direct Photo Capture / Upload & Fallback URL
+            st.markdown("##### 📷 Fish Photo Capture / Upload")
+            
+            img_col1, img_col2 = st.columns(2)
+            with img_col1:
+                camera_photo = st.camera_input("Take a Live Photo of Fish")
+            with img_col2:
+                uploaded_photo = st.file_uploader("Or Upload Photo File", type=["jpg", "jpeg", "png"])
+                manual_image_url = st.text_input("Or Paste Existing Drive ID / Image URL", placeholder="Paste direct link or Drive ID")
 
-            if breeder_filter == "Breeders Only":
-                filtered_fish = [f for f in filtered_fish if f.get("is_breeder")]
-            elif breeder_filter == "Non-Breeders Only":
-                filtered_fish = [f for f in filtered_fish if not f.get("is_breeder")]
+            notes = st.text_area("Notes / Characteristics", placeholder="e.g. Strong dorsal, solid iridescence, aggressive disposition")
 
-            st.write(f"Showing **{len(filtered_fish)}** fish")
+            submit = st.form_submit_button("💾 Register Fish", use_container_width=True)
 
-            for fish in filtered_fish:
-                fish_id = fish["fish_id"]
-                is_breeder = fish.get("is_breeder", False)
+        # Handle Form Submission Logic
+        if submit:
+            final_strain = new_strain_input if selected_strain_option == "➕ Add New Strain..." else selected_strain_option
+            
+            if selected_strain_option == "➕ Add New Strain..." and new_strain_input.strip():
+                add_new_strain_to_db(sheets_service, new_strain_input.strip())
 
-                with st.container(border=True):
-                    col_img, col_main, col_action = st.columns([1.2, 3, 1.8])
+            # Handle Image Upload to Google Drive
+            final_image_val = manual_image_url
+            photo_bytes = None
+            if camera_photo is not None:
+                photo_bytes = camera_photo.getvalue()
+            elif uploaded_photo is not None:
+                photo_bytes = uploaded_photo.getvalue()
 
-                    with col_img:
-                        display_breeder_image(fish.get("image_url", ""), gender_label=fish.get("gender", "Fish"))
+            if photo_bytes:
+                with st.spinner("Uploading photo to Google Drive..."):
+                    try:
+                        file_id, img_url = upload_image_to_drive(drive_service, photo_bytes)
+                        final_image_val = img_url
+                        st.success(f"Image uploaded successfully! (Drive ID: {file_id})")
+                    except Exception as err:
+                        st.error(f"Image upload failed: {err}")
 
-                    with col_main:
-                        role_badge = "👑 **[ACTIVE BREEDER]**" if is_breeder else "🐟 [Master Inventory]"
-                        st.markdown(f"### `{fish_id}` {role_badge}")
-                        st.markdown(f"**Variety:** {fish.get('variety', 'N/A')} | **Gender:** `{fish.get('gender', 'N/A')}` | **Grade:** `{fish.get('grade', 'N/A')}`")
-                        st.markdown(f"🧬 **Lineage:** `{fish.get('line_code', 'UNK')}` (`{fish.get('generation', 'P1')}`) | **Origin:** `{fish.get('origin', 'Purchased')}`")
-                        
-                        if fish.get("origin") == "Batch Spawn":
-                            st.caption(f"♂️ **Sire:** `{fish.get('sire_id')}` | ♀️ **Dam:** `{fish.get('dam_id')}` | 📦 **Batch:** `{fish.get('batch_id')}`")
-                        else:
-                            st.caption(f"🛒 **Seller:** {fish.get('seller', 'N/A')} | 📅 **Purchased:** {fish.get('purchase_date', 'N/A')} | 💰 **Cost:** ₱{fish.get('purchase_cost', 0):,.2f}")
+            # Selected Tank ID
+            selected_tank_id = selected_tank_str.split(" (")[0] if selected_tank_str != "No Available Tanks" else ""
 
-                        st.caption(f"📍 **Location:** `{fish.get('location', 'Unassigned')}` | 🏷️ **Status:** `{fish.get('status', 'Active')}`")
-                        if fish.get("notes"):
-                            st.info(f"**Notes:** {fish['notes']}")
+            # Prepare row data for Google Sheets
+            new_fish_record = [
+                f"FISH-{datetime.datetime.now().strftime('%M%S')}",
+                f"{form_type} - {final_strain}",
+                gender,
+                computed_grade,
+                selected_tank_id,
+                seller,
+                str(purchase_date),
+                purchase_cost,
+                final_image_val,
+                f"Body Shape: {body_shape}. {notes}".strip()
+            ]
 
-                    with col_action:
-                        st.markdown("#### Actions")
-                        if not is_breeder:
-                            if st.button("👑 Promote to Breeder", key=f"promote_{fish_id}", type="primary", use_container_width=True):
-                                if promote_fish_to_breeder(fish_id):
-                                    st.success(f"`{fish_id}` promoted to Active Breeder!")
-                                    st.rerun()
-                                else:
-                                    st.error("Failed to promote fish.")
-                        else:
-                            st.button("✅ Active Breeder", key=f"is_breeder_btn_{fish_id}", disabled=True, use_container_width=True)
-                            st.caption("Breeder ID matches Fish ID perfectly.")
+            try:
+                # Append row to 'Fish_Master' sheet
+                sheets_service.spreadsheets().values().append(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range='Fish_Master!A:J',
+                    valueInputOption='USER_ENTERED',
+                    body={'values': [new_fish_record]}
+                ).execute()
+
+                st.balloons()
+                st.success(f"🎉 Fish successfully registered as Grade: **{computed_grade}** assigned to **{selected_tank_id}**!")
+            except Exception as e:
+                st.error(f"Error saving fish record: {e}")
+
+    with tab_view:
+        st.write("Displaying registered fish list from `Fish_Master` worksheet...")
