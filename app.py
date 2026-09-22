@@ -6,6 +6,7 @@ from views.spawn_view import render_spawn_page
 from views.activity_log_view import render_activity_log_page
 from views.tank_view import render_tank_page       # Tank Registry View
 from views.search_view import render_search_page   # Global Search View
+from modules.tank_dashboard import render_tank_dashboard  # Tank Dashboard View
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
 from modules.spawn_manager import format_spawns_sheet
 
@@ -157,6 +158,7 @@ def run_google_diagnostic():
 # --- Sidebar Navigation ---
 st.sidebar.title("🐟 The Betta Studio")
 page = st.sidebar.radio("Navigation", [
+    "📊 Tank Dashboard",
     "🔍 Global Search Studio",
     "Breeder Registry",
     "🪣 Tank & Container Registry",
@@ -168,7 +170,9 @@ st.sidebar.markdown("---")
 run_google_diagnostic()
 
 # --- View Routing ---
-if page == "🔍 Global Search Studio":
+if page == "📊 Tank Dashboard":
+    render_tank_dashboard()
+elif page == "🔍 Global Search Studio":
     render_search_page()
 elif page == "Breeder Registry":
     render_breeder_page()
