@@ -18,14 +18,12 @@ def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
         sheet_titles = [s['properties']['title'] for s in sheets]
 
         if sheet_name not in sheet_titles:
-            # Create sheet tab
             requests = [{'addSheet': {'properties': {'title': sheet_name}}}]
             sheets_service.spreadsheets().batchUpdate(
                 spreadsheetId=SPREADSHEET_ID,
                 body={'requests': requests}
             ).execute()
 
-            # Add headers starting at A1
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f'{sheet_name}!A1',
@@ -167,55 +165,73 @@ def delete_strain_from_db(sheets_service, strain_to_remove):
 
 
 def get_available_tanks(sheets_service):
-    """Fetch tanks with status 'Available' along with their container type."""
+    """Fetch tanks from Tanks sheet matching tank_view criteria (empty/idle or no occupant)."""
+    available_statuses = ["empty / idle", "empty", "idle", "available", "ready", "clean"]
     try:
         res = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Tanks!A2:E'
+            range='Tanks!A2:H'
         ).execute()
         rows = res.get('values', [])
         tanks = []
+        
         for r in rows:
-            if len(r) >= 3:
-                tank_id = r[0]
-                container_type = r[1] if len(r) > 1 else "Standard"
-                status = r[2] if len(r) > 2 else "Available"
-                if status.strip().lower() in ["available", "vacant", "empty", "free"]:
-                    tanks.append({"id": tank_id, "type": container_type, "status": status})
+            if len(r) >= 1:
+                tank_id = r[0].strip()
+                container_type = r[1].strip() if len(r) > 1 else "Standard Container"
+                location_code = r[2].strip() if len(r) > 2 and r[2].strip() else tank_id
+                status = r[5].strip() if len(r) > 5 else "Empty / Idle"
+                occupant = r[6].strip() if len(r) > 6 else ""
+
+                status_clean = status.lower()
+                occupant_clean = occupant.lower()
+
+                is_avail = (status_clean in available_statuses) or (not occupant_clean or occupant_clean in ["empty", "none", "n/a"])
+
+                if is_avail and tank_id:
+                    tanks.append({
+                        "id": tank_id,
+                        "location": location_code,
+                        "type": container_type,
+                        "status": status,
+                        "occupant": occupant
+                    })
         return tanks
     except Exception:
         return [
-            {"id": "Jar M-01", "type": "Empi Jar", "status": "Available"},
-            {"id": "Jar M-02", "type": "Empi Jar", "status": "Available"},
-            {"id": "B-01", "type": "6L Bottle", "status": "Available"},
-            {"id": "T-01", "type": "Tubo Container", "status": "Available"},
+            {"id": "TANK-001", "location": "JAR-M-01", "type": "Empi Glass / Jar", "status": "Empty / Idle", "occupant": ""},
+            {"id": "TANK-002", "location": "BOT-6L-01", "type": "6-Liter Water Bottle", "status": "Empty / Idle", "occupant": ""},
         ]
 
 
-def mark_tank_occupied(sheets_service, tank_id: str):
-    """Updates the assigned tank's status to 'Occupied' in the Tanks sheet."""
+def update_tank_occupancy(sheets_service, tank_id: str, occupant_id: str, status: str = "Active"):
+    """Updates Tank status and occupant columns in the Tanks sheet to maintain parity with tank_view."""
+    if not tank_id or tank_id == "Unassigned":
+        return
+
     try:
         res = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Tanks!A2:C'
+            range='Tanks!A2:G'
         ).execute()
         rows = res.get('values', [])
         
         for idx, r in enumerate(rows, start=2):
-            if r and r[0].strip().lower() == tank_id.strip().lower():
+            if r and (r[0].strip().lower() == tank_id.strip().lower() or (len(r) > 2 and r[2].strip().lower() == tank_id.strip().lower())):
+                # Update Status (Column F / Index 6) and Occupant (Column G / Index 7)
                 sheets_service.spreadsheets().values().update(
                     spreadsheetId=SPREADSHEET_ID,
-                    range=f'Tanks!C{idx}',
+                    range=f'Tanks!F{idx}:G{idx}',
                     valueInputOption='USER_ENTERED',
-                    body={'values': [["Occupied"]]}
+                    body={'values': [[status, occupant_id]]}
                 ).execute()
                 break
     except Exception as e:
-        st.warning(f"Note: Could not update tank '{tank_id}' status to Occupied: {e}")
+        st.warning(f"Note: Could not update tank '{tank_id}' occupancy: {e}")
 
 
 def transfer_or_assign_tank(sheets_service, fish_id: str, old_tank_id: str, new_tank_id: str) -> bool:
-    """Updates tank assignment in Fish_Master and toggles tank status in Tanks sheet."""
+    """Updates tank assignment in Fish_Master and toggles tank status/occupant in Tanks sheet."""
     try:
         # 1. Update Fish_Master sheet with new Tank ID
         res = sheets_service.spreadsheets().values().get(
@@ -234,25 +250,15 @@ def transfer_or_assign_tank(sheets_service, fish_id: str, old_tank_id: str, new_
                 ).execute()
                 break
 
-        # 2. Set old tank back to Available if applicable
+        # 2. Release old tank if applicable
         if old_tank_id and old_tank_id != "Unassigned":
-            tanks_res = sheets_service.spreadsheets().values().get(
-                spreadsheetId=SPREADSHEET_ID,
-                range='Tanks!A2:C'
-            ).execute()
-            tank_rows = tanks_res.get('values', [])
-            for idx, r in enumerate(tank_rows, start=2):
-                if r and r[0].strip().lower() == old_tank_id.strip().lower():
-                    sheets_service.spreadsheets().values().update(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range=f'Tanks!C{idx}',
-                        valueInputOption='USER_ENTERED',
-                        body={'values': [["Available"]]}
-                    ).execute()
-                    break
+            update_tank_occupancy(sheets_service, old_tank_id, occupant_id="", status="Empty / Idle")
 
-        # 3. Mark new tank as Occupied
-        mark_tank_occupied(sheets_service, new_tank_id)
+        # 3. Assign new tank to fish
+        if new_tank_id and new_tank_id != "Unassigned":
+            update_tank_occupancy(sheets_service, new_tank_id, occupant_id=fish_id, status="Active")
+
+        st.cache_data.clear()
         return True
     except Exception as e:
         st.error(f"Failed to transfer tank: {e}")
@@ -434,7 +440,7 @@ def render_fish_registry_page():
                 else:
                     filtered_tanks = all_available_tanks
 
-                tank_options = ["Leave Unassigned"] + [f"{t['id']} ({t['type']})" for t in filtered_tanks]
+                tank_options = ["Leave Unassigned"] + [f"{t['location']} ({t['id']} | {t['type']})" for t in filtered_tanks]
                 selected_tank_str = st.selectbox("Select Available Tank / Jar Location", options=tank_options)
 
             st.divider()
@@ -505,7 +511,9 @@ def render_fish_registry_page():
 
             selected_tank_id = ""
             if selected_tank_str != "Leave Unassigned":
-                selected_tank_id = selected_tank_str.split(" (")[0]
+                # Parse system tank ID inside parentheses: Location (TANK-ID | Type)
+                parsed_id = selected_tank_str.split(" (")[1].split(" | ")[0]
+                selected_tank_id = parsed_id
 
             new_fish_record = [
                 assigned_fish_id,
@@ -529,8 +537,9 @@ def render_fish_registry_page():
                 ).execute()
 
                 if selected_tank_id:
-                    mark_tank_occupied(sheets_service, selected_tank_id)
+                    update_tank_occupancy(sheets_service, selected_tank_id, occupant_id=assigned_fish_id, status="Active")
 
+                st.cache_data.clear()
                 st.balloons()
                 st.success(f"🎉 Fish **#{assigned_fish_id}** ({selected_strain}) successfully registered!")
                 st.rerun()
@@ -562,7 +571,7 @@ def render_fish_registry_page():
                 col_f, col_t, col_act = st.columns([2, 2, 1])
 
                 fish_options = {
-                    f"{row['Fish ID']} - {row['Variety / Strain']} (Current: {row['Tank ID'] if row['Tank ID'] else 'Unassigned'})": (row['Fish ID'], row['Tank ID'])
+                    f"{row['Fish ID']} - {row['Variety / Strain']} (Current Tank: {row['Tank ID'] if row['Tank ID'] else 'Unassigned'})": (row['Fish ID'], row['Tank ID'])
                     for _, row in df.iterrows()
                 }
 
@@ -572,7 +581,7 @@ def render_fish_registry_page():
 
                 with col_t:
                     available_tanks = get_available_tanks(sheets_service)
-                    avail_tank_opts = [f"{t['id']} ({t['type']})" for t in available_tanks]
+                    avail_tank_opts = [f"{t['location']} ({t['id']} | {t['type']})" for t in available_tanks]
                     
                     if not avail_tank_opts:
                         st.warning("No vacant tanks available!")
@@ -585,17 +594,17 @@ def render_fish_registry_page():
                     action_btn_label = "📥 Assign Tank" if not current_tank_id or current_tank_id == "Unassigned" else "🔄 Transfer Tank"
                     
                     if st.button(action_btn_label, type="primary", use_container_width=True, disabled=not selected_new_tank):
-                        new_tank_id = selected_new_tank.split(" (")[0]
+                        parsed_new_tank_id = selected_new_tank.split(" (")[1].split(" | ")[0]
                         
                         with st.spinner("Updating tank assignments in database..."):
                             success = transfer_or_assign_tank(
                                 sheets_service, 
                                 target_fish_id, 
                                 current_tank_id, 
-                                new_tank_id
+                                parsed_new_tank_id
                             )
                             if success:
-                                st.toast(f"✅ {target_fish_id} moved from '{current_tank_id}' to '{new_tank_id}'!", icon="🎉")
+                                st.toast(f"✅ {target_fish_id} moved to '{parsed_new_tank_id}'!", icon="🎉")
                                 st.rerun()
 
             st.divider()
