@@ -6,7 +6,7 @@ import streamlit as st
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
 
 # ------------------------------------------------------------------------------
-# Helper Functions: Sheet Initialization, Tanks & Grades
+# Helper Functions: Sheet Initialization, Strains, Tanks & Grades
 # ------------------------------------------------------------------------------
 
 def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
@@ -37,11 +37,117 @@ def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
 
 def ensure_fish_master_sheet_exists(sheets_service):
     headers = [
-        "Fish ID", "Variety / Type", "Gender", "Grade", 
+        "Fish ID", "Variety / Strain", "Gender", "Grade", 
         "Tank ID", "Seller", "Purchase Date", "Purchase Cost", 
         "Image URL", "Notes"
     ]
     ensure_sheet_exists(sheets_service, 'Fish_Master', headers)
+
+
+def get_registered_strains(sheets_service):
+    """Fetch list of saved strains from 'Master_Strains' sheet or return defaults."""
+    default_strains = [
+        "Yellow Koi Galaxy",
+        "Red Koi Galaxy",
+        "Blue Rim",
+        "Avatar",
+        "Black Star / Samurai",
+        "Red Dragon",
+        "Copper Light",
+        "Fancy Marble",
+        "Super Red",
+        "Super Black"
+    ]
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Master_Strains!A2:A'
+        ).execute()
+        rows = res.get('values', [])
+        strains = [r[0] for r in rows if r and r[0].strip()]
+        
+        # Combine default and sheet strains, removing those marked as removed
+        all_strains = set(default_strains + strains)
+        
+        # Exclude strains stored in session state for dynamic removals
+        removed_strains = st.session_state.get("removed_strains_list", set())
+        active_strains = [s for s in all_strains if s not in removed_strains]
+        
+        return sorted(active_strains)
+    except Exception:
+        removed_strains = st.session_state.get("removed_strains_list", set())
+        return sorted([s for s in default_strains if s not in removed_strains])
+
+
+def add_new_strain_to_db(sheets_service, new_strain):
+    """Save a new strain to the 'Master_Strains' worksheet."""
+    try:
+        ensure_sheet_exists(sheets_service, 'Master_Strains', ["Strain Name"])
+        
+        # Unmark from session removed set if re-added
+        if "removed_strains_list" in st.session_state:
+            st.session_state["removed_strains_list"].discard(new_strain.strip())
+            
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Master_Strains!A:A',
+            valueInputOption='USER_ENTERED',
+            body={'values': [[new_strain.strip()]]}
+        ).execute()
+        st.toast(f"✅ Saved '{new_strain}' to Strain Registry!", icon="✨")
+    except Exception as e:
+        st.error(f"Could not save strain to database ({e})")
+
+
+def delete_strain_from_db(sheets_service, strain_to_remove):
+    """Delete a strain row from 'Master_Strains' or soft-delete from local registry."""
+    # Store in local session removal set
+    if "removed_strains_list" not in st.session_state:
+        st.session_state["removed_strains_list"] = set()
+    st.session_state["removed_strains_list"].add(strain_to_remove)
+
+    try:
+        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        sheets = spreadsheet.get('sheets', [])
+        sheet_id = None
+        for s in sheets:
+            if s['properties']['title'] == 'Master_Strains':
+                sheet_id = s['properties']['sheetId']
+                break
+
+        if sheet_id is not None:
+            res = sheets_service.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range='Master_Strains!A1:A'
+            ).execute()
+            rows = res.get('values', [])
+            
+            # Find matching row indices (1-indexed for sheets)
+            delete_requests = []
+            for idx, r in enumerate(rows):
+                if r and r[0].strip().lower() == strain_to_remove.strip().lower():
+                    delete_requests.append({
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": idx,
+                                "endIndex": idx + 1
+                            }
+                        }
+                    })
+
+            # Execute deletion in reverse order to avoid index shifts
+            if delete_requests:
+                delete_requests.reverse()
+                sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=SPREADSHEET_ID,
+                    body={'requests': delete_requests}
+                ).execute()
+
+        st.toast(f"🗑️ Removed '{strain_to_remove}' from Strain Registry!", icon="✨")
+    except Exception as e:
+        st.toast(f"Removed '{strain_to_remove}' from UI view.", icon="ℹ️")
 
 
 def get_available_tanks(sheets_service):
@@ -137,6 +243,60 @@ def render_fish_registry_page():
     with tab_register:
         st.subheader("🛒 Purchased / Imported Fish Details")
 
+        # Fetch existing active strains from Google Sheets DB
+        strains_list = get_registered_strains(sheets_service)
+
+        # ----------------------------------------------------------------------
+        # Manage Strains Popover (Add & Remove Strains)
+        # ----------------------------------------------------------------------
+        strain_col_select, strain_col_btn = st.columns([4, 1])
+        
+        with strain_col_btn:
+            st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+            with st.popover("⚙️ Manage Strains"):
+                pop_tab_add, pop_tab_remove = st.tabs(["➕ Add", "🗑️ Remove"])
+                
+                with pop_tab_add:
+                    st.markdown("##### Add New Strain")
+                    new_strain_val = st.text_input("Strain Name", placeholder="e.g. Copper Blue Star").strip()
+                    if st.button("Save Strain", use_container_width=True, type="primary", key="btn_add_strain"):
+                        if new_strain_val:
+                            add_new_strain_to_db(sheets_service, new_strain_val)
+                            st.session_state["selected_strain"] = new_strain_val
+                            st.rerun()
+                        else:
+                            st.warning("Please enter a strain name.")
+
+                with pop_tab_remove:
+                    st.markdown("##### Remove Existing Strain")
+                    if strains_list:
+                        strain_to_delete = st.selectbox(
+                            "Select Strain to Delete", 
+                            options=strains_list, 
+                            key="select_strain_to_delete"
+                        )
+                        if st.button("Delete Strain", use_container_width=True, type="primary", key="btn_delete_strain"):
+                            delete_strain_from_db(sheets_service, strain_to_delete)
+                            # Reset selection if active strain was deleted
+                            if st.session_state.get("selected_strain") == strain_to_delete:
+                                st.session_state.pop("selected_strain", None)
+                            st.rerun()
+                    else:
+                        st.info("No strains available to remove.")
+
+        # Determine default selected index safely
+        default_index = 0
+        if "selected_strain" in st.session_state and st.session_state["selected_strain"] in strains_list:
+            default_index = strains_list.index(st.session_state["selected_strain"])
+
+        with strain_col_select:
+            selected_strain = st.selectbox(
+                "Select Strain",
+                options=strains_list if strains_list else ["No Strains Available"],
+                index=default_index if strains_list else 0,
+                key="select_strain_dropdown"
+            )
+
         # ----------------------------------------------------------------------
         # Registration Form
         # ----------------------------------------------------------------------
@@ -145,7 +305,7 @@ def render_fish_registry_page():
 
             with col1:
                 st.markdown("##### 🧬 Variety & Details")
-                form_type = st.text_input("Form / Type", value="HMPK", help="e.g. HMPK, Crown Tail, Halfmoon")
+                form_type = st.text_input("Form / Type", value="HMPK", help="Default is HMPK (Halfmoon Plakat)")
                 gender = st.selectbox("Gender", ["Male", "Female"])
                 seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder")
                 purchase_date = st.date_input("Purchase Date", datetime.date.today())
@@ -244,7 +404,7 @@ def render_fish_registry_page():
             # Prepare row data for Google Sheets
             new_fish_record = [
                 f"FISH-{datetime.datetime.now().strftime('%M%S')}",
-                form_type,
+                f"{form_type} - {selected_strain}",
                 gender,
                 computed_grade,
                 selected_tank_id,
@@ -264,7 +424,7 @@ def render_fish_registry_page():
                 ).execute()
 
                 st.balloons()
-                st.success(f"🎉 Fish successfully registered as Grade: **{computed_grade}** assigned to **{selected_tank_id}**!")
+                st.success(f"🎉 Fish ({selected_strain}) successfully registered as Grade: **{computed_grade}** assigned to **{selected_tank_id}**!")
             except Exception as e:
                 st.error(f"Error saving fish record: {e}")
 
