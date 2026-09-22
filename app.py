@@ -10,33 +10,38 @@ from modules.spawn_manager import format_spawns_sheet
 st.set_page_config(page_title="The Betta Studio", page_icon="🐟", layout="wide")
 
 # ==============================================================================
-# GLOBAL STYLING: Applies Deep Midnight Dark Theme & Half-Sized Image Glow (40px)
+# GLOBAL STYLING: Applies Clean Light Theme (White Background)
 # ==============================================================================
 st.markdown("""
 <style>
-  /* 1. Base App Dark Background */
+  /* 1. Base App Light Background & Dark Text */
   .stApp {
-    background-color: #0F1117;
-    color: #E6E8EB;
+    background-color: #FFFFFF;
+    color: #1E2022;
   }
   
+  /* Force global text elements to remain dark */
+  .stApp p, .stApp span, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6 {
+    color: #1E2022 !important;
+  }
+
   /* 2. Sidebar Customization */
   section[data-testid="stSidebar"] {
-    background-color: #161922 !important;
-    border-right: 1px solid #232733;
+    background-color: #F8F9FA !important;
+    border-right: 1px solid #E2E8F0;
   }
 
   /* 3. Global Cards / Expanders / Containers */
   div[data-testid="stExpander"], div.stCard, div[data-testid="stVerticalBlock"] > div[style*="background-color"] {
-    background: #1A1D24;
-    border: 1px solid #282C37;
+    background: #FFFFFF !important;
+    border: 1px solid #E2E8F0 !important;
     border-radius: 12px;
   }
 
   /* 4. Global Spawn / Breeder Card Component */
   .spawn-card {
-      background-color: #1A1D24;
-      border: 1px solid #282C37;
+      background-color: #F8F9FA;
+      border: 1px solid #E2E8F0;
       border-radius: 12px;
       padding: 12px 16px;
       display: flex;
@@ -45,31 +50,31 @@ st.markdown("""
       margin-bottom: 12px;
   }
 
-  /* 5. Betta Image - Scaled Down to Half Size (40px) with Cyan Glow */
+  /* 5. Betta Image Styling */
   .spawn-card-img {
       width: 40px;
       height: 40px;
       object-fit: cover;
       border-radius: 6px;
-      border: 1.5px solid #2A303F;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4), 0 0 6px rgba(0, 210, 255, 0.15);
+      border: 1.5px solid #CBD5E1;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
       transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
   }
 
   .spawn-card-img:hover {
       transform: scale(1.08);
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6), 0 0 10px rgba(0, 210, 255, 0.5);
-      border-color: #00D2FF;
+      box-shadow: 0 4px 12px rgba(0, 150, 255, 0.25);
+      border-color: #0072FF;
   }
 
   .spawn-details h4 {
       margin: 0 0 4px 0;
-      color: #00D2FF;
+      color: #0072FF !important;
   }
 
   .spawn-details p {
       margin: 1px 0;
-      color: #E6E8EB;
+      color: #4A5568 !important;
       font-size: 13px;
   }
 </style>
