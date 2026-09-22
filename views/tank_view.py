@@ -5,6 +5,7 @@ from modules.tank_registry import (
     get_all_tanks,
     update_tank_status
 )
+from modules.breeder_registry import get_available_breeders
 
 DEFAULT_CONTAINER_TYPES = [
     "Grow-Out Planggana (Large)",
@@ -34,6 +35,13 @@ def render_tank_page():
 
     tab1, tab2 = st.tabs(["➕ Register Container", "🗃️ Container Inventory"])
 
+    # Fetch available breeders (unassigned to any tank)
+    available_breeders = get_available_breeders()
+    breeder_options = ["None (Empty)"] + [
+        f"{b['id']} | {b.get('variety', 'Betta')} ({b.get('sex', 'Unknown')})" 
+        for b in available_breeders
+    ]
+
     # TAB 1: REGISTER CONTAINER
     with tab1:
         st.subheader("Register New Tank or Container")
@@ -52,7 +60,11 @@ def render_tank_page():
                 purpose = st.selectbox("Container Purpose / Role", CONTAINER_PURPOSES)
 
             with col2:
-                occupant = st.text_input("Current Occupant ID (Optional)", placeholder="e.g. BRD-M-20260920 or Spawn #001")
+                selected_occupant = st.selectbox(
+                    "Current Occupant (Available Fish Only)",
+                    options=breeder_options,
+                    help="Only active breeders not assigned to other tanks are listed."
+                )
                 photo_file = st.file_uploader("📷 Container Photo (Optional)", type=["jpg", "jpeg", "png"])
                 notes = st.text_area("Notes / Setup Details", placeholder="e.g. Almond leaf tea water, sponge filter installed")
 
@@ -60,6 +72,7 @@ def render_tank_page():
 
         if submit:
             final_type = custom_type.strip() if selected_type == "➕ Other / Custom Container..." else selected_type
+            occupant_id = "" if selected_occupant == "None (Empty)" else selected_occupant.split(" | ")[0]
 
             if not final_type:
                 st.error("Please specify a container type.")
@@ -70,13 +83,11 @@ def render_tank_page():
                         capacity_liters=capacity,
                         purpose=purpose,
                         photo_file=photo_file,
-                        current_occupant=occupant,
+                        current_occupant=occupant_id,
                         notes=notes
                     )
 
                 st.success("Container Successfully Registered!")
-                
-                # Display prominent tape code box to write on physical tank
                 st.markdown(f"""
                 <div style="background-color: #FEF3C7; border: 2px dashed #D97706; padding: 16px; border-radius: 12px; text-align: center; margin: 12px 0;">
                     <span style="font-size: 14px; color: #92400E; font-weight: bold; text-transform: uppercase;">✍️ WRITE THIS ON PAINTER'S TAPE:</span>
@@ -98,9 +109,7 @@ def render_tank_page():
         if not tanks:
             st.info("No containers registered yet.")
         else:
-            # ------------------------------------------------------------------
-            # AVAILABILITY & SEARCH FILTERS
-            # ------------------------------------------------------------------
+            # Availability & Search Filters
             f_col1, f_col2 = st.columns([1, 2])
 
             with f_col1:
@@ -113,7 +122,6 @@ def render_tank_page():
             with f_col2:
                 search_query = st.text_input("🔍 Search Inventory", placeholder="Search ID, Tape Code, Type, Purpose, or Occupant...").strip().lower()
 
-            # Define terms that represent available/vacant containers
             available_statuses = ["empty / idle", "empty", "idle", "available", "ready", "clean"]
 
             filtered = []
@@ -121,31 +129,23 @@ def render_tank_page():
                 status_str = str(t.get('status', '')).strip().lower()
                 occupant_str = str(t.get('occupant', '')).strip().lower()
                 
-                # Determine availability based on status or occupant presence
                 is_available = (status_str in available_statuses) or (not occupant_str or occupant_str in ["empty", "none", "n/a"])
 
-                # Filter 1: Availability
                 if availability_filter == "Available / Empty Only" and not is_available:
                     continue
                 elif availability_filter == "Occupied / In Use Only" and is_available:
                     continue
 
-                # Filter 2: Text Search Query
                 if search_query:
                     searchable_fields = [
-                        str(t.get('id', '')),
-                        str(t.get('type', '')),
-                        str(t.get('location', '')),
-                        str(t.get('purpose', '')),
-                        str(t.get('occupant', '')),
-                        str(t.get('notes', ''))
+                        str(t.get('id', '')), str(t.get('type', '')), str(t.get('location', '')),
+                        str(t.get('purpose', '')), str(t.get('occupant', '')), str(t.get('notes', ''))
                     ]
                     if not any(search_query in field.lower() for field in searchable_fields):
                         continue
 
                 filtered.append(t)
 
-            # Display quick status count header
             avail_count = sum(
                 1 for t in tanks 
                 if str(t.get('status', '')).strip().lower() in available_statuses 
@@ -161,6 +161,8 @@ def render_tank_page():
                 cols = st.columns(3)
                 for idx, t in enumerate(filtered):
                     tank_id = t['id']
+                    curr_occ = t.get('occupant', '')
+
                     with cols[idx % 3]:
                         with st.container(border=True):
                             # Display photo if uploaded
@@ -173,8 +175,8 @@ def render_tank_page():
                             st.write(f"🎯 **Purpose:** {t['purpose']}")
                             st.write(f"🧪 **Capacity:** {t['capacity']} L | **Status:** `{t['status']}`")
                             
-                            if t.get('occupant'):
-                                st.write(f"🐟 **Occupant:** `{t['occupant']}`")
+                            if curr_occ:
+                                st.write(f"🐟 **Occupant:** `{curr_occ}`")
                             else:
                                 st.write("🐟 **Occupant:** *Empty*")
 
@@ -183,11 +185,29 @@ def render_tank_page():
 
                             st.divider()
 
-                            # Quick Update Status Popover
+                            # Update Container Popover
                             with st.popover("⚙️ Update Container", use_container_width=True):
+                                # Dynamic Occupant Dropdown (includes current occupant + unassigned fish)
+                                update_options = ["None (Empty)"]
+                                if curr_occ:
+                                    update_options.append(f"{curr_occ} (Current Occupant)")
+                                
+                                for b in available_breeders:
+                                    opt_str = f"{b['id']} | {b.get('variety', 'Betta')} ({b.get('sex', 'Unknown')})"
+                                    if opt_str not in update_options:
+                                        update_options.append(opt_str)
+
+                                selected_occ_opt = st.selectbox(
+                                    "Current Occupant",
+                                    options=update_options,
+                                    index=1 if curr_occ else 0,
+                                    key=f"occ_sel_{tank_id}"
+                                )
+
                                 new_status = st.selectbox(
                                     "Status",
                                     ["Active", "Cleaning / Quarantine", "Empty / Idle", "Retired"],
+                                    index=0 if curr_occ else 2,
                                     key=f"status_{tank_id}"
                                 )
                                 
@@ -202,10 +222,18 @@ def render_tank_page():
                                     index=curr_p_idx,
                                     key=f"purpose_{tank_id}"
                                 )
-                                new_occ = st.text_input("Current Occupant ID", value=t.get('occupant', ''), key=f"occ_{tank_id}")
+
                                 new_notes = st.text_area("Notes", value=t.get('notes', ''), key=f"notes_{tank_id}")
 
                                 if st.button("Save Changes", key=f"save_{tank_id}", type="primary"):
-                                    if update_tank_status(tank_id, new_status, new_purpose, new_occ, new_notes):
+                                    # Derive final occupant ID string
+                                    if selected_occ_opt == "None (Empty)":
+                                        final_occ = ""
+                                    elif "(Current Occupant)" in selected_occ_opt:
+                                        final_occ = curr_occ
+                                    else:
+                                        final_occ = selected_occ_opt.split(" | ")[0]
+
+                                    if update_tank_status(tank_id, new_status, new_purpose, final_occ, new_notes):
                                         st.success("Updated!")
                                         st.rerun()
