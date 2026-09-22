@@ -11,6 +11,54 @@ from modules.drive_service import (
     get_drive_folder_id
 )
 
+def ensure_tanks_tab_exists(sheets_service, spreadsheet_id):
+    """
+    Ensures the 'Tanks' worksheet tab exists with proper headers in Google Sheets.
+    Prevents HttpError when appending or reading empty/missing tabs.
+    """
+    try:
+        # Check existing sheet tabs
+        sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheets = sheet_metadata.get('sheets', [])
+        sheet_titles = [s['properties']['title'] for s in sheets]
+
+        # 1. Create 'Tanks' worksheet tab if it does not exist
+        if "Tanks" not in sheet_titles:
+            body = {
+                'requests': [{
+                    'addSheet': {
+                        'properties': {'title': 'Tanks'}
+                    }
+                }]
+            }
+            sheets_service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body=body
+            ).execute()
+
+        # 2. Check if Header Row exists; populate if empty
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range='Tanks!A1:K1'
+        ).execute()
+
+        headers = result.get('values', [])
+        if not headers:
+            header_row = [
+                "System ID", "Tank Type", "Tape Code", "Capacity (Liters)",
+                "Status", "Purpose", "Current Occupant", "Photo Drive ID",
+                "QR Drive ID", "Notes", "Date Registered"
+            ]
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range='Tanks!A1:K1',
+                valueInputOption='USER_ENTERED',
+                body={'values': [header_row]}
+            ).execute()
+
+    except Exception as e:
+        print(f"Warning: Failed during ensure_tanks_tab_exists execution: {e}")
+
 def generate_tape_code(tank_type: str) -> str:
     """Generates a short, easy-to-write code for painter's tape (e.g. GO-8492, JAR-1039)."""
     type_upper = tank_type.upper()
@@ -86,12 +134,16 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
 
 def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose", photo_file=None, current_occupant="", notes=""):
     """
-    1. Generates a unique Tank ID and short Tape Code upon submission.
-    2. Uploads container photo (if provided) and QR Tag to Google Drive.
-    3. Saves record in Google Sheets.
+    1. Verifies/creates sheet tab & header structure.
+    2. Generates a unique Tank ID and short Tape Code upon submission.
+    3. Uploads container photo (if provided) and QR Tag to Google Drive.
+    4. Saves record in Google Sheets.
     """
     drive_service, sheets_service = get_google_services()
     spreadsheet_id = get_spreadsheet_id()
+
+    # Ensure worksheet tab & A1:K1 headers exist prior to append operation
+    ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
 
     # Generate unique Tank ID and short Tape Code upon submission
     type_prefix = tank_type.replace(" ", "")[:3].upper()
@@ -156,6 +208,8 @@ def get_all_tanks():
     spreadsheet_id = get_spreadsheet_id()
 
     try:
+        ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
+
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range='Tanks!A2:K'
@@ -194,6 +248,8 @@ def update_tank_status(tank_id: str, new_status: str, purpose: str = "", occupan
     try:
         drive_service, sheets_service = get_google_services()
         spreadsheet_id = get_spreadsheet_id()
+
+        ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
 
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
