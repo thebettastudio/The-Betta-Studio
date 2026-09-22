@@ -1,11 +1,10 @@
 # views/breeder_view.py
 import datetime
-import pandas as pd
 import streamlit as st
 from modules.breeder_registry import (
     register_breeder,
     get_all_breeders,
-    retire_breeder  # Updated function import
+    retire_breeder
 )
 
 # Preset list of color pattern classes
@@ -36,11 +35,7 @@ RETIREMENT_REASONS = [
 
 def evaluate_grade(caudal_180, caudal_prop, dorsal_good, anal_good, ventral_good, pectoral_good, body_shape, color_good):
     """
-    Evaluates fish grade based on physical traits and IBC show criteria:
-    - Show Grade: Full 180° caudal spread, clean fin branching/proportion, 
-                  proper body shape (Bullet/Regular), clean dorsal/anal/ventral/pectoral fins, and good color.
-    - Material Grade: Good color coverage and high-tier form features, but minor form flaws or spoonhead.
-    - Pet Grade: Lacks core form criteria or key show traits.
+    Evaluates fish grade based on physical traits and IBC show criteria.
     """
     passed_fin_checks = sum([
         caudal_180,
@@ -51,48 +46,49 @@ def evaluate_grade(caudal_180, caudal_prop, dorsal_good, anal_good, ventral_good
         pectoral_good
     ])
     
-    # Show Grade: Strict form standards met
     if (caudal_180 and 
         caudal_prop and 
         body_shape in ["Bullet Head", "Regular"] and 
         passed_fin_checks >= 5 and 
         color_good):
         return "Show Grade"
-    # Material Grade: Strong breeding/color potential with minor physical limitations
     elif (caudal_180 or caudal_prop or passed_fin_checks >= 3) and color_good:
         return "Material Grade"
-    # Pet Grade: Standard pet quality
     else:
         return "Pet Grade"
 
 
-def render_breeder_gallery_grid(breeders_list: list):
-    """Renders breeder cards in a 3-column grid with Retirement popovers."""
+def render_merged_breeder_grid(breeders_list: list):
+    """
+    Renders breeder records in a 2-column merged Gallery/Inventory card layout.
+    """
     if not breeders_list:
-        st.info("No breeders found in this category.")
+        st.info("No breeders found in this section.")
         return
 
-    cols = st.columns(3)
+    # Render cards in a 2-column layout
+    cols = st.columns(2)
     for idx, b in enumerate(breeders_list):
         breeder_id = b['id']
-        is_retired = b.get('status', 'Active').lower() == 'retired'
+        is_retired = str(b.get('status', 'Active')).lower() == 'retired'
 
-        with cols[idx % 3]:
+        with cols[idx % 2]:
             with st.container(border=True):
-                st.markdown(f"### {breeder_id}")
-                st.caption(f"**Sex:** {b['sex']} | **Status:** `{b.get('status', 'Active')}`")
-                st.write(f"**Variety:** {b['variety']}")
-                st.write(f"**Lineage:** {b['lineage']}")
-                st.write(f"**DOB:** {b['dob']}")
-                
-                if b.get('notes'):
-                    st.info(f"**Notes:** {b['notes']}")
-                
+                # Photo Display
                 if b.get('photo_id'):
                     img_src = f"https://drive.google.com/thumbnail?id={b['photo_id']}&sz=w800"
                     st.image(img_src, use_container_width=True)
                 else:
                     st.caption("📷 *No Photo Available*")
+
+                st.markdown(f"### {breeder_id}")
+                st.caption(f"**Sex:** {b['sex']} | **Status:** `{b.get('status', 'Active')}`")
+                st.write(f"🧬 **Variety:** {b['variety']}")
+                st.write(f"🏷️ **Lineage:** {b['lineage']}")
+                st.write(f"📅 **DOB:** {b['dob']}")
+                
+                if b.get('notes'):
+                    st.info(f"📝 **Notes:** {b['notes']}")
 
                 st.divider()
 
@@ -126,55 +122,18 @@ def render_breeder_gallery_grid(breeders_list: list):
                                 st.error("Failed to update status.")
 
 
-def render_breeder_inventory_table(breeders_list: list, gender_label: str):
-    """Renders interactive inventory table and summary metrics for breeders."""
-    if not breeders_list:
-        st.info(f"No {gender_label.lower()} breeders registered in inventory.")
-        return
-
-    df = pd.DataFrame(breeders_list)
-    
-    # Mapping columns for standard schema display
-    rename_dict = {
-        "id": "Breeder ID",
-        "sex": "Sex",
-        "variety": "Variety / Pattern",
-        "lineage": "Lineage / Source",
-        "dob": "Date of Birth",
-        "status": "Current Status",
-        "notes": "Notes / Traits"
-    }
-    
-    available_cols = [col for col in rename_dict.keys() if col in df.columns]
-    display_df = df[available_cols].rename(columns=rename_dict)
-
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # Metrics Summary
-    col1, col2 = st.columns(2)
-    col1.metric(f"Total {gender_label}s", len(breeders_list))
-    
-    active_count = sum(1 for b in breeders_list if str(b.get('status', '')).lower() == 'active')
-    col2.metric(f"Active {gender_label}s", active_count)
-
-
 def render_breeder_page():
     st.title("🐟 Betta Breeder Management")
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2 = st.tabs([
         "➕ Register New Breeder", 
-        "🖼️ Breeder Gallery", 
-        "📋 Breeder Inventory"
+        "📋 Breeder Inventory & Gallery"
     ])
 
-    # Fetch all breeders once for views
+    # Fetch all breeders once
     breeders = get_all_breeders()
 
-    # Split dataset by sex
+    # Split dataset into Males and Females
     males_list = [b for b in breeders if str(b.get("sex", "")).strip().lower() in ["male", "m", "♂️ male"]]
     females_list = [b for b in breeders if str(b.get("sex", "")).strip().lower() in ["female", "f", "♀️ female"]]
 
@@ -191,10 +150,8 @@ def render_breeder_page():
                 st.markdown("### 📋 Basic Info")
                 sex = st.selectbox("Sex", ["Male", "Female"])
                 
-                # Color / Pattern Class dropdown selector
                 pattern_class = st.selectbox("Color / Pattern Class", COLOR_PATTERN_OPTIONS)
                 
-                # Input field displayed if "Others" is selected
                 custom_pattern = ""
                 if pattern_class == "Others":
                     custom_pattern = st.text_input("Specify Other Pattern", placeholder="e.g. Black Star")
@@ -225,10 +182,8 @@ def render_breeder_page():
             submit = st.form_submit_button("📷 Register Breeder & Evaluate Grade")
 
         if submit:
-            # Determine selected color pattern
             selected_pattern = custom_pattern.strip() if pattern_class == "Others" else pattern_class
             
-            # Auto-calculate the fish classification
             grade = evaluate_grade(
                 caudal_180=caudal_180,
                 caudal_prop=caudal_prop,
@@ -245,7 +200,6 @@ def render_breeder_page():
             else:
                 full_variety = f"HMKP - {selected_pattern}"
                 
-                # Format evaluation results into the notes field for logging
                 form_summary = (
                     f"Grade: {grade} | Head: {body_shape} | "
                     f"180°: {'Yes' if caudal_180 else 'No'}, "
@@ -277,59 +231,46 @@ def render_breeder_page():
                         st.image(photo_file, caption=f"{full_variety} ({sex}) — {grade}", width=300)
 
     # ====================================================
-    # TAB 2: GALLERY (SEPARATED BY MALE / FEMALE)
+    # TAB 2: MERGED INVENTORY & GALLERY (MALE & FEMALE SEPARATED)
     # ====================================================
     with tab2:
         col_title, col_btn = st.columns([4, 1])
         with col_title:
-            st.subheader("Breeder Gallery")
+            st.subheader("Breeder Inventory & Gallery")
         with col_btn:
-            if st.button("🔄 Refresh", key="refresh_gallery"):
+            if st.button("🔄 Refresh", key="refresh_all"):
                 st.rerun()
 
         if not breeders:
             st.info("No breeders registered yet.")
         else:
-            search_query = st.text_input("🔍 Search Gallery by ID, Variety, or Lineage:", "", key="search_gallery")
+            search_query = st.text_input("🔍 Search by ID, Variety, or Lineage:", "", key="search_merged")
             
             # Apply search filter
             filtered_males = [
                 b for b in males_list
-                if search_query.lower() in b['id'].lower()
-                or search_query.lower() in b['variety'].lower()
-                or search_query.lower() in b['lineage'].lower()
+                if search_query.lower() in str(b['id']).lower()
+                or search_query.lower() in str(b['variety']).lower()
+                or search_query.lower() in str(b['lineage']).lower()
             ]
             
             filtered_females = [
                 b for b in females_list
-                if search_query.lower() in b['id'].lower()
-                or search_query.lower() in b['variety'].lower()
-                or search_query.lower() in b['lineage'].lower()
+                if search_query.lower() in str(b['id']).lower()
+                or search_query.lower() in str(b['variety']).lower()
+                or search_query.lower() in str(b['lineage']).lower()
             ]
 
-            gal_male_tab, gal_female_tab = st.tabs(["♂️ Male Breeders", "♀️ Female Breeders"])
+            male_tab, female_tab = st.tabs(["♂️ Male Breeders", "♀️ Female Breeders"])
 
-            with gal_male_tab:
-                st.caption(f"Showing **{len(filtered_males)}** Male Breeders")
-                render_breeder_gallery_grid(filtered_males)
+            # Male Section
+            with male_tab:
+                active_males = sum(1 for b in filtered_males if str(b.get('status', '')).lower() == 'active')
+                st.caption(f"Showing **{len(filtered_males)}** Males | **{active_males}** Active")
+                render_merged_breeder_grid(filtered_males)
 
-            with gal_female_tab:
-                st.caption(f"Showing **{len(filtered_females)}** Female Breeders")
-                render_breeder_gallery_grid(filtered_females)
-
-    # ====================================================
-    # TAB 3: INVENTORY (SEPARATED BY MALE / FEMALE)
-    # ====================================================
-    with tab3:
-        st.subheader("Breeder Inventory")
-
-        if not breeders:
-            st.info("No breeders registered in inventory.")
-        else:
-            inv_male_tab, inv_female_tab = st.tabs(["♂️ Male Inventory", "♀️ Female Inventory"])
-
-            with inv_male_tab:
-                render_breeder_inventory_table(males_list, "Male")
-
-            with inv_female_tab:
-                render_breeder_inventory_table(females_list, "Female")
+            # Female Section
+            with female_tab:
+                active_females = sum(1 for b in filtered_females if str(b.get('status', '')).lower() == 'active')
+                st.caption(f"Showing **{len(filtered_females)}** Females | **{active_females}** Active")
+                render_merged_breeder_grid(filtered_females)
