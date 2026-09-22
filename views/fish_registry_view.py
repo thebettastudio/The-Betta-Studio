@@ -25,10 +25,10 @@ def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
                 body={'requests': requests}
             ).execute()
 
-            # Add headers starting at B1 to match existing sheet layout
+            # Add headers starting at A1
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f'{sheet_name}!B1',
+                range=f'{sheet_name}!A1',
                 valueInputOption='USER_ENTERED',
                 body={'values': [default_headers]}
             ).execute()
@@ -46,11 +46,11 @@ def ensure_fish_master_sheet_exists(sheets_service):
 
 
 def generate_next_fish_id(sheets_service) -> str:
-    """Fetch all existing Fish IDs from Column B and return the next sequential ID."""
+    """Fetch all existing Fish IDs from Column A and return the next sequential ID."""
     try:
         res = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Fish_Master!B2:B'
+            range='Fish_Master!A2:A'
         ).execute()
         rows = res.get('values', [])
         
@@ -193,11 +193,11 @@ def get_available_tanks(sheets_service):
 
 
 def get_all_fish_records(sheets_service):
-    """Fetch all registered fish from 'Fish_Master' sheet (Range B1:J)."""
+    """Fetch all registered fish from 'Fish_Master' sheet (Range A1:J)."""
     try:
         res = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Fish_Master!B1:J'
+            range='Fish_Master!A1:J'
         ).execute()
         rows = res.get('values', [])
         
@@ -211,11 +211,8 @@ def get_all_fish_records(sheets_service):
         headers = [h.strip() for h in rows[0]]
         data = rows[1:]
         
-        # Pad rows if any values are missing/empty
         padded_data = [r + [""] * (len(headers) - len(r)) for r in data]
         df = pd.DataFrame(padded_data, columns=headers)
-        
-        # Strip trailing/leading spaces from string values
         df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
         
         return df
@@ -285,7 +282,6 @@ def render_fish_registry_page():
         st.error(f"Failed to connect to Google Services: {e}")
         return
 
-    # Tabs for Registration and View Registry
     tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
 
     # ==========================================================================
@@ -296,7 +292,7 @@ def render_fish_registry_page():
 
         ensure_fish_master_sheet_exists(sheets_service)
         next_fish_id = generate_next_fish_id(sheets_service)
-        st.info(f"📌 Next Assigned Fish ID: **#{next_fish_id}**")
+        st.info(f"📌 Next Assigned Fish ID: **#FISH-{next_fish_id.zfill(4)}**")
 
         strains_list = get_registered_strains(sheets_service)
 
@@ -456,10 +452,10 @@ def render_fish_registry_page():
             ]
 
             try:
-                # Appends specifically to Range B:J to align with Column B
+                # Appends to Range A:J
                 sheets_service.spreadsheets().values().append(
                     spreadsheetId=SPREADSHEET_ID,
-                    range='Fish_Master!B:J',
+                    range='Fish_Master!A:J',
                     valueInputOption='USER_ENTERED',
                     body={'values': [new_fish_record]}
                 ).execute()
