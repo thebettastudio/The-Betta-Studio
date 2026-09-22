@@ -2,6 +2,7 @@
 import re
 import datetime
 import streamlit as st
+import pandas as pd
 from modules.spawn_manager import (
     get_available_breeders,
     get_available_spawning_tanks,
@@ -10,7 +11,9 @@ from modules.spawn_manager import (
     create_new_spawn,
     mark_pairing_success_pending,
     mark_free_swimming,
-    mark_pairing_failed
+    mark_pairing_failed,
+    update_spawn_details,
+    format_spawns_sheet
 )
 
 def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
@@ -96,8 +99,15 @@ def render_spawn_page():
     with tab1:
         st.subheader("Currently Active Pairings")
         
-        if st.button("🔄 Refresh Active Pairs", key="btn_refresh_spawns"):
-            st.rerun()
+        col_ref, col_fmt = st.columns([1, 1])
+        with col_ref:
+            if st.button("🔄 Refresh Active Pairs", key="btn_refresh_spawns", use_container_width=True):
+                st.rerun()
+        with col_fmt:
+            if st.button("🎨 Format Spawns Sheet", key="btn_format_spawns", use_container_width=True):
+                with st.spinner("Applying sheet styling..."):
+                    format_spawns_sheet()
+                st.success("Sheet styling applied successfully!")
 
         active_pairs = get_active_pairings_with_details()
 
@@ -119,7 +129,22 @@ def render_spawn_page():
                     days_paired = 0
 
                 with st.container(border=True):
-                    st.markdown(f"### 🧪 Spawn: `{spawn_id}`")
+                    col_title, col_edit = st.columns([4, 1])
+                    with col_title:
+                        st.markdown(f"### 🧪 Spawn: `{spawn_id}`")
+                    with col_edit:
+                        # Edit details popover
+                        with st.popover("✏️ Edit Spawn", use_container_width=True):
+                            st.write(f"**Edit Spawn {spawn_id}**")
+                            edit_goal = st.text_input("Line Goal", value=spawn.get("line_goal", ""), key=f"edit_goal_{spawn_id}")
+                            edit_notes = st.text_area("Notes", value=spawn.get("notes", ""), key=f"edit_notes_{spawn_id}")
+                            if st.button("Save Changes", key=f"save_edit_{spawn_id}"):
+                                if update_spawn_details(spawn_id, line_goal=edit_goal, notes=edit_notes):
+                                    st.success("Updated successfully!")
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to update spawn.")
+
                     st.caption(f"📍 **Tank:** {spawn['tank']} | 📅 **Paired:** {pairing_date} ({days_paired} days ago) | 🏷️ **Status:** `{status}`")
 
                     if spawn.get("line_goal"):
@@ -260,6 +285,14 @@ def render_spawn_page():
         st.subheader("All Spawn Records")
         spawns = get_all_spawns()
         if spawns:
-            st.dataframe(spawns, use_container_width=True)
+            df = pd.DataFrame(spawns)
+            # Remove internal helper keys if present
+            if "row_index" in df.columns:
+                df = df.drop(columns=["row_index"])
+
+            # Clean column headers for display
+            df.columns = [col.replace("_", " ").title() for col in df.columns]
+
+            st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.info("No spawn history recorded yet.")
