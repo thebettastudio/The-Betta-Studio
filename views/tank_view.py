@@ -1,292 +1,657 @@
-# views/tank_view.py
-import re
+import io
+import datetime
+import pandas as pd
 import streamlit as st
-from modules.tank_registry import (
-    register_tank,
-    get_all_tanks,
-    update_tank_status,
-    delete_tank
-)
-from modules.breeder_registry import get_available_breeders
 
-DEFAULT_CONTAINER_TYPES = [
-    "Grow-Out Planggana (Large)",
-    "Spawning Planggana (Small)",
-    "6-Liter Water Bottle",
-    "Empi (Emperador) Glass / Jar",
-    "Glass Aquarium",
-    "Sorority / Female Basin",
-    "Quarantine / Treatment Jar",
-    "➕ Other / Custom Container..."
-]
+# Import Drive & Sheets services
+from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
 
-CONTAINER_PURPOSES = [
-    "🫙 Male / Female Individual Jarring",
-    "🥩 Breeder Conditioning",
-    "🥚 Spawning & Breeding Set-Up",
-    "🌿 Fry Nursery / Free Swimming",
-    "🪴 Fry / Juvenile Grow-Out",
-    "👑 Female Sorority Tank",
-    "🏥 Medical / Quarantine Treatment",
-    "🛒 Sales / Grooming Display",
-    "📦 General / Multi-purpose Storage"
-]
+# ------------------------------------------------------------------------------
+# Helper Functions: Sheet Initialization, Strains, Tanks, Grades & ID
+# ------------------------------------------------------------------------------
 
-def clean_text_for_matching(text: str) -> str:
-    """Strips special characters and emojis for reliable index matching."""
-    return re.sub(r'[^\w\s]', '', text).strip().lower()
+def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
+    """Ensures that a specified worksheet tab exists in Google Sheets with headers."""
+    try:
+        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        sheets = spreadsheet.get('sheets', [])
+        sheet_titles = [s['properties']['title'] for s in sheets]
 
-def get_purpose_index(stored_purpose: str) -> int:
-    """Matches stored purpose string against CONTAINER_PURPOSES safely."""
-    clean_stored = clean_text_for_matching(stored_purpose)
-    if not clean_stored:
-        return 0
-    
-    for idx, purpose in enumerate(CONTAINER_PURPOSES):
-        clean_p = clean_text_for_matching(purpose)
-        if clean_p in clean_stored or clean_stored in clean_p:
-            return idx
-    return 0
+        if sheet_name not in sheet_titles:
+            requests = [{'addSheet': {'properties': {'title': sheet_name}}}]
+            sheets_service.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={'requests': requests}
+            ).execute()
 
-def render_tank_page():
-    st.title("🪣 Tank & Container Registry")
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f'{sheet_name}!A1',
+                valueInputOption='USER_ENTERED',
+                body={'values': [default_headers]}
+            ).execute()
+    except Exception as e:
+        st.warning(f"Note: Auto-creation check for '{sheet_name}' failed ({e})")
 
-    tab1, tab2 = st.tabs(["➕ Register Container", "🗃️ Container Inventory"])
 
-    # Fetch available breeders (unassigned to any tank)
-    available_breeders = get_available_breeders()
-    breeder_options = ["None (Empty)"] + [
-        f"{b['id']} | {b.get('variety', 'Betta')} ({b.get('sex', 'Unknown')})" 
-        for b in available_breeders
+def ensure_fish_master_sheet_exists(sheets_service):
+    headers = [
+        "Fish ID", "Variety / Strain", "Gender", "Grade", 
+        "Tank ID", "Seller", "Purchase Date", "Purchase Cost", 
+        "Image URL", "Notes"
     ]
+    ensure_sheet_exists(sheets_service, 'Fish_Master', headers)
 
-    # TAB 1: REGISTER CONTAINER
-    with tab1:
-        st.subheader("Register New Tank or Container")
 
-        with st.form("tank_register_form", clear_on_submit=True):
+def generate_next_fish_id(sheets_service) -> int:
+    """Fetch all existing Fish IDs from Column A and return the next integer sequence."""
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Fish_Master!A2:A'
+        ).execute()
+        rows = res.get('values', [])
+        
+        max_id = 0
+        for r in rows:
+            if r and r[0].strip():
+                raw_id = r[0].strip()
+                val_str = raw_id.replace("FISH-", "").strip()
+                if val_str.isdigit():
+                    max_id = max(max_id, int(val_str))
+                    
+        return max_id + 1
+    except Exception:
+        return 1
+
+
+def get_registered_strains(sheets_service):
+    """Fetch list of saved strains from 'Master_Strains' sheet or return defaults."""
+    default_strains = [
+        "Yellow Koi Galaxy",
+        "Red Koi Galaxy",
+        "Blue Rim",
+        "Avatar",
+        "Black Star / Samurai",
+        "Red Dragon",
+        "Copper Light",
+        "Fancy Marble",
+        "Super Red",
+        "Super Black"
+    ]
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Master_Strains!A2:A'
+        ).execute()
+        rows = res.get('values', [])
+        strains = [r[0] for r in rows if r and r[0].strip()]
+        
+        all_strains = set(default_strains + strains)
+        removed_strains = st.session_state.get("removed_strains_list", set())
+        active_strains = [s for s in all_strains if s not in removed_strains]
+        
+        return sorted(active_strains)
+    except Exception:
+        removed_strains = st.session_state.get("removed_strains_list", set())
+        return sorted([s for s in default_strains if s not in removed_strains])
+
+
+def add_new_strain_to_db(sheets_service, new_strain):
+    """Save a new strain to the 'Master_Strains' worksheet."""
+    try:
+        ensure_sheet_exists(sheets_service, 'Master_Strains', ["Strain Name"])
+        
+        if "removed_strains_list" in st.session_state:
+            st.session_state["removed_strains_list"].discard(new_strain.strip())
+            
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Master_Strains!A:A',
+            valueInputOption='USER_ENTERED',
+            body={'values': [[new_strain.strip()]]}
+        ).execute()
+        st.toast(f"✅ Saved '{new_strain}' to Strain Registry!", icon="✨")
+    except Exception as e:
+        st.error(f"Could not save strain to database ({e})")
+
+
+def delete_strain_from_db(sheets_service, strain_to_remove):
+    """Delete a strain row from 'Master_Strains' or soft-delete from local registry."""
+    if "removed_strains_list" not in st.session_state:
+        st.session_state["removed_strains_list"] = set()
+    st.session_state["removed_strains_list"].add(strain_to_remove)
+
+    try:
+        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        sheets = spreadsheet.get('sheets', [])
+        sheet_id = None
+        for s in sheets:
+            if s['properties']['title'] == 'Master_Strains':
+                sheet_id = s['properties']['sheetId']
+                break
+
+        if sheet_id is not None:
+            res = sheets_service.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range='Master_Strains!A1:A'
+            ).execute()
+            rows = res.get('values', [])
+            
+            delete_requests = []
+            for idx, r in enumerate(rows):
+                if r and r[0].strip().lower() == strain_to_remove.strip().lower():
+                    delete_requests.append({
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": idx,
+                                "endIndex": idx + 1
+                            }
+                        }
+                    })
+
+            if delete_requests:
+                delete_requests.reverse()
+                sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=SPREADSHEET_ID,
+                    body={'requests': delete_requests}
+                ).execute()
+
+        st.toast(f"🗑️ Removed '{strain_to_remove}' from Strain Registry!", icon="✨")
+    except Exception:
+        st.toast(f"Removed '{strain_to_remove}' from UI view.", icon="ℹ️")
+
+
+def get_available_tanks(sheets_service):
+    """Fetch tanks from Tanks sheet matching tank_view criteria (empty/idle or no occupant)."""
+    available_statuses = ["empty / idle", "empty", "idle", "available", "ready", "clean"]
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Tanks!A2:H'
+        ).execute()
+        rows = res.get('values', [])
+        tanks = []
+        
+        for r in rows:
+            if len(r) >= 1:
+                tank_id = r[0].strip()
+                container_type = r[1].strip() if len(r) > 1 else "Standard Container"
+                location_code = r[2].strip() if len(r) > 2 and r[2].strip() else tank_id
+                status = r[5].strip() if len(r) > 5 else "Empty / Idle"
+                occupant = r[6].strip() if len(r) > 6 else ""
+
+                status_clean = status.lower()
+                occupant_clean = occupant.lower()
+
+                is_avail = (status_clean in available_statuses) or (not occupant_clean or occupant_clean in ["empty", "none", "n/a"])
+
+                if is_avail and tank_id:
+                    tanks.append({
+                        "id": tank_id,
+                        "location": location_code,
+                        "type": container_type,
+                        "status": status,
+                        "occupant": occupant
+                    })
+        return tanks
+    except Exception:
+        return [
+            {"id": "TANK-001", "location": "JAR-M-01", "type": "Empi Glass / Jar", "status": "Empty / Idle", "occupant": ""},
+            {"id": "TANK-002", "location": "BOT-6L-01", "type": "6-Liter Water Bottle", "status": "Empty / Idle", "occupant": ""},
+        ]
+
+
+def update_tank_occupancy(sheets_service, tank_id: str, occupant_id: str, status: str = "Active"):
+    """Updates Tank status and occupant columns in the Tanks sheet to maintain parity with tank_view."""
+    if not tank_id or tank_id == "Unassigned":
+        return
+
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Tanks!A2:G'
+        ).execute()
+        rows = res.get('values', [])
+        
+        for idx, r in enumerate(rows, start=2):
+            if r and (r[0].strip().lower() == tank_id.strip().lower() or (len(r) > 2 and r[2].strip().lower() == tank_id.strip().lower())):
+                # Update Status (Column F / Index 6) and Occupant (Column G / Index 7)
+                sheets_service.spreadsheets().values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f'Tanks!F{idx}:G{idx}',
+                    valueInputOption='USER_ENTERED',
+                    body={'values': [[status, occupant_id]]}
+                ).execute()
+                break
+    except Exception as e:
+        st.warning(f"Note: Could not update tank '{tank_id}' occupancy: {e}")
+
+
+def transfer_or_assign_tank(sheets_service, fish_id: str, old_tank_id: str, new_tank_id: str) -> bool:
+    """Updates tank assignment in Fish_Master and toggles tank status/occupant in Tanks sheet."""
+    try:
+        # 1. Update Fish_Master sheet with new Tank ID
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Fish_Master!A2:E'
+        ).execute()
+        rows = res.get('values', [])
+
+        for idx, r in enumerate(rows, start=2):
+            if r and r[0].strip().lower() == fish_id.strip().lower():
+                sheets_service.spreadsheets().values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f'Fish_Master!E{idx}',
+                    valueInputOption='USER_ENTERED',
+                    body={'values': [[new_tank_id]]}
+                ).execute()
+                break
+
+        # 2. Release old tank if applicable
+        if old_tank_id and old_tank_id != "Unassigned":
+            update_tank_occupancy(sheets_service, old_tank_id, occupant_id="", status="Empty / Idle")
+
+        # 3. Assign new tank to fish
+        if new_tank_id and new_tank_id != "Unassigned":
+            update_tank_occupancy(sheets_service, new_tank_id, occupant_id=fish_id, status="Active")
+
+        st.cache_data.clear()
+        return True
+    except Exception as e:
+        st.error(f"Failed to transfer tank: {e}")
+        return False
+
+
+def get_all_fish_records(sheets_service):
+    """Fetch all registered fish from 'Fish_Master' sheet (Range A1:J)."""
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Fish_Master!A1:J'
+        ).execute()
+        rows = res.get('values', [])
+        
+        if not rows or len(rows) < 2:
+            return pd.DataFrame(columns=[
+                "Fish ID", "Variety / Strain", "Gender", "Grade", 
+                "Tank ID", "Seller", "Purchase Date", "Purchase Cost", 
+                "Image URL", "Notes"
+            ])
+        
+        headers = [h.strip() for h in rows[0]]
+        data = rows[1:]
+        
+        padded_data = [r + [""] * (len(headers) - len(r)) for r in data]
+        df = pd.DataFrame(padded_data, columns=headers)
+        df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
+        
+        return df
+    except Exception as e:
+        st.error(f"Error reading Fish Master database: {e}")
+        return pd.DataFrame()
+
+
+def upload_image_to_drive(drive_service, image_bytes, filename_prefix="fish_"):
+    """Upload photo bytes to Google Drive and return public direct view URL."""
+    from googleapiclient.http import MediaIoBaseUpload
+    
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name = f"{filename_prefix}{timestamp}.jpg"
+    
+    file_stream = io.BytesIO(image_bytes)
+    metadata = {'name': file_name}
+    if DRIVE_FOLDER_ID:
+        metadata['parents'] = [DRIVE_FOLDER_ID.strip()]
+
+    media = MediaIoBaseUpload(file_stream, mimetype='image/jpeg', resumable=False)
+    uploaded = drive_service.files().create(
+        body=metadata,
+        media_body=media,
+        fields='id'
+    ).execute()
+    
+    file_id = uploaded.get('id')
+    return file_id, f"https://lh3.googleusercontent.com/d/{file_id}"
+
+
+def calculate_form_grade(checks: dict, body_shape: str) -> tuple[str, int]:
+    """Calculates grade and total score based on fin criteria checkboxes and body shape."""
+    total_score = sum(15 for matched in checks.values() if matched)
+    
+    shape_scores = {
+        "Bullet Head": 10,
+        "Regular": 8,
+        "Spoonhead": 5
+    }
+    total_score += shape_scores.get(body_shape, 8)
+    
+    if total_score >= 95:
+        grade = "Show Grade"
+    elif total_score >= 80:
+        grade = "High Grade"
+    elif total_score >= 60:
+        grade = "Breeder Grade"
+    else:
+        grade = "Pet Grade"
+        
+    return grade, total_score
+
+
+# ------------------------------------------------------------------------------
+# Main Page Render Function
+# ------------------------------------------------------------------------------
+
+def render_fish_registry_page():
+    st.header("🐠 Fish Master Registry")
+    st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
+
+    # Initialize Google Services
+    try:
+        drive_service, sheets_service = get_google_services()
+    except Exception as e:
+        st.error(f"Failed to connect to Google Services: {e}")
+        return
+
+    tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
+
+    # ==========================================================================
+    # TAB 1: REGISTER NEW FISH
+    # ==========================================================================
+    with tab_register:
+        st.subheader("🛒 Purchased / Imported Fish Details")
+
+        ensure_fish_master_sheet_exists(sheets_service)
+        next_fish_num = generate_next_fish_id(sheets_service)
+        assigned_fish_id = f"FISH-{str(next_fish_num).zfill(4)}"
+        
+        st.info(f"📌 Next Assigned Fish ID: **#{assigned_fish_id}**")
+
+        strains_list = get_registered_strains(sheets_service)
+
+        strain_col_select, strain_col_btn = st.columns([4, 1])
+        
+        with strain_col_btn:
+            st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+            with st.popover("⚙️ Manage Strains"):
+                pop_tab_add, pop_tab_remove = st.tabs(["➕ Add", "🗑️ Remove"])
+                
+                with pop_tab_add:
+                    st.markdown("##### Add New Strain")
+                    new_strain_val = st.text_input("Strain Name", placeholder="e.g. Copper Blue Star").strip()
+                    if st.button("Save Strain", use_container_width=True, type="primary", key="btn_add_strain"):
+                        if new_strain_val:
+                            add_new_strain_to_db(sheets_service, new_strain_val)
+                            st.session_state["selected_strain"] = new_strain_val
+                            st.rerun()
+                        else:
+                            st.warning("Please enter a strain name.")
+
+                with pop_tab_remove:
+                    st.markdown("##### Remove Existing Strain")
+                    if strains_list:
+                        strain_to_delete = st.selectbox(
+                            "Select Strain to Delete", 
+                            options=strains_list, 
+                            key="select_strain_to_delete"
+                        )
+                        if st.button("Delete Strain", use_container_width=True, type="primary", key="btn_delete_strain"):
+                            delete_strain_from_db(sheets_service, strain_to_delete)
+                            if st.session_state.get("selected_strain") == strain_to_delete:
+                                st.session_state.pop("selected_strain", None)
+                            st.rerun()
+                    else:
+                        st.info("No strains available to remove.")
+
+        default_index = 0
+        if "selected_strain" in st.session_state and st.session_state["selected_strain"] in strains_list:
+            default_index = strains_list.index(st.session_state["selected_strain"])
+
+        with strain_col_select:
+            selected_strain = st.selectbox(
+                "Select Strain",
+                options=strains_list if strains_list else ["No Strains Available"],
+                index=default_index if strains_list else 0,
+                key="select_strain_dropdown"
+            )
+
+        with st.form("register_fish_form", clear_on_submit=False):
             col1, col2 = st.columns(2)
 
             with col1:
-                selected_type = st.selectbox("Container / Tank Type", DEFAULT_CONTAINER_TYPES)
-                
-                custom_type = ""
-                if selected_type == "➕ Other / Custom Container...":
-                    custom_type = st.text_input("Enter Custom Container Name", placeholder="e.g. 20L Storage Box, Styro Box, etc.")
-
-                capacity = st.number_input("Capacity (Liters)", min_value=0.1, max_value=500.0, value=6.0, step=0.5)
-                purpose = st.selectbox("Container Purpose / Role", CONTAINER_PURPOSES)
+                st.markdown("##### 🧬 Variety & Details")
+                form_type = st.text_input("Form / Type", value="HMPK", help="Default is HMPK (Halfmoon Plakat)")
+                gender = st.selectbox("Gender", ["Male", "Female"])
+                seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder")
+                purchase_date = st.date_input("Purchase Date", datetime.date.today())
+                purchase_cost = st.number_input("Purchase Cost (₱)", min_value=0.0, value=0.0, step=50.0)
 
             with col2:
-                selected_occupant = st.selectbox(
-                    "Current Occupant (Available Fish Only)",
-                    options=breeder_options,
-                    help="Only active breeders not assigned to other tanks are listed."
-                )
-                photo_file = st.file_uploader("📷 Container Photo (Optional)", type=["jpg", "jpeg", "png"])
-                notes = st.text_area("Notes / Setup Details", placeholder="e.g. Almond leaf tea water, sponge filter installed")
+                st.markdown("##### 🪣 Tank & Container Assignment")
+                all_available_tanks = get_available_tanks(sheets_service)
+                container_types = ["All Types"] + sorted(list(set(t["type"] for t in all_available_tanks)))
+                
+                selected_type_filter = st.selectbox("Filter Tank Type", options=container_types)
+                
+                if selected_type_filter != "All Types":
+                    filtered_tanks = [t for t in all_available_tanks if t["type"] == selected_type_filter]
+                else:
+                    filtered_tanks = all_available_tanks
 
-            submit = st.form_submit_button("🏷️ Register Container & Generate Tape Tag")
+                tank_options = ["Leave Unassigned"] + [f"{t['location']} ({t['id']} | {t['type']})" for t in filtered_tanks]
+                selected_tank_str = st.selectbox("Select Available Tank / Jar Location", options=tank_options)
+
+            st.divider()
+
+            st.markdown("### 🏆 Form Evaluation Criteria")
+            
+            chk_col, shape_col = st.columns([3, 2])
+            
+            with chk_col:
+                caudal_spread = st.checkbox("Caudal Fin Spread 180°", value=True)
+                caudal_prop = st.checkbox("Caudal Fin Proportion (Good branching, no damage)", value=True)
+                dorsal_struct = st.checkbox("Dorsal Fin Structure (Broad base & clean overlapping)", value=True)
+                anal_struct = st.checkbox("Anal Fin Structure (Parallel & proper length)", value=True)
+                ventral_fins = st.checkbox("Ventral Fins (Straight, broad, no curl)", value=True)
+                pectoral_fins = st.checkbox("Pectoral Fins (Full & undamaged)", value=True)
+
+            with shape_col:
+                body_shape = st.selectbox(
+                    "Body Shape",
+                    options=["Bullet Head", "Regular", "Spoonhead"],
+                    index=0,
+                    help="Select the head profile/body shape structure."
+                )
+
+            evaluation_checks = {
+                "caudal_spread": caudal_spread,
+                "caudal_prop": caudal_prop,
+                "dorsal_struct": dorsal_struct,
+                "anal_struct": anal_struct,
+                "ventral_fins": ventral_fins,
+                "pectoral_fins": pectoral_fins,
+            }
+
+            computed_grade, total_points = calculate_form_grade(evaluation_checks, body_shape)
+            st.info(f"🏆 Calculated Grade: **{computed_grade}** (Score: **{total_points}/100**)")
+
+            st.divider()
+
+            st.markdown("##### 📷 Fish Photo Capture / Upload")
+            
+            img_col1, img_col2 = st.columns(2)
+            with img_col1:
+                camera_photo = st.camera_input("Take a Live Photo of Fish")
+            with img_col2:
+                uploaded_photo = st.file_uploader("Or Upload Photo File", type=["jpg", "jpeg", "png"])
+                manual_image_url = st.text_input("Or Paste Existing Drive ID / Image URL", placeholder="Paste direct link or Drive ID")
+
+            notes = st.text_area("Notes / Characteristics", placeholder="e.g. Strong dorsal, solid iridescence, aggressive disposition")
+
+            submit = st.form_submit_button("💾 Register Fish", use_container_width=True)
 
         if submit:
-            if selected_type == "➕ Other / Custom Container..." and not custom_type.strip():
-                st.error("Please enter a custom container name.")
-            else:
-                final_type = custom_type.strip() if selected_type == "➕ Other / Custom Container..." else selected_type
-                occupant_id = "" if selected_occupant == "None (Empty)" else selected_occupant.split(" | ")[0]
+            final_image_val = manual_image_url
+            photo_bytes = None
+            if camera_photo is not None:
+                photo_bytes = camera_photo.getvalue()
+            elif uploaded_photo is not None:
+                photo_bytes = uploaded_photo.getvalue()
 
-                with st.spinner("Generating Tape Tag & registering container..."):
-                    res = register_tank(
-                        tank_type=final_type,
-                        capacity_liters=capacity,
-                        purpose=purpose,
-                        photo_file=photo_file,
-                        current_occupant=occupant_id,
-                        notes=notes
-                    )
+            if photo_bytes:
+                with st.spinner("Uploading photo to Google Drive..."):
+                    try:
+                        file_id, img_url = upload_image_to_drive(drive_service, photo_bytes)
+                        final_image_val = img_url
+                        st.success(f"Image uploaded successfully! (Drive ID: {file_id})")
+                    except Exception as err:
+                        st.error(f"Image upload failed: {err}")
 
-                st.cache_data.clear()  # Clear cache after registering
-                st.success("Container Successfully Registered!")
-                st.markdown(f"""
-                <div style="background-color: #FEF3C7; border: 2px dashed #D97706; padding: 16px; border-radius: 12px; text-align: center; margin: 12px 0;">
-                    <span style="font-size: 14px; color: #92400E; font-weight: bold; text-transform: uppercase;">✍️ WRITE THIS ON PAINTER'S TAPE:</span>
-                    <h1 style="font-size: 42px; color: #B45309; margin: 8px 0; font-family: monospace; letter-spacing: 2px;">{res['location_code']}</h1>
-                    <span style="font-size: 12px; color: #B45309;">System ID: {res['tank_id']}</span>
-                </div>
-                """, unsafe_allow_html=True)
+            selected_tank_id = ""
+            if selected_tank_str != "Leave Unassigned":
+                # Parse system tank ID inside parentheses: Location (TANK-ID | Type)
+                parsed_id = selected_tank_str.split(" (")[1].split(" | ")[0]
+                selected_tank_id = parsed_id
 
-                if res.get("direct_photo_url"):
-                    st.image(res["direct_photo_url"], caption="Uploaded Container Photo", width=250)
+            new_fish_record = [
+                assigned_fish_id,
+                f"{form_type} - {selected_strain}",
+                gender,
+                computed_grade,
+                selected_tank_id if selected_tank_id else "Unassigned",
+                seller,
+                str(purchase_date),
+                purchase_cost,
+                final_image_val,
+                f"Body Shape: {body_shape}. {notes}".strip()
+            ]
 
-    # TAB 2: CONTAINER INVENTORY
-    with tab2:
-        st.subheader("Container Inventory")
-        if st.button("🔄 Refresh Containers"):
-            st.cache_data.clear()
-            st.rerun()
+            try:
+                sheets_service.spreadsheets().values().append(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range='Fish_Master!A:J',
+                    valueInputOption='USER_ENTERED',
+                    body={'values': [new_fish_record]}
+                ).execute()
 
-        tanks = get_all_tanks()
-        if not tanks:
-            st.info("No containers registered yet.")
+                if selected_tank_id:
+                    update_tank_occupancy(sheets_service, selected_tank_id, occupant_id=assigned_fish_id, status="Active")
+
+                st.cache_data.clear()
+                st.balloons()
+                st.success(f"🎉 Fish **#{assigned_fish_id}** ({selected_strain}) successfully registered!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error saving fish record: {e}")
+
+    # ==========================================================================
+    # TAB 2: FISH LIST & DATABASE
+    # ==========================================================================
+    with tab_view:
+        st.subheader("📋 Registered Fish Database")
+        
+        df = get_all_fish_records(sheets_service)
+
+        if df.empty:
+            st.info("No fish records found in `Fish_Master`. Register your first fish above!")
         else:
-            f_col1, f_col2 = st.columns([1, 2])
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Registered", len(df))
+            m2.metric("Males", len(df[df["Gender"] == "Male"])) if "Gender" in df else None
+            m3.metric("Females", len(df[df["Gender"] == "Female"])) if "Gender" in df else None
+            m4.metric("Show/High Grade", len(df[df["Grade"].isin(["Show Grade", "High Grade"])])) if "Grade" in df else None
+
+            st.divider()
+
+            st.markdown("### 🔄 Tank Location Management")
+            
+            with st.expander("🛠️ Assign or Transfer Fish Tank Location", expanded=False):
+                col_f, col_t, col_act = st.columns([2, 2, 1])
+
+                fish_options = {
+                    f"{row['Fish ID']} - {row['Variety / Strain']} (Current Tank: {row['Tank ID'] if row['Tank ID'] else 'Unassigned'})": (row['Fish ID'], row['Tank ID'])
+                    for _, row in df.iterrows()
+                }
+
+                with col_f:
+                    selected_fish_label = st.selectbox("Select Fish to Move", options=list(fish_options.keys()))
+                    target_fish_id, current_tank_id = fish_options[selected_fish_label]
+
+                with col_t:
+                    available_tanks = get_available_tanks(sheets_service)
+                    avail_tank_opts = [f"{t['location']} ({t['id']} | {t['type']})" for t in available_tanks]
+                    
+                    if not avail_tank_opts:
+                        st.warning("No vacant tanks available!")
+                        selected_new_tank = None
+                    else:
+                        selected_new_tank = st.selectbox("Select New Vacant Tank", options=avail_tank_opts)
+
+                with col_act:
+                    st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+                    action_btn_label = "📥 Assign Tank" if not current_tank_id or current_tank_id == "Unassigned" else "🔄 Transfer Tank"
+                    
+                    if st.button(action_btn_label, type="primary", use_container_width=True, disabled=not selected_new_tank):
+                        parsed_new_tank_id = selected_new_tank.split(" (")[1].split(" | ")[0]
+                        
+                        with st.spinner("Updating tank assignments in database..."):
+                            success = transfer_or_assign_tank(
+                                sheets_service, 
+                                target_fish_id, 
+                                current_tank_id, 
+                                parsed_new_tank_id
+                            )
+                            if success:
+                                st.toast(f"✅ {target_fish_id} moved to '{parsed_new_tank_id}'!", icon="🎉")
+                                st.rerun()
+
+            st.divider()
+
+            st.markdown("##### 🔍 Filter Database")
+            f_col1, f_col2, f_col3 = st.columns(3)
 
             with f_col1:
-                availability_filter = st.selectbox(
-                    "🟢 Container Availability",
-                    options=["All Containers", "Available / Empty Only", "Occupied / In Use Only"],
-                    index=0
+                gender_filter = st.multiselect(
+                    "Filter Gender",
+                    options=list(df["Gender"].unique()) if "Gender" in df else [],
+                    default=[]
                 )
 
             with f_col2:
-                search_query = st.text_input("🔍 Search Inventory", placeholder="Search ID, Tape Code, Type, Purpose, or Occupant...").strip().lower()
+                grade_filter = st.multiselect(
+                    "Filter Grade",
+                    options=list(df["Grade"].unique()) if "Grade" in df else [],
+                    default=[]
+                )
 
-            available_statuses = ["empty / idle", "empty", "idle", "available", "ready", "clean"]
+            with f_col3:
+                strain_filter = st.multiselect(
+                    "Filter Strain / Variety",
+                    options=list(df["Variety / Strain"].unique()) if "Variety / Strain" in df else [],
+                    default=[]
+                )
 
-            filtered = []
-            for t in tanks:
-                status_str = str(t.get('status', '')).strip().lower()
-                occupant_str = str(t.get('occupant', '')).strip().lower()
-                
-                is_available = (status_str in available_statuses) or (not occupant_str or occupant_str in ["empty", "none", "n/a"])
+            filtered_df = df.copy()
+            if gender_filter:
+                filtered_df = filtered_df[filtered_df["Gender"].isin(gender_filter)]
+            if grade_filter:
+                filtered_df = filtered_df[filtered_df["Grade"].isin(grade_filter)]
+            if strain_filter:
+                filtered_df = filtered_df[filtered_df["Variety / Strain"].isin(strain_filter)]
 
-                if availability_filter == "Available / Empty Only" and not is_available:
-                    continue
-                elif availability_filter == "Occupied / In Use Only" and is_available:
-                    continue
-
-                if search_query:
-                    searchable_fields = [
-                        str(t.get('id', '')), str(t.get('type', '')), str(t.get('location', '')),
-                        str(t.get('purpose', '')), str(t.get('occupant', '')), str(t.get('notes', ''))
-                    ]
-                    if not any(search_query in field.lower() for field in searchable_fields):
-                        continue
-
-                filtered.append(t)
-
-            avail_count = sum(
-                1 for t in tanks 
-                if str(t.get('status', '')).strip().lower() in available_statuses 
-                or not str(t.get('occupant', '')).strip() 
-                or str(t.get('occupant', '')).strip().lower() in ["empty", "none", "n/a"]
+            st.dataframe(
+                filtered_df,
+                column_config={
+                    "Fish ID": st.column_config.TextColumn("Fish ID"),
+                    "Tank ID": st.column_config.TextColumn("Tank ID"),
+                    "Image URL": st.column_config.ImageColumn("Photo Preview"),
+                    "Purchase Cost": st.column_config.NumberColumn("Cost (₱)", format="₱%.2f"),
+                    "Notes": st.column_config.TextColumn("Notes", width="large"),
+                },
+                use_container_width=True,
+                hide_index=True
             )
-            st.caption(f"Showing **{len(filtered)}** of **{len(tanks)}** containers | 🟢 **{avail_count}** Available / Empty Containers")
-            st.markdown("---")
 
-            if not filtered:
-                st.warning("No containers match your filter criteria.")
-            else:
-                cols = st.columns(3)
-                for idx, t in enumerate(filtered):
-                    tank_id = t['id']
-                    curr_occ = t.get('occupant', '')
-
-                    with cols[idx % 3]:
-                        with st.container(border=True):
-                            if t.get('photo_id'):
-                                st.image(f"https://drive.google.com/thumbnail?id={t['photo_id']}&sz=w800", use_container_width=True)
-
-                            st.markdown(f"### 🏷️ `{t['location']}`")
-                            st.caption(f"**System ID:** `{tank_id}`")
-                            st.write(f"🪣 **Type:** {t['type']}")
-                            st.write(f"🎯 **Purpose:** {t['purpose']}")
-                            st.write(f"🧪 **Capacity:** {t['capacity']} L | **Status:** `{t['status']}`")
-                            
-                            if curr_occ:
-                                st.write(f"🐟 **Occupant:** `{curr_occ}`")
-                            else:
-                                st.write("🐟 **Occupant:** *Empty*")
-
-                            if t.get('notes'):
-                                st.caption(f"📝 {t['notes']}")
-
-                            st.divider()
-
-                            # UPDATE & DELETE POPOVER
-                            with st.popover("⚙️ Update / Remove", use_container_width=True):
-                                st.markdown("#### 📝 Edit Details")
-                                update_options = ["None (Empty)"]
-                                if curr_occ:
-                                    update_options.append(f"{curr_occ} (Current Occupant)")
-                                
-                                for b in available_breeders:
-                                    opt_str = f"{b['id']} | {b.get('variety', 'Betta')} ({b.get('sex', 'Unknown')})"
-                                    if opt_str not in update_options:
-                                        update_options.append(opt_str)
-
-                                selected_occ_opt = st.selectbox(
-                                    "Current Occupant",
-                                    options=update_options,
-                                    index=1 if curr_occ else 0,
-                                    key=f"occ_sel_{tank_id}"
-                                )
-
-                                status_options = ["Empty / Idle", "Active", "Cleaning / Quarantine", "Retired"]
-                                curr_status = str(t.get('status', 'Empty / Idle')).title()
-                                status_index = next((i for i, s in enumerate(status_options) if s.lower() in curr_status.lower()), 0)
-
-                                new_status = st.selectbox(
-                                    "Status",
-                                    status_options,
-                                    index=status_index,
-                                    key=f"status_{tank_id}"
-                                )
-                                
-                                curr_p_idx = get_purpose_index(t.get('purpose', ''))
-
-                                new_purpose = st.selectbox(
-                                    "Container Purpose",
-                                    CONTAINER_PURPOSES,
-                                    index=curr_p_idx,
-                                    key=f"purpose_{tank_id}"
-                                )
-
-                                new_notes = st.text_area("Notes", value=t.get('notes', ''), key=f"notes_{tank_id}")
-
-                                if st.button("💾 Save Changes", key=f"save_{tank_id}", type="primary", use_container_width=True):
-                                    if selected_occ_opt == "None (Empty)":
-                                        final_occ = ""
-                                    elif "(Current Occupant)" in selected_occ_opt:
-                                        final_occ = curr_occ
-                                    else:
-                                        final_occ = selected_occ_opt.split(" | ")[0]
-
-                                    with st.spinner("Saving changes to sheet..."):
-                                        if update_tank_status(tank_id, new_status, new_purpose, final_occ, new_notes):
-                                            st.cache_data.clear()  # Invalidate Streamlit sheet cache
-                                            st.success("Updated successfully!")
-                                            st.rerun()
-
-                                # DELETE / REMOVE SECTION
-                                st.divider()
-                                st.markdown("#### 🗑️ Remove Container")
-                                
-                                delete_reason = st.selectbox(
-                                    "Reason for Removal",
-                                    [
-                                        "Error in Registration / Duplicate Entry",
-                                        "Damaged / Cracked / Leaking",
-                                        "Lost / Misplaced Container",
-                                        "Permanently Retired from Service"
-                                    ],
-                                    key=f"del_reason_{tank_id}"
-                                )
-
-                                confirm_delete = st.checkbox(
-                                    "I confirm I want to permanently delete this container.",
-                                    key=f"del_confirm_{tank_id}"
-                                )
-
-                                if st.button(
-                                    "🔥 Delete Container Permanently",
-                                    key=f"del_btn_{tank_id}",
-                                    type="secondary",
-                                    disabled=not confirm_delete,
-                                    use_container_width=True
-                                ):
-                                    with st.spinner("Deleting record..."):
-                                        if delete_tank(tank_id):
-                                            st.cache_data.clear()  # Invalidate Streamlit sheet cache
-                                            st.success(f"Container {t['location']} removed successfully!")
-                                            st.rerun()
+            st.caption(f"Showing {len(filtered_df)} of {len(df)} records.")
