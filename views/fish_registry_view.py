@@ -9,41 +9,39 @@ from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOL
 # Helper Functions: Sheet Initialization, Strains, Tanks & Grades
 # ------------------------------------------------------------------------------
 
-def ensure_fish_master_sheet_exists(sheets_service):
-    """Ensures that the 'Fish_Master' tab exists in Google Sheets with proper headers."""
+def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
+    """Ensures that a specified worksheet tab exists in Google Sheets with headers."""
     try:
         spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
         sheets = spreadsheet.get('sheets', [])
         sheet_titles = [s['properties']['title'] for s in sheets]
 
-        if 'Fish_Master' not in sheet_titles:
-            # Create the sheet tab
-            requests = [{
-                'addSheet': {
-                    'properties': {
-                        'title': 'Fish_Master'
-                    }
-                }
-            }]
+        if sheet_name not in sheet_titles:
+            # Create sheet tab
+            requests = [{'addSheet': {'properties': {'title': sheet_name}}}]
             sheets_service.spreadsheets().batchUpdate(
                 spreadsheetId=SPREADSHEET_ID,
                 body={'requests': requests}
             ).execute()
 
-            # Add header row
-            headers = [
-                "Fish ID", "Variety / Strain", "Gender", "Grade", 
-                "Tank ID", "Seller", "Purchase Date", "Purchase Cost", 
-                "Image URL", "Notes"
-            ]
+            # Add headers
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
-                range='Fish_Master!A1:J1',
+                range=f'{sheet_name}!A1',
                 valueInputOption='USER_ENTERED',
-                body={'values': [headers]}
+                body={'values': [default_headers]}
             ).execute()
     except Exception as e:
-        st.warning(f"Note: Auto-creation check for 'Fish_Master' sheet failed ({e})")
+        st.warning(f"Note: Auto-creation check for '{sheet_name}' failed ({e})")
+
+
+def ensure_fish_master_sheet_exists(sheets_service):
+    headers = [
+        "Fish ID", "Variety / Strain", "Gender", "Grade", 
+        "Tank ID", "Seller", "Purchase Date", "Purchase Cost", 
+        "Image URL", "Notes"
+    ]
+    ensure_sheet_exists(sheets_service, 'Fish_Master', headers)
 
 
 def get_registered_strains(sheets_service):
@@ -75,15 +73,16 @@ def get_registered_strains(sheets_service):
 def add_new_strain_to_db(sheets_service, new_strain):
     """Save a new strain to the 'Master_Strains' worksheet."""
     try:
+        ensure_sheet_exists(sheets_service, 'Master_Strains', ["Strain Name"])
         sheets_service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
             range='Master_Strains!A:A',
             valueInputOption='USER_ENTERED',
             body={'values': [[new_strain.strip()]]}
         ).execute()
-        st.toast(f"✅ Added '{new_strain}' to Strain Registry!", icon="✨")
+        st.toast(f"✅ Saved '{new_strain}' to Strain Registry!", icon="✨")
     except Exception as e:
-        st.warning(f"Note: Could not save strain to persistent sheet ({e})")
+        st.error(f"Could not save strain to database ({e})")
 
 
 def get_available_tanks(sheets_service):
@@ -104,7 +103,6 @@ def get_available_tanks(sheets_service):
                     tanks.append({"id": tank_id, "type": container_type, "status": status})
         return tanks
     except Exception:
-        # Fallback dummy tanks if sheet is empty/unreachable
         return [
             {"id": "Jar M-01", "type": "Empi Jar", "status": "Available"},
             {"id": "Jar M-02", "type": "Empi Jar", "status": "Available"},
@@ -137,15 +135,7 @@ def upload_image_to_drive(drive_service, image_bytes, filename_prefix="fish_"):
 
 
 def calculate_form_grade(checks: dict, body_shape: str) -> tuple[str, int]:
-    """
-    Calculates grade and total score based on fin criteria checkboxes and body shape.
-    
-    Each checked fin criterion adds 15 points (Max 90 pts).
-    Body Shape weighting:
-      - Bullet Head: +10 pts
-      - Regular: +8 pts
-      - Spoonhead: +5 pts
-    """
+    """Calculates grade and total score based on fin criteria checkboxes and body shape."""
     total_score = sum(15 for matched in checks.values() if matched)
     
     shape_scores = {
@@ -188,31 +178,56 @@ def render_fish_registry_page():
     with tab_register:
         st.subheader("🛒 Purchased / Imported Fish Details")
 
+        # Fetch existing strains from Google Sheets DB
+        strains_list = get_registered_strains(sheets_service)
+
+        # ----------------------------------------------------------------------
+        # Clean Add-Strain Popover (Outside Form for Instant Reload)
+        # ----------------------------------------------------------------------
+        strain_col_select, strain_col_btn = st.columns([4, 1])
+        
+        with strain_col_btn:
+            st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+            with st.popover("➕ Add Strain"):
+                st.markdown("##### Add New Strain")
+                new_strain_val = st.text_input("Strain Name", placeholder="e.g. Copper Blue Star").strip()
+                if st.button("Save Strain", use_container_width=True, type="primary"):
+                    if new_strain_val:
+                        add_new_strain_to_db(sheets_service, new_strain_val)
+                        st.session_state["selected_strain"] = new_strain_val
+                        st.rerun()
+                    else:
+                        st.warning("Please enter a strain name.")
+
+        # Auto-select the newly created strain if saved in session_state
+        default_index = 0
+        if "selected_strain" in st.session_state and st.session_state["selected_strain"] in strains_list:
+            default_index = strains_list.index(st.session_state["selected_strain"])
+
+        with strain_col_select:
+            selected_strain = st.selectbox(
+                "Select Strain",
+                options=strains_list,
+                index=default_index,
+                key="select_strain_dropdown"
+            )
+
+        # ----------------------------------------------------------------------
+        # Registration Form
+        # ----------------------------------------------------------------------
         with st.form("register_fish_form", clear_on_submit=False):
             col1, col2 = st.columns(2)
 
             with col1:
-                # 1. Variety / Type & Strain Selection
-                st.markdown("##### 🧬 Variety & Strain")
+                st.markdown("##### 🧬 Variety & Details")
                 form_type = st.text_input("Form / Type", value="HMPK", help="Default is HMPK (Halfmoon Plakat)")
-                
-                existing_strains = get_registered_strains(sheets_service)
-                strain_options = existing_strains + ["➕ Add New Strain..."]
-                selected_strain_option = st.selectbox("Select Strain", options=strain_options, index=0)
-
-                new_strain_input = ""
-                if selected_strain_option == "➕ Add New Strain...":
-                    new_strain_input = st.text_input("Enter New Strain Name", placeholder="e.g. Yellow Red Dragon Fancy")
-
                 gender = st.selectbox("Gender", ["Male", "Female"])
                 seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder")
                 purchase_date = st.date_input("Purchase Date", datetime.date.today())
                 purchase_cost = st.number_input("Purchase Cost (₱)", min_value=0.0, value=0.0, step=50.0)
 
             with col2:
-                # 2. Dynamic Tank Selection with Filter
                 st.markdown("##### 🪣 Tank & Container Assignment")
-                
                 all_available_tanks = get_available_tanks(sheets_service)
                 container_types = ["All Types"] + sorted(list(set(t["type"] for t in all_available_tanks)))
                 
@@ -228,7 +243,7 @@ def render_fish_registry_page():
 
             st.divider()
 
-            # 3. Form Evaluation Criteria Checklist & Body Shape
+            # Form Evaluation Criteria Checklist & Body Shape
             st.markdown("### 🏆 Form Evaluation Criteria")
             
             chk_col, shape_col = st.columns([3, 2])
@@ -263,7 +278,7 @@ def render_fish_registry_page():
 
             st.divider()
 
-            # 4. Direct Photo Capture / Upload & Fallback URL
+            # Photo Capture / Upload & Fallback URL
             st.markdown("##### 📷 Fish Photo Capture / Upload")
             
             img_col1, img_col2 = st.columns(2)
@@ -279,13 +294,7 @@ def render_fish_registry_page():
 
         # Handle Form Submission Logic
         if submit:
-            # Ensure the worksheet tab exists before executing append queries
             ensure_fish_master_sheet_exists(sheets_service)
-
-            final_strain = new_strain_input if selected_strain_option == "➕ Add New Strain..." else selected_strain_option
-            
-            if selected_strain_option == "➕ Add New Strain..." and new_strain_input.strip():
-                add_new_strain_to_db(sheets_service, new_strain_input.strip())
 
             # Handle Image Upload to Google Drive
             final_image_val = manual_image_url
@@ -310,7 +319,7 @@ def render_fish_registry_page():
             # Prepare row data for Google Sheets
             new_fish_record = [
                 f"FISH-{datetime.datetime.now().strftime('%M%S')}",
-                f"{form_type} - {final_strain}",
+                f"{form_type} - {selected_strain}",
                 gender,
                 computed_grade,
                 selected_tank_id,
@@ -322,7 +331,6 @@ def render_fish_registry_page():
             ]
 
             try:
-                # Append row to 'Fish_Master' sheet
                 sheets_service.spreadsheets().values().append(
                     spreadsheetId=SPREADSHEET_ID,
                     range='Fish_Master!A:J',
@@ -331,7 +339,7 @@ def render_fish_registry_page():
                 ).execute()
 
                 st.balloons()
-                st.success(f"🎉 Fish successfully registered as Grade: **{computed_grade}** assigned to **{selected_tank_id}**!")
+                st.success(f"🎉 Fish ({selected_strain}) successfully registered as Grade: **{computed_grade}** assigned to **{selected_tank_id}**!")
             except Exception as e:
                 st.error(f"Error saving fish record: {e}")
 
