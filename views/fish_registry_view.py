@@ -25,10 +25,10 @@ def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
                 body={'requests': requests}
             ).execute()
 
-            # Add headers
+            # Add headers starting at B1 to match existing sheet layout
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f'{sheet_name}!A1',
+                range=f'{sheet_name}!B1',
                 valueInputOption='USER_ENTERED',
                 body={'values': [default_headers]}
             ).execute()
@@ -46,11 +46,11 @@ def ensure_fish_master_sheet_exists(sheets_service):
 
 
 def generate_next_fish_id(sheets_service) -> str:
-    """Fetch all existing Fish IDs and return the next sequential integer ID starting at 1."""
+    """Fetch all existing Fish IDs from Column B and return the next sequential ID."""
     try:
         res = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Fish_Master!A2:A'
+            range='Fish_Master!B2:B'
         ).execute()
         rows = res.get('values', [])
         
@@ -193,13 +193,14 @@ def get_available_tanks(sheets_service):
 
 
 def get_all_fish_records(sheets_service):
-    """Fetch all registered fish from 'Fish_Master' sheet."""
+    """Fetch all registered fish from 'Fish_Master' sheet (Range B1:J)."""
     try:
         res = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Fish_Master!A1:J'
+            range='Fish_Master!B1:J'
         ).execute()
         rows = res.get('values', [])
+        
         if not rows or len(rows) < 2:
             return pd.DataFrame(columns=[
                 "Fish ID", "Variety / Strain", "Gender", "Grade", 
@@ -207,12 +208,16 @@ def get_all_fish_records(sheets_service):
                 "Image URL", "Notes"
             ])
         
-        headers = rows[0]
+        headers = [h.strip() for h in rows[0]]
         data = rows[1:]
         
-        # Pad shorter rows if any columns were omitted in Google Sheets
+        # Pad rows if any values are missing/empty
         padded_data = [r + [""] * (len(headers) - len(r)) for r in data]
         df = pd.DataFrame(padded_data, columns=headers)
+        
+        # Strip trailing/leading spaces from string values
+        df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
+        
         return df
     except Exception as e:
         st.error(f"Error reading Fish Master database: {e}")
@@ -220,7 +225,7 @@ def get_all_fish_records(sheets_service):
 
 
 def upload_image_to_drive(drive_service, image_bytes, filename_prefix="fish_"):
-    """Upload photo bytes to Google Drive and return public file ID / URL."""
+    """Upload photo bytes to Google Drive and return public direct view URL."""
     from googleapiclient.http import MediaIoBaseUpload
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -417,7 +422,7 @@ def render_fish_registry_page():
             submit = st.form_submit_button("💾 Register Fish", use_container_width=True)
 
         if submit:
-            assigned_fish_id = generate_next_fish_id(sheets_service)
+            assigned_fish_id = f"FISH-{generate_next_fish_id(sheets_service).zfill(4)}"
 
             final_image_val = manual_image_url
             photo_bytes = None
@@ -451,15 +456,16 @@ def render_fish_registry_page():
             ]
 
             try:
+                # Appends specifically to Range B:J to align with Column B
                 sheets_service.spreadsheets().values().append(
                     spreadsheetId=SPREADSHEET_ID,
-                    range='Fish_Master!A:J',
+                    range='Fish_Master!B:J',
                     valueInputOption='USER_ENTERED',
                     body={'values': [new_fish_record]}
                 ).execute()
 
                 st.balloons()
-                st.success(f"🎉 Fish **#{assigned_fish_id}** ({selected_strain}) successfully registered! Grade: **{computed_grade}** in **{selected_tank_id}**.")
+                st.success(f"🎉 Fish **#{assigned_fish_id}** ({selected_strain}) successfully registered! Grade: **{computed_grade}**.")
                 st.rerun()
             except Exception as e:
                 st.error(f"Error saving fish record: {e}")
@@ -474,62 +480,61 @@ def render_fish_registry_page():
 
         if df.empty:
             st.info("No fish records found in `Fish_Master`. Register your first fish above!")
-            return
+        else:
+            # Metrics Overview Row
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Registered", len(df))
+            m2.metric("Males", len(df[df["Gender"] == "Male"])) if "Gender" in df else None
+            m3.metric("Females", len(df[df["Gender"] == "Female"])) if "Gender" in df else None
+            m4.metric("Show/High Grade", len(df[df["Grade"].isin(["Show Grade", "High Grade"])])) if "Grade" in df else None
 
-        # Metrics Overview Row
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Registered", len(df))
-        m2.metric("Males", len(df[df["Gender"] == "Male"]))
-        m3.metric("Females", len(df[df["Gender"] == "Female"]))
-        m4.metric("Show/High Grade", len(df[df["Grade"].isin(["Show Grade", "High Grade"])]))
+            st.divider()
 
-        st.divider()
+            # Filters Bar
+            st.markdown("##### 🔍 Filter Database")
+            f_col1, f_col2, f_col3 = st.columns(3)
 
-        # Filters Bar
-        st.markdown("##### 🔍 Filter Database")
-        f_col1, f_col2, f_col3 = st.columns(3)
+            with f_col1:
+                gender_filter = st.multiselect(
+                    "Filter Gender",
+                    options=list(df["Gender"].unique()) if "Gender" in df else [],
+                    default=[]
+                )
 
-        with f_col1:
-            gender_filter = st.multiselect(
-                "Filter Gender",
-                options=list(df["Gender"].unique()) if "Gender" in df else [],
-                default=[]
+            with f_col2:
+                grade_filter = st.multiselect(
+                    "Filter Grade",
+                    options=list(df["Grade"].unique()) if "Grade" in df else [],
+                    default=[]
+                )
+
+            with f_col3:
+                strain_filter = st.multiselect(
+                    "Filter Strain / Variety",
+                    options=list(df["Variety / Strain"].unique()) if "Variety / Strain" in df else [],
+                    default=[]
+                )
+
+            # Apply Filters
+            filtered_df = df.copy()
+            if gender_filter:
+                filtered_df = filtered_df[filtered_df["Gender"].isin(gender_filter)]
+            if grade_filter:
+                filtered_df = filtered_df[filtered_df["Grade"].isin(grade_filter)]
+            if strain_filter:
+                filtered_df = filtered_df[filtered_df["Variety / Strain"].isin(strain_filter)]
+
+            # Interactive Table
+            st.dataframe(
+                filtered_df,
+                column_config={
+                    "Fish ID": st.column_config.TextColumn("Fish ID"),
+                    "Image URL": st.column_config.ImageColumn("Photo Preview"),
+                    "Purchase Cost": st.column_config.NumberColumn("Cost (₱)", format="₱%.2f"),
+                    "Notes": st.column_config.TextColumn("Notes", width="large"),
+                },
+                use_container_width=True,
+                hide_index=True
             )
 
-        with f_col2:
-            grade_filter = st.multiselect(
-                "Filter Grade",
-                options=list(df["Grade"].unique()) if "Grade" in df else [],
-                default=[]
-            )
-
-        with f_col3:
-            strain_filter = st.multiselect(
-                "Filter Strain / Variety",
-                options=list(df["Variety / Strain"].unique()) if "Variety / Strain" in df else [],
-                default=[]
-            )
-
-        # Apply Filters
-        filtered_df = df.copy()
-        if gender_filter:
-            filtered_df = filtered_df[filtered_df["Gender"].isin(gender_filter)]
-        if grade_filter:
-            filtered_df = filtered_df[filtered_df["Grade"].isin(grade_filter)]
-        if strain_filter:
-            filtered_df = filtered_df[filtered_df["Variety / Strain"].isin(strain_filter)]
-
-        # Interactive Data Table with Image Previews
-        st.dataframe(
-            filtered_df,
-            column_config={
-                "Fish ID": st.column_config.TextColumn("Fish ID", help="Numeric Parent ID (1, 2, 3...)"),
-                "Image URL": st.column_config.ImageColumn("Photo Preview", help="Uploaded Drive Image"),
-                "Purchase Cost": st.column_config.NumberColumn("Cost (₱)", format="₱%.2f"),
-                "Notes": st.column_config.TextColumn("Notes", width="large"),
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.caption(f"Showing {len(filtered_df)} of {len(df)} records.")
+            st.caption(f"Showing {len(filtered_df)} of {len(df)} records.")
