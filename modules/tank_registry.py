@@ -1,307 +1,263 @@
-# modules/tank_registry.py
-import io
-import random
 import datetime
-import qrcode
-import streamlit as st
+import uuid
+import re
+from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-from modules.drive_service import (
-    get_google_services,
-    get_spreadsheet_id,
-    get_drive_folder_id
-)
+from modules.google_auth import get_credentials, SPREADSHEET_ID, PARENT_FOLDER_ID
 
-def ensure_tanks_tab_exists(sheets_service, spreadsheet_id):
-    """
-    Ensures the 'Tanks' worksheet tab exists with proper headers in Google Sheets.
-    Prevents HttpError when appending or reading empty/missing tabs.
-    """
-    try:
-        # Check existing sheet tabs
-        sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-        sheets = sheet_metadata.get('sheets', [])
-        sheet_titles = [s['properties']['title'] for s in sheets]
+# Define Google Sheets Worksheet Name for Containers
+TANK_SHEET_NAME = "Tanks_Registry"
 
-        # 1. Create 'Tanks' worksheet tab if it does not exist
-        if "Tanks" not in sheet_titles:
-            body = {
-                'requests': [{
-                    'addSheet': {
-                        'properties': {'title': 'Tanks'}
-                    }
-                }]
-            }
-            sheets_service.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body=body
-            ).execute()
 
-        # 2. Check if Header Row exists; populate if empty
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range='Tanks!A1:K1'
-        ).execute()
+def get_sheets_service():
+    """Initializes and returns the Google Sheets API service."""
+    creds = get_credentials()
+    return build("sheets", "v4", credentials=creds)
 
-        headers = result.get('values', [])
-        if not headers:
-            header_row = [
-                "System ID", "Tank Type", "Tape Code", "Capacity (Liters)",
-                "Status", "Purpose", "Current Occupant", "Photo Drive ID",
-                "QR Drive ID", "Notes", "Date Registered"
-            ]
-            sheets_service.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range='Tanks!A1:K1',
-                valueInputOption='USER_ENTERED',
-                body={'values': [header_row]}
-            ).execute()
 
-    except Exception as e:
-        print(f"Warning: Failed during ensure_tanks_tab_exists execution: {e}")
+def get_drive_service():
+    """Initializes and returns the Google Drive API service."""
+    creds = get_credentials()
+    return build("drive", "v3", credentials=creds)
 
-def get_next_tank_id(sheets_service, spreadsheet_id) -> str:
-    """Fetches all existing rows to compute the next sequential integer ID (starting at 1)."""
-    try:
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range='Tanks!A2:A'
-        ).execute()
 
-        rows = result.get('values', [])
-        max_id = 0
-
-        for row in rows:
-            if row and row[0]:
-                val = str(row[0]).strip()
-                if val.isdigit():
-                    max_id = max(max_id, int(val))
-
-        return str(max_id + 1)
-    except Exception as e:
-        print(f"Error fetching next tank ID: {e}")
-        return "1"
-
-def generate_tape_code(tank_type: str) -> str:
-    """Generates a short, easy-to-write code for painter's tape (e.g. GO-8492, JAR-1039)."""
-    type_upper = tank_type.upper()
-    if "GROW-OUT" in type_upper or "PLANGGANA" in type_upper:
-        prefix = "GO"
-    elif "SPAWNING" in type_upper:
-        prefix = "SPN"
-    elif "JAR" in type_upper or "EMPI" in type_upper or "BOTTLE" in type_upper:
-        prefix = "JAR"
-    elif "SORORITY" in type_upper:
-        prefix = "SOR"
-    elif "QUARANTINE" in type_upper:
-        prefix = "QT"
-    else:
-        prefix = "TNK"
-
-    random_num = random.randint(1000, 9999)
-    return f"{prefix}-{random_num}"
-
-def generate_tank_qr(tank_id):
-    """Generates a QR Code image stream for a given Tank ID."""
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=10,
-        border=4,
-    )
-    qr.add_data(tank_id)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+def _ensure_sheet_exists():
+    """Ensures that the 'Tanks_Registry' worksheet exists and has header row."""
+    service = get_sheets_service()
+    sheet_metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    sheets = sheet_metadata.get("sheets", [])
     
-    img_stream = io.BytesIO()
-    img.save(img_stream, format='PNG')
-    img_stream.seek(0)
-    return img_stream
+    sheet_names = [s["properties"]["title"] for s in sheets]
+    
+    if TANK_SHEET_NAME not in sheet_names:
+        # Create worksheet
+        body = {
+            "requests": [{
+                "addSheet": {
+                    "properties": {
+                        "title": TANK_SHEET_NAME
+                    }
+                }
+            }]
+        }
+        service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+        
+        # Add headers
+        headers = [
+            "Tank ID",
+            "Location Code",
+            "Type",
+            "Capacity (L)",
+            "Purpose",
+            "Status",
+            "Current Occupant",
+            "Notes",
+            "Photo ID",
+            "Registered Date"
+        ]
+        service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{TANK_SHEET_NAME}!A1",
+            valueInputOption="USER_ENTERED",
+            body={"values": [headers]}
+        ).execute()
 
-def upload_to_drive(drive_service, file_data, file_name, mime_type):
-    """Uploads a file directly to Google Drive."""
-    if hasattr(file_data, 'getvalue'):
-        raw_bytes = file_data.getvalue()
-    elif hasattr(file_data, 'read'):
-        raw_bytes = file_data.read()
-    else:
-        raw_bytes = file_data
 
-    stream = io.BytesIO(raw_bytes)
-    stream.seek(0)
+def upload_container_photo(file_obj, filename_prefix="TANK"):
+    """
+    Uploads a photo to Google Drive and sets public read permissions for display in Streamlit.
+    Returns (file_id, direct_view_url).
+    """
+    if not file_obj:
+        return "", ""
 
-    media = MediaIoBaseUpload(stream, mimetype=mime_type, resumable=False)
-    folder_id = get_drive_folder_id()
-
-    metadata = {'name': file_name}
-    if folder_id:
-        metadata['parents'] = [folder_id]
-
-    uploaded = drive_service.files().create(
-        body=metadata,
+    drive_service = get_drive_service()
+    
+    # Define file metadata
+    file_metadata = {
+        "name": f"{filename_prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg",
+        "parents": [PARENT_FOLDER_ID] if PARENT_FOLDER_ID else []
+    }
+    
+    # Upload media
+    media = MediaIoBaseUpload(file_obj, mimetype=file_obj.type or "image/jpeg", resumable=True)
+    uploaded_file = drive_service.files().create(
+        body=file_metadata,
         media_body=media,
-        fields='id'
+        fields="id, webViewLink"
     ).execute()
     
-    file_id = uploaded.get('id')
-
+    file_id = uploaded_file.get("id")
+    
+    # Make file publicly readable for image rendering
     try:
         drive_service.permissions().create(
             fileId=file_id,
-            body={'type': 'anyone', 'role': 'reader'}
+            body={"role": "reader", "type": "anyone"}
         ).execute()
-    except Exception as e:
-        print(f"Warning: Could not set permission on file {file_id}: {e}")
+    except Exception:
+        pass
 
-    return file_id
+    direct_url = f"https://drive.google.com/thumbnail?id={file_id}&sz=w800"
+    return file_id, direct_url
 
-def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose", photo_file=None, current_occupant="", notes=""):
+
+def generate_location_code(container_type, existing_tanks):
     """
-    1. Verifies/creates sheet tab & header structure.
-    2. Generates sequential Tank ID (1, 2, 3...) and short Tape Code upon submission.
-    3. Uploads container photo (if provided) and QR Tag to Google Drive.
-    4. Saves record in Google Sheets.
+    Generates a concise, short code suitable for writing on painter's tape.
+    E.g., Grow-Out Planggana -> PLG-G-001
     """
-    drive_service, sheets_service = get_google_services()
-    spreadsheet_id = get_spreadsheet_id()
+    type_clean = container_type.upper()
+    
+    if "PLANGGANA" in type_clean:
+        prefix = "PLG-G" if "GROW" in type_clean or "LARGE" in type_clean else "PLG-S"
+    elif "BOTTLE" in type_clean or "WATER" in type_clean:
+        prefix = "BOT-6L"
+    elif "EMPI" in type_clean or "EMPERADOR" in type_clean:
+        prefix = "JAR-EMP"
+    elif "AQUARIUM" in type_clean or "GLASS" in type_clean:
+        prefix = "AQ-GLS"
+    elif "SORORITY" in type_clean or "BASIN" in type_clean:
+        prefix = "PLG-SOR"
+    elif "QUARANTINE" in type_clean or "TREATMENT" in type_clean:
+        prefix = "JAR-MED"
+    else:
+        # Fallback short code generator for custom entries
+        clean_words = re.sub(r'[^A-Z0-9 ]', '', type_clean).split()
+        prefix = "".join([w[0] for w in clean_words[:3]]) if clean_words else "TNK"
 
-    # Ensure worksheet tab & A1:K1 headers exist prior to append operation
-    ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
+    # Find highest current index with this prefix
+    count = 1
+    for t in existing_tanks:
+        code = t.get("location", "")
+        if code.startswith(prefix):
+            try:
+                num_part = int(code.split("-")[-1])
+                if num_part >= count:
+                    count = num_part + 1
+            except ValueError:
+                pass
 
-    # Generate sequential Tank ID starting from 1
-    tank_id = get_next_tank_id(sheets_service, spreadsheet_id)
-    location_code = generate_tape_code(tank_type)
+    return f"{prefix}-{count:03d}"
 
-    # 1. Upload Container Photo (if uploaded)
-    photo_id = ""
-    if photo_file is not None:
-        try:
-            photo_name = f"tank_{tank_id}_photo.jpg"
-            photo_id = upload_to_drive(drive_service, photo_file, photo_name, 'image/jpeg')
-        except Exception as e:
-            st.error(f"Failed to upload photo: {e}")
 
-    # 2. Upload Tank QR Code
-    qr_id = ""
-    try:
-        qr_stream = generate_tank_qr(tank_id)
-        qr_name = f"tank_{tank_id}_QR.png"
-        qr_id = upload_to_drive(drive_service, qr_stream, qr_name, 'image/png')
-    except Exception as e:
-        print(f"Warning: Failed to generate QR Code: {e}")
+def register_tank(tank_type, capacity_liters, purpose, photo_file=None, current_occupant="", notes=""):
+    """
+    Registers a new container/tank entry into Google Sheets.
+    """
+    _ensure_sheet_exists()
+    
+    existing_tanks = get_all_tanks()
+    
+    tank_id = f"TNK-{datetime.datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+    location_code = generate_location_code(tank_type, existing_tanks)
+    
+    # Upload photo if supplied
+    photo_id, direct_photo_url = "", ""
+    if photo_file:
+        photo_id, direct_photo_url = upload_container_photo(photo_file, filename_prefix=location_code)
 
-    date_registered = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    registered_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    initial_status = "Active"
 
-    row = [
-        tank_id,               # A: Tank System ID (1, 2, 3...)
-        tank_type,             # B: Tank / Container Type
-        location_code,         # C: Auto-Generated Tape Code
-        capacity_liters,       # D: Capacity (Liters)
-        "Active",              # E: Status
-        purpose,               # F: Container Purpose / Usage
-        current_occupant,      # G: Current Occupant ID
-        photo_id,              # H: Photo Drive ID
-        qr_id,                 # I: QR Code Drive ID
-        notes,                 # J: Notes
-        date_registered        # K: Date Registered
+    row_data = [
+        tank_id,
+        location_code,
+        tank_type,
+        capacity_liters,
+        purpose,
+        initial_status,
+        current_occupant,
+        notes,
+        photo_id,
+        registered_date
     ]
 
-    sheets_service.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range='Tanks!A:K',
-        valueInputOption='USER_ENTERED',
-        body={'values': [row]}
+    service = get_sheets_service()
+    service.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{TANK_SHEET_NAME}!A:J",
+        valueInputOption="USER_ENTERED",
+        body={"values": [row_data]}
     ).execute()
-
-    direct_photo_url = f"https://drive.google.com/thumbnail?id={photo_id}&sz=w800" if photo_id else None
 
     return {
         "tank_id": tank_id,
         "location_code": location_code,
-        "photo_id": photo_id,
-        "qr_id": qr_id,
         "direct_photo_url": direct_photo_url
     }
 
+
 def get_all_tanks():
-    """Fetches all registered tank records from Google Sheets."""
-    drive_service, sheets_service = get_google_services()
-    spreadsheet_id = get_spreadsheet_id()
-
-    try:
-        ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
-
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range='Tanks!A2:K'
-        ).execute()
-
-        rows = result.get('values', [])
-        tanks = []
-
-        for row in rows:
-            if not row:
-                continue
-            while len(row) < 11:
-                row.append("")
-
-            tanks.append({
-                "id": str(row[0]),
-                "type": str(row[1]),
-                "location": str(row[2]),
-                "capacity": str(row[3]),
-                "status": str(row[4]) if row[4] else "Active",
-                "purpose": str(row[5]) if row[5] else "General / Multi-purpose",
-                "occupant": str(row[6]),
-                "photo_id": str(row[7]),
-                "qr_id": str(row[8]),
-                "notes": str(row[9]),
-                "date_registered": str(row[10])
-            })
-
-        return tanks
-    except Exception as e:
-        print(f"Error fetching tanks: {e}")
+    """
+    Fetches all registered tanks/containers from Google Sheets.
+    """
+    _ensure_sheet_exists()
+    service = get_sheets_service()
+    
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{TANK_SHEET_NAME}!A:J"
+    ).execute()
+    
+    rows = result.get("values", [])
+    if len(rows) <= 1:
         return []
 
-def update_tank_status(tank_id: str, new_status: str, purpose: str = "", occupant: str = "", notes: str = "") -> bool:
-    """Updates tank status, purpose, current occupant, or notes."""
-    try:
-        drive_service, sheets_service = get_google_services()
-        spreadsheet_id = get_spreadsheet_id()
+    tanks = []
+    # Skip header row
+    for row in rows[1:]:
+        # Safeguard against short rows missing trailing columns
+        row_padded = row + [""] * (10 - len(row))
+        tanks.append({
+            "id": row_padded[0],
+            "location": row_padded[1],
+            "type": row_padded[2],
+            "capacity": row_padded[3],
+            "purpose": row_padded[4],
+            "status": row_padded[5],
+            "occupant": row_padded[6],
+            "notes": row_padded[7],
+            "photo_id": row_padded[8],
+            "registered_date": row_padded[9]
+        })
 
-        ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
+    return tanks
 
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range='Tanks!A:K'
-        ).execute()
 
-        rows = result.get('values', [])
-        target_row = None
+def update_tank_status(tank_id, new_status, new_purpose, new_occupant, new_notes):
+    """
+    Updates status, purpose, occupant, and notes for an existing tank ID in Google Sheets.
+    """
+    _ensure_sheet_exists()
+    service = get_sheets_service()
+    
+    # Read existing rows to find matching row index
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{TANK_SHEET_NAME}!A:A"
+    ).execute()
+    
+    id_column = result.get("values", [])
+    row_index = None
 
-        for idx, row in enumerate(rows):
-            if row and str(row[0]).strip() == str(tank_id).strip():
-                target_row = idx + 1
-                break
+    for idx, row in enumerate(id_column):
+        if row and row[0] == tank_id:
+            row_index = idx + 1  # 1-based index for Google Sheets API
+            break
 
-        if not target_row:
-            return False
-
-        sheets_service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f'Tanks!E{target_row}:G{target_row}',
-            valueInputOption='USER_ENTERED',
-            body={'values': [[new_status, purpose, occupant]]}
-        ).execute()
-
-        sheets_service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f'Tanks!J{target_row}',
-            valueInputOption='USER_ENTERED',
-            body={'values': [[notes]]}
-        ).execute()
-
-        return True
-    except Exception as e:
-        print(f"Error updating tank status: {e}")
+    if not row_index:
         return False
+
+    # Update columns E to H (Purpose, Status, Current Occupant, Notes)
+    # Col E (5) = Purpose, Col F (6) = Status, Col G (7) = Occupant, Col H (8) = Notes
+    update_values = [[new_purpose, new_status, new_occupant, new_notes]]
+    
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{TANK_SHEET_NAME}!E{row_index}:H{row_index}",
+        valueInputOption="USER_ENTERED",
+        body={"values": update_values}
+    ).execute()
+
+    return True
