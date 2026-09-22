@@ -190,6 +190,64 @@ def get_all_breeders():
         print(f"Error fetching breeders: {e}")
         return []
 
+def retire_breeder(breeder_id: str, reason: str, notes: str = "") -> bool:
+    """
+    1. Locates breeder row by Breeder ID in Google Sheets.
+    2. Updates Status (Column F) to 'Retired'.
+    3. Appends retirement reason and extra notes to Notes (Column I).
+    """
+    try:
+        drive_service, sheets_service = get_google_services()
+        spreadsheet_id = get_spreadsheet_id()
+
+        # Fetch current spreadsheet data
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range='Breeders!A:J'
+        ).execute()
+        
+        rows = result.get('values', [])
+        if not rows:
+            return False
+
+        target_row_idx = None
+        existing_notes = ""
+
+        for idx, row in enumerate(rows):
+            if row and len(row) > 0 and str(row[0]).strip() == str(breeder_id).strip():
+                target_row_idx = idx + 1  # 1-based index for Google Sheets ranges
+                if len(row) > 8:
+                    existing_notes = str(row[8])
+                break
+
+        if target_row_idx is None:
+            return False
+
+        # Format retirement details for notes log
+        retire_tag = f"[Retired: {reason}]"
+        updated_notes = f"{existing_notes} | {retire_tag} {notes}".strip(" |") if existing_notes else f"{retire_tag} {notes}".strip()
+
+        # 1. Update Status in Column F (F{target_row_idx})
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f'Breeders!F{target_row_idx}',
+            valueInputOption='USER_ENTERED',
+            body={'values': [["Retired"]]}
+        ).execute()
+
+        # 2. Update Notes in Column I (I{target_row_idx})
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f'Breeders!I{target_row_idx}',
+            valueInputOption='USER_ENTERED',
+            body={'values': [[updated_notes]]}
+        ).execute()
+
+        return True
+    except Exception as e:
+        print(f"Error retiring breeder {breeder_id}: {e}")
+        return False
+
 def delete_breeder(breeder_id: str) -> bool:
     """
     1. Finds breeder row by Breeder ID in Google Sheets.
