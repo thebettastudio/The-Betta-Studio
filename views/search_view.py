@@ -16,6 +16,28 @@ def render_search_page():
     st.title("🔍 Advanced Studio Search & Filters")
     st.caption("Locate breeders, spawn batches, and containers using keyword search or specific biological and system filters.")
 
+    # Load All Data First to Extract Dynamic Options
+    breeders = get_all_breeders()
+    tanks = get_all_tanks()
+    try:
+        spawns = get_all_spawns()
+    except Exception:
+        spawns = []
+
+    # --------------------------------------------------------------------------
+    # DYNAMIC DATA EXTRACTION FOR FILTERS
+    # --------------------------------------------------------------------------
+    # Extract unique varieties from breeders & spawns
+    existing_varieties = sorted(list(set(
+        [b.get('variety', '').strip() for b in breeders if b.get('variety')] +
+        [s.get('variety', '').strip() for s in spawns if s.get('variety')]
+    )))
+
+    # Extract unique tank/container types
+    existing_tank_types = sorted(list(set(
+        [t.get('type', '').strip() for t in tanks if t.get('type')]
+    )))
+
     # Main Keyword Search
     query = st.text_input("🔍 Global Keyword Search", placeholder="Search by ID, tape code (e.g., GO-01), lineage, notes...").strip().lower()
 
@@ -27,7 +49,9 @@ def render_search_page():
             st.markdown("**🐟 Breeder Filters**")
             filter_sex = st.multiselect("Sex", ["Male", "Female"])
             filter_grade = st.multiselect("Betta Grade", ["Show / Competition", "High Grade Breeder", "Standard Breeder", "Pet / Commercial Grade"])
-            filter_variety = st.text_input("Variety / Color Tag", placeholder="e.g. Avatar, Super Red, HMKP")
+            
+            # Dynamic Variety Dropdown based on actual dataset
+            filter_variety = st.multiselect("Variety / Color Tag", options=existing_varieties)
 
         with col2:
             st.markdown("**🥚 Spawn Filters**")
@@ -36,7 +60,7 @@ def render_search_page():
 
         with col3:
             st.markdown("**🪣 Container & Date Filters**")
-            filter_tank_type = st.text_input("Tank / Container Type", placeholder="e.g. Planggana, 6L Bottle, Glass")
+            filter_tank_type = st.multiselect("Tank / Container Type", options=existing_tank_types)
             filter_tank_status = st.multiselect("Container Status", ["Active", "Cleaning / Quarantine", "Empty / Idle", "Retired"])
             
             enable_dob_filter = st.checkbox("Filter by Date Range")
@@ -44,14 +68,6 @@ def render_search_page():
                 dob_range = st.date_input("Date Range (DOB / Spawn Date)", value=(datetime.date(2025, 1, 1), datetime.date.today()))
             else:
                 dob_range = None
-
-    # Load Data
-    breeders = get_all_breeders()
-    tanks = get_all_tanks()
-    try:
-        spawns = get_all_spawns()
-    except Exception:
-        spawns = []
 
     # --------------------------------------------------------------------------
     # 1. FILTER BREEDERS
@@ -67,14 +83,14 @@ def render_search_page():
         if filter_sex and b.get('sex', '').capitalize() not in filter_sex:
             continue
 
-        # Grade filter (Stored inside notes or a grade field if present)
+        # Grade filter
         if filter_grade:
             b_grade = b.get('grade', b.get('notes', ''))
             if not any(g.lower() in str(b_grade).lower() for g in filter_grade):
                 continue
 
-        # Variety filter
-        if filter_variety and filter_variety.lower() not in b.get('variety', '').lower():
+        # Dynamic Variety filter
+        if filter_variety and b.get('variety', '').strip() not in filter_variety:
             continue
 
         # Date of Birth Filter
@@ -90,7 +106,7 @@ def render_search_page():
     # --------------------------------------------------------------------------
     matching_spawns = []
     for s in spawns:
-        s_text = f"{s.get('id','')} {s.get('pair_name','')} {s.get('male_id','')} {s.get('female_id','')} {s.get('notes','')} {s.get('status','')}".lower()
+        s_text = f"{s.get('id','')} {s.get('pair_name','')} {s.get('male_id','')} {s.get('female_id','')} {s.get('variety','')} {s.get('notes','')} {s.get('status','')}".lower()
         if query and query not in s_text:
             continue
 
@@ -99,6 +115,10 @@ def render_search_page():
             s_type = s.get('batch_type', s.get('notes', ''))
             if not any(bt.lower() in str(s_type).lower() for bt in filter_batch_type):
                 continue
+
+        # Variety filter for Spawns
+        if filter_variety and s.get('variety', '').strip() not in filter_variety:
+            continue
 
         # Spawn Status filter
         if filter_spawn_status and s.get('status', '') not in filter_spawn_status:
@@ -121,8 +141,8 @@ def render_search_page():
         if query and query not in t_text:
             continue
 
-        # Tank Type filter
-        if filter_tank_type and filter_tank_type.lower() not in t.get('type', '').lower():
+        # Tank Type filter (Dynamic)
+        if filter_tank_type and t.get('type', '').strip() not in filter_tank_type:
             continue
 
         # Tank Status filter
