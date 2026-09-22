@@ -29,17 +29,17 @@ def format_spawns_sheet():
     if spawns_sheet_id is None:
         return
 
-    # 1. Define standard headers
+    # 1. Define standard headers (14 columns)
     headers = [
-        ["Spawn ID", "Male ID", "Female ID", "Pairing Date", "Status", 
-         "Batch Name", "Free Swim Date", "Fry Count", "Failure Reason", 
-         "Tank Location", "Line Goal", "Notes"]
+        ["Spawn ID", "Line Code", "Generation", "Male ID", "Female ID", 
+         "Pairing Date", "Status", "Batch Name", "Free Swim Date", 
+         "Fry Count", "Failure Reason", "Tank Location", "Line Goal", "Notes"]
     ]
 
     # Write headers to Row 1
     sheets_service.spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
-        range='Spawns!A1:L1',
+        range='Spawns!A1:N1',
         valueInputOption='USER_ENTERED',
         body={'values': headers}
     ).execute()
@@ -54,7 +54,7 @@ def format_spawns_sheet():
                     "startRowIndex": 0,
                     "endRowIndex": 1,
                     "startColumnIndex": 0,
-                    "endColumnIndex": 12
+                    "endColumnIndex": 14
                 },
                 "cell": {
                     "userEnteredFormat": {
@@ -77,14 +77,14 @@ def format_spawns_sheet():
                 "fields": "gridProperties.frozenRowCount"
             }
         },
-        # Align center for dates, status, IDs, tank location
+        # Align center for main data columns
         {
             "repeatCell": {
                 "range": {
                     "sheetId": spawns_sheet_id,
                     "startRowIndex": 1,
                     "startColumnIndex": 0,
-                    "endColumnIndex": 10
+                    "endColumnIndex": 12
                 },
                 "cell": {
                     "userEnteredFormat": {
@@ -109,7 +109,7 @@ def format_spawns_sheet():
         }
     ]
 
-    # Add Conditional Formatting Rules for Status (Col E)
+    # Add Conditional Formatting Rules for Status (Col G)
     status_rules = [
         ("In Pairing", {"red": 1.0, "green": 0.94, "blue": 0.8}, {"red": 0.6, "green": 0.4, "blue": 0.0}),
         ("Free Swimming", {"red": 0.85, "green": 0.95, "blue": 0.85}, {"red": 0.1, "green": 0.5, "blue": 0.2}),
@@ -124,8 +124,8 @@ def format_spawns_sheet():
                     "ranges": [{
                         "sheetId": spawns_sheet_id,
                         "startRowIndex": 1,
-                        "endColumnIndex": 5,
-                        "startColumnIndex": 4
+                        "endColumnIndex": 7,
+                        "startColumnIndex": 6
                     }],
                     "booleanRule": {
                         "condition": {
@@ -156,6 +156,50 @@ def format_spawns_sheet():
 def clean_text(text: str) -> str:
     """Strips special characters/emojis for reliable keyword matching."""
     return re.sub(r'[^\w\s]', '', str(text)).strip().lower()
+
+
+def generate_short_spawn_id():
+    """Generates sequential Spawn IDs in the format SPN-YY-XX (e.g. SPN-26-01)."""
+    all_spawns = get_all_spawns()
+    year_short = datetime.date.today().strftime("%y")
+    prefix = f"SPN-{year_short}-"
+    
+    current_year_spawns = [
+        s for s in all_spawns 
+        if str(s.get("id", "")).startswith(prefix)
+    ]
+    
+    next_num = len(current_year_spawns) + 1
+    return f"{prefix}{next_num:02d}"
+
+
+def calculate_child_generation(male_gen: str, female_gen: str, male_line: str, female_line: str):
+    """Calculates child line code and generation based on parent lineage rules."""
+    m_gen = (male_gen or "P1").strip().upper()
+    f_gen = (female_gen or "P1").strip().upper()
+    m_line = (male_line or "UNK").strip().upper()
+    f_line = (female_line or "UNK").strip().upper()
+
+    if m_line != f_line:
+        new_line = f"{m_line}x{f_line}"
+        return new_line, "F1 (Outcross)"
+
+    line_code = m_line
+
+    if m_gen == f_gen and m_gen.startswith("F"):
+        try:
+            curr_num = int(m_gen.replace("F", ""))
+            return line_code, f"F{curr_num + 1}"
+        except ValueError:
+            pass
+
+    if m_gen in ["P1", "F0"] and f_gen in ["P1", "F0"]:
+        return line_code, "F1"
+
+    if ("P1" in [m_gen, f_gen] or "F0" in [m_gen, f_gen]) and ("F1" in [m_gen, f_gen]):
+        return line_code, "BC1"
+
+    return line_code, f"{m_gen}x{f_gen}"
 
 
 def get_available_spawning_tanks():
@@ -227,7 +271,7 @@ def get_breeder_details_map():
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Breeders!A2:J'
+            range='Breeders!A2:L'
         ).execute()
 
         rows = result.get('values', [])
@@ -250,7 +294,9 @@ def get_breeder_details_map():
                 "grade": row[5] if len(row) > 5 else "N/A",
                 "photo_id": photo_val,
                 "image_url": photo_val,
-                "notes": row[7] if len(row) > 7 else ""
+                "notes": row[7] if len(row) > 7 else "",
+                "line_code": row[8] if len(row) > 8 else "UNK",
+                "generation": row[9] if len(row) > 9 else "P1"
             }
         return breeders_map
     except Exception:
@@ -263,7 +309,7 @@ def get_available_breeders():
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Breeders!A2:J'
+            range='Breeders!A2:L'
         ).execute()
 
         rows = result.get('values', [])
@@ -297,7 +343,7 @@ def get_all_spawns():
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Spawns!A2:L'
+            range='Spawns!A2:N'
         ).execute()
 
         rows = result.get('values', [])
@@ -310,17 +356,19 @@ def get_all_spawns():
             spawns.append({
                 "row_index": idx,
                 "id": row[0].strip() if len(row) > 0 else "",
-                "male_id": row[1].strip() if len(row) > 1 else "",
-                "female_id": row[2].strip() if len(row) > 2 else "",
-                "pairing_date": row[3].strip() if len(row) > 3 else "",
-                "status": row[4].strip() if len(row) > 4 else "In Pairing",
-                "batch_name": row[5].strip() if len(row) > 5 else "",
-                "free_swim_date": row[6].strip() if len(row) > 6 else "",
-                "fry_count": row[7].strip() if len(row) > 7 else "0",
-                "failure_reason": row[8].strip() if len(row) > 8 else "",
-                "tank": row[9].strip() if len(row) > 9 else "",
-                "line_goal": row[10].strip() if len(row) > 10 else "",
-                "notes": row[11].strip() if len(row) > 11 else ""
+                "line_code": row[1].strip() if len(row) > 1 else "",
+                "generation": row[2].strip() if len(row) > 2 else "",
+                "male_id": row[3].strip() if len(row) > 3 else "",
+                "female_id": row[4].strip() if len(row) > 4 else "",
+                "pairing_date": row[5].strip() if len(row) > 5 else "",
+                "status": row[6].strip() if len(row) > 6 else "In Pairing",
+                "batch_name": row[7].strip() if len(row) > 7 else "",
+                "free_swim_date": row[8].strip() if len(row) > 8 else "",
+                "fry_count": row[9].strip() if len(row) > 9 else "0",
+                "failure_reason": row[10].strip() if len(row) > 10 else "",
+                "tank": row[11].strip() if len(row) > 11 else "",
+                "line_goal": row[12].strip() if len(row) > 12 else "",
+                "notes": row[13].strip() if len(row) > 13 else ""
             })
         return spawns
     except Exception:
@@ -354,14 +402,27 @@ def get_active_pairings_with_details():
 # ==========================================
 
 def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goal="", notes=""):
-    """Appends clean 12-column spawn row under Spawns sheet and updates breeder/tank statuses."""
+    """Appends clean 14-column spawn row under Spawns sheet and updates breeder/tank statuses."""
     _, sheets_service = get_google_services()
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    spawn_id = f"SPN-{timestamp}"
+    breeders_map = get_breeder_details_map()
+
+    male_info = breeders_map.get(male_breeder_id, {})
+    female_info = breeders_map.get(female_breeder_id, {})
+
+    line_code, child_gen = calculate_child_generation(
+        male_gen=male_info.get("generation"),
+        female_gen=female_info.get("generation"),
+        male_line=male_info.get("line_code"),
+        female_line=female_info.get("line_code")
+    )
+
+    spawn_id = generate_short_spawn_id()
     pairing_date = datetime.date.today().isoformat()
 
     row = [
         spawn_id,
+        line_code,
+        child_gen,
         male_breeder_id,
         female_breeder_id,
         pairing_date,
@@ -377,7 +438,7 @@ def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goa
 
     sheets_service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range='Spawns!A1:L1',
+        range='Spawns!A1:N1',
         valueInputOption='USER_ENTERED',
         insertDataOption='INSERT_ROWS',
         body={'values': [row]}
@@ -391,7 +452,7 @@ def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goa
     if tank_location:
         _update_tank_status(sheets_service, tank_location, "Occupied", occupant=f"Spawn {spawn_id}")
 
-    return spawn_id
+    return spawn_id, line_code, child_gen
 
 
 # ==========================================
@@ -405,7 +466,7 @@ def mark_pairing_success_pending(spawn_id):
     if row_idx:
         sheets_service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f'Spawns!E{row_idx}',
+            range=f'Spawns!G{row_idx}',
             valueInputOption='USER_ENTERED',
             body={'values': [["Pending (Success)"]]}
         ).execute()
@@ -416,14 +477,14 @@ def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
     _, sheets_service = get_google_services()
     row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
-        male_id, female_id = spawn_data[1], spawn_data[2]
-        tank_location = spawn_data[9] if len(spawn_data) > 9 else ""
+        male_id, female_id = spawn_data[3], spawn_data[4]
+        tank_location = spawn_data[11] if len(spawn_data) > 11 else ""
         free_swim_date = datetime.date.today().isoformat()
 
         update_values = [["Free Swimming", batch_name, free_swim_date, est_fry_count]]
         sheets_service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f'Spawns!E{row_idx}:H{row_idx}',
+            range=f'Spawns!G{row_idx}:J{row_idx}',
             valueInputOption='USER_ENTERED',
             body={'values': update_values}
         ).execute()
@@ -439,17 +500,16 @@ def mark_pairing_failed(spawn_id, failure_reason):
     _, sheets_service = get_google_services()
     row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
-        male_id, female_id = spawn_data[1], spawn_data[2]
-        tank_location = spawn_data[9] if len(spawn_data) > 9 else ""
+        male_id, female_id = spawn_data[3], spawn_data[4]
+        tank_location = spawn_data[11] if len(spawn_data) > 11 else ""
 
-        # Batch update status and failure reason in one API request
         sheets_service.spreadsheets().values().batchUpdate(
             spreadsheetId=SPREADSHEET_ID,
             body={
                 'valueInputOption': 'USER_ENTERED',
                 'data': [
-                    {'range': f'Spawns!E{row_idx}', 'values': [["Failed"]]},
-                    {'range': f'Spawns!I{row_idx}', 'values': [[failure_reason]]}
+                    {'range': f'Spawns!G{row_idx}', 'values': [["Failed"]]},
+                    {'range': f'Spawns!K{row_idx}', 'values': [[failure_reason]]}
                 ]
             }
         ).execute()
@@ -467,11 +527,11 @@ def update_spawn_details(spawn_id, batch_name=None, fry_count=None, status=None,
     if not row_idx:
         return False
 
-    current_status = spawn_data[4] if len(spawn_data) > 4 else "In Pairing"
-    current_batch = spawn_data[5] if len(spawn_data) > 5 else ""
-    current_fry = spawn_data[7] if len(spawn_data) > 7 else "0"
-    current_goal = spawn_data[10] if len(spawn_data) > 10 else ""
-    current_notes = spawn_data[11] if len(spawn_data) > 11 else ""
+    current_status = spawn_data[6] if len(spawn_data) > 6 else "In Pairing"
+    current_batch = spawn_data[7] if len(spawn_data) > 7 else ""
+    current_fry = spawn_data[9] if len(spawn_data) > 9 else "0"
+    current_goal = spawn_data[12] if len(spawn_data) > 12 else ""
+    current_notes = spawn_data[13] if len(spawn_data) > 13 else ""
 
     new_status = status if status is not None else current_status
     new_batch = batch_name if batch_name is not None else current_batch
@@ -479,15 +539,14 @@ def update_spawn_details(spawn_id, batch_name=None, fry_count=None, status=None,
     new_goal = line_goal if line_goal is not None else current_goal
     new_notes = notes if notes is not None else current_notes
 
-    # Single batch update across all targeted ranges
     sheets_service.spreadsheets().values().batchUpdate(
         spreadsheetId=SPREADSHEET_ID,
         body={
             'valueInputOption': 'USER_ENTERED',
             'data': [
-                {'range': f'Spawns!E{row_idx}:F{row_idx}', 'values': [[new_status, new_batch]]},
-                {'range': f'Spawns!H{row_idx}', 'values': [[new_fry]]},
-                {'range': f'Spawns!K{row_idx}:L{row_idx}', 'values': [[new_goal, new_notes]]}
+                {'range': f'Spawns!G{row_idx}:H{row_idx}', 'values': [[new_status, new_batch]]},
+                {'range': f'Spawns!J{row_idx}', 'values': [[new_fry]]},
+                {'range': f'Spawns!M{row_idx}:N{row_idx}', 'values': [[new_goal, new_notes]]}
             ]
         }
     ).execute()
@@ -503,7 +562,7 @@ def _find_spawn_by_id(sheets_service, spawn_id):
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Spawns!A2:L'
+            range='Spawns!A2:N'
         ).execute()
         rows = result.get('values', [])
         for idx, row in enumerate(rows, start=2):
@@ -537,10 +596,6 @@ def _update_breeder_status(sheets_service, breeder_id, new_status):
 
 
 def _update_tank_status(sheets_service, tank_identifier, new_status, occupant=None):
-    """
-    Updates tank status (and optionally occupant) in Tanks sheet matching
-    either Tank ID or Location string.
-    """
     if not tank_identifier:
         return
     try:
