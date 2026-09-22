@@ -64,7 +64,7 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
 
     return file_id
 
-def register_tank(tank_type, location, capacity_liters, photo_file=None, current_occupant="", notes=""):
+def register_tank(tank_type, location, capacity_liters, purpose="General / Multi-purpose", photo_file=None, current_occupant="", notes=""):
     """
     1. Generates a unique Tank ID upon submission.
     2. Uploads container photo (if provided) and QR Tag to Google Drive.
@@ -104,16 +104,17 @@ def register_tank(tank_type, location, capacity_liters, photo_file=None, current
         location,              # C: Tape Code / Location Tag
         capacity_liters,       # D: Capacity (Liters)
         "Active",              # E: Status
-        current_occupant,      # F: Current Occupant
-        photo_id,              # G: Photo Drive ID
-        qr_id,                 # H: QR Code Drive ID
-        notes,                 # I: Notes
-        date_registered        # J: Date Registered
+        purpose,               # F: Container Purpose / Usage
+        current_occupant,      # G: Current Occupant ID
+        photo_id,              # H: Photo Drive ID
+        qr_id,                 # I: QR Code Drive ID
+        notes,                 # J: Notes
+        date_registered        # K: Date Registered
     ]
 
     sheets_service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
-        range='Tanks!A:J',
+        range='Tanks!A:K',
         valueInputOption='USER_ENTERED',
         body={'values': [row]}
     ).execute()
@@ -135,7 +136,7 @@ def get_all_tanks():
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range='Tanks!A2:J'
+            range='Tanks!A2:K'
         ).execute()
 
         rows = result.get('values', [])
@@ -144,7 +145,7 @@ def get_all_tanks():
         for row in rows:
             if not row:
                 continue
-            while len(row) < 10:
+            while len(row) < 11:
                 row.append("")
 
             tanks.append({
@@ -153,11 +154,12 @@ def get_all_tanks():
                 "location": str(row[2]),
                 "capacity": str(row[3]),
                 "status": str(row[4]) if row[4] else "Active",
-                "occupant": str(row[5]),
-                "photo_id": str(row[6]),
-                "qr_id": str(row[7]),
-                "notes": str(row[8]),
-                "date_registered": str(row[9])
+                "purpose": str(row[5]) if row[5] else "General / Multi-purpose",
+                "occupant": str(row[6]),
+                "photo_id": str(row[7]),
+                "qr_id": str(row[8]),
+                "notes": str(row[9]),
+                "date_registered": str(row[10])
             })
 
         return tanks
@@ -165,15 +167,15 @@ def get_all_tanks():
         print(f"Error fetching tanks: {e}")
         return []
 
-def update_tank_status(tank_id: str, new_status: str, occupant: str = "", notes: str = "") -> bool:
-    """Updates tank status, current occupant, or notes."""
+def update_tank_status(tank_id: str, new_status: str, purpose: str = "", occupant: str = "", notes: str = "") -> bool:
+    """Updates tank status, purpose, current occupant, or notes."""
     try:
         drive_service, sheets_service = get_google_services()
         spreadsheet_id = get_spreadsheet_id()
 
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range='Tanks!A:J'
+            range='Tanks!A:K'
         ).execute()
 
         rows = result.get('values', [])
@@ -189,14 +191,14 @@ def update_tank_status(tank_id: str, new_status: str, occupant: str = "", notes:
 
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f'Tanks!E{target_row}:F{target_row}',
+            range=f'Tanks!E{target_row}:G{target_row}',
             valueInputOption='USER_ENTERED',
-            body={'values': [[new_status, occupant]]}
+            body={'values': [[new_status, purpose, occupant]]}
         ).execute()
 
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f'Tanks!I{target_row}',
+            range=f'Tanks!J{target_row}',
             valueInputOption='USER_ENTERED',
             body={'values': [[notes]]}
         ).execute()
