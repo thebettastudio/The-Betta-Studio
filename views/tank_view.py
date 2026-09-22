@@ -1,9 +1,11 @@
 # views/tank_view.py
+import re
 import streamlit as st
 from modules.tank_registry import (
     register_tank,
     get_all_tanks,
-    update_tank_status
+    update_tank_status,
+    delete_tank
 )
 from modules.breeder_registry import get_available_breeders
 
@@ -29,6 +31,18 @@ CONTAINER_PURPOSES = [
     "🛒 Sales / Grooming Display",
     "📦 General / Multi-purpose Storage"
 ]
+
+def clean_text_for_matching(text: str) -> str:
+    """Strips special characters and emojis for reliable index matching."""
+    return re.sub(r'[^\w\s]', '', text).strip().lower()
+
+def get_purpose_index(stored_purpose: str) -> int:
+    """Matches stored purpose string against CONTAINER_PURPOSES safely."""
+    clean_stored = clean_text_for_matching(stored_purpose)
+    for idx, purpose in enumerate(CONTAINER_PURPOSES):
+        if clean_text_for_matching(purpose) in clean_stored or clean_stored in clean_text_for_matching(purpose):
+            return idx
+    return 0
 
 def render_tank_page():
     st.title("🪣 Tank & Container Registry")
@@ -71,12 +85,12 @@ def render_tank_page():
             submit = st.form_submit_button("🏷️ Register Container & Generate Tape Tag")
 
         if submit:
-            final_type = custom_type.strip() if selected_type == "➕ Other / Custom Container..." else selected_type
-            occupant_id = "" if selected_occupant == "None (Empty)" else selected_occupant.split(" | ")[0]
-
-            if not final_type:
-                st.error("Please specify a container type.")
+            if selected_type == "➕ Other / Custom Container..." and not custom_type.strip():
+                st.error("Please enter a custom container name.")
             else:
+                final_type = custom_type.strip() if selected_type == "➕ Other / Custom Container..." else selected_type
+                occupant_id = "" if selected_occupant == "None (Empty)" else selected_occupant.split(" | ")[0]
+
                 with st.spinner("Generating Tape Tag & registering container..."):
                     res = register_tank(
                         tank_type=final_type,
@@ -109,7 +123,6 @@ def render_tank_page():
         if not tanks:
             st.info("No containers registered yet.")
         else:
-            # Availability & Search Filters
             f_col1, f_col2 = st.columns([1, 2])
 
             with f_col1:
@@ -165,7 +178,6 @@ def render_tank_page():
 
                     with cols[idx % 3]:
                         with st.container(border=True):
-                            # Display photo if uploaded
                             if t.get('photo_id'):
                                 st.image(f"https://drive.google.com/thumbnail?id={t['photo_id']}&sz=w800", use_container_width=True)
 
@@ -185,9 +197,9 @@ def render_tank_page():
 
                             st.divider()
 
-                            # Update Container Popover
-                            with st.popover("⚙️ Update Container", use_container_width=True):
-                                # Dynamic Occupant Dropdown (includes current occupant + unassigned fish)
+                            # UPDATE & DELETE POPOVER
+                            with st.popover("⚙️ Update / Remove", use_container_width=True):
+                                st.markdown("#### 📝 Edit Details")
                                 update_options = ["None (Empty)"]
                                 if curr_occ:
                                     update_options.append(f"{curr_occ} (Current Occupant)")
@@ -211,10 +223,7 @@ def render_tank_page():
                                     key=f"status_{tank_id}"
                                 )
                                 
-                                try:
-                                    curr_p_idx = CONTAINER_PURPOSES.index(t['purpose'])
-                                except (ValueError, KeyError):
-                                    curr_p_idx = 0
+                                curr_p_idx = get_purpose_index(t.get('purpose', ''))
 
                                 new_purpose = st.selectbox(
                                     "Container Purpose",
@@ -225,8 +234,7 @@ def render_tank_page():
 
                                 new_notes = st.text_area("Notes", value=t.get('notes', ''), key=f"notes_{tank_id}")
 
-                                if st.button("Save Changes", key=f"save_{tank_id}", type="primary"):
-                                    # Derive final occupant ID string
+                                if st.button("💾 Save Changes", key=f"save_{tank_id}", type="primary", use_container_width=True):
                                     if selected_occ_opt == "None (Empty)":
                                         final_occ = ""
                                     elif "(Current Occupant)" in selected_occ_opt:
@@ -237,3 +245,35 @@ def render_tank_page():
                                     if update_tank_status(tank_id, new_status, new_purpose, final_occ, new_notes):
                                         st.success("Updated!")
                                         st.rerun()
+
+                                # DELETE / REMOVE SECTION
+                                st.divider()
+                                st.markdown("#### 🗑️ Remove Container")
+                                
+                                delete_reason = st.selectbox(
+                                    "Reason for Removal",
+                                    [
+                                        "Error in Registration / Duplicate Entry",
+                                        "Damaged / Cracked / Leaking",
+                                        "Lost / Misplaced Container",
+                                        "Permanently Retired from Service"
+                                    ],
+                                    key=f"del_reason_{tank_id}"
+                                )
+
+                                confirm_delete = st.checkbox(
+                                    "I confirm I want to permanently delete this container.",
+                                    key=f"del_confirm_{tank_id}"
+                                )
+
+                                if st.button(
+                                    "🔥 Delete Container Permanently",
+                                    key=f"del_btn_{tank_id}",
+                                    type="secondary",
+                                    disabled=not confirm_delete,
+                                    use_container_width=True
+                                ):
+                                    with st.spinner("Deleting record..."):
+                                        if delete_tank(tank_id):
+                                            st.success(f"Container {t['location']} removed successfully!")
+                                            st.rerun()
