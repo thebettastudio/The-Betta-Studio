@@ -1,5 +1,6 @@
 import io
 import datetime
+import pandas as pd
 import streamlit as st
 
 # Import Drive & Sheets services
@@ -57,7 +58,6 @@ def generate_next_fish_id(sheets_service) -> str:
         for r in rows:
             if r and r[0].strip():
                 raw_id = r[0].strip()
-                # Handle numeric IDs or strip potential legacy 'FISH-' prefixes
                 val_str = raw_id.replace("FISH-", "").strip()
                 if val_str.isdigit():
                     max_id = max(max_id, int(val_str))
@@ -89,10 +89,7 @@ def get_registered_strains(sheets_service):
         rows = res.get('values', [])
         strains = [r[0] for r in rows if r and r[0].strip()]
         
-        # Combine default and sheet strains
         all_strains = set(default_strains + strains)
-        
-        # Exclude strains stored in session state for dynamic removals
         removed_strains = st.session_state.get("removed_strains_list", set())
         active_strains = [s for s in all_strains if s not in removed_strains]
         
@@ -195,6 +192,33 @@ def get_available_tanks(sheets_service):
         ]
 
 
+def get_all_fish_records(sheets_service):
+    """Fetch all registered fish from 'Fish_Master' sheet."""
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Fish_Master!A1:J'
+        ).execute()
+        rows = res.get('values', [])
+        if not rows or len(rows) < 2:
+            return pd.DataFrame(columns=[
+                "Fish ID", "Variety / Strain", "Gender", "Grade", 
+                "Tank ID", "Seller", "Purchase Date", "Purchase Cost", 
+                "Image URL", "Notes"
+            ])
+        
+        headers = rows[0]
+        data = rows[1:]
+        
+        # Pad shorter rows if any columns were omitted in Google Sheets
+        padded_data = [r + [""] * (len(headers) - len(r)) for r in data]
+        df = pd.DataFrame(padded_data, columns=headers)
+        return df
+    except Exception as e:
+        st.error(f"Error reading Fish Master database: {e}")
+        return pd.DataFrame()
+
+
 def upload_image_to_drive(drive_service, image_bytes, filename_prefix="fish_"):
     """Upload photo bytes to Google Drive and return public file ID / URL."""
     from googleapiclient.http import MediaIoBaseUpload
@@ -259,20 +283,18 @@ def render_fish_registry_page():
     # Tabs for Registration and View Registry
     tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
 
+    # ==========================================================================
+    # TAB 1: REGISTER NEW FISH
+    # ==========================================================================
     with tab_register:
         st.subheader("🛒 Purchased / Imported Fish Details")
 
-        # Get Next Sequential Fish ID
         ensure_fish_master_sheet_exists(sheets_service)
         next_fish_id = generate_next_fish_id(sheets_service)
         st.info(f"📌 Next Assigned Fish ID: **#{next_fish_id}**")
 
-        # Fetch existing active strains from Google Sheets DB
         strains_list = get_registered_strains(sheets_service)
 
-        # ----------------------------------------------------------------------
-        # Manage Strains Popover (Add & Remove Strains)
-        # ----------------------------------------------------------------------
         strain_col_select, strain_col_btn = st.columns([4, 1])
         
         with strain_col_btn:
@@ -319,9 +341,6 @@ def render_fish_registry_page():
                 key="select_strain_dropdown"
             )
 
-        # ----------------------------------------------------------------------
-        # Registration Form
-        # ----------------------------------------------------------------------
         with st.form("register_fish_form", clear_on_submit=False):
             col1, col2 = st.columns(2)
 
@@ -350,7 +369,6 @@ def render_fish_registry_page():
 
             st.divider()
 
-            # Form Evaluation Criteria Checklist & Body Shape
             st.markdown("### 🏆 Form Evaluation Criteria")
             
             chk_col, shape_col = st.columns([3, 2])
@@ -385,7 +403,6 @@ def render_fish_registry_page():
 
             st.divider()
 
-            # Photo Capture / Upload & Fallback URL
             st.markdown("##### 📷 Fish Photo Capture / Upload")
             
             img_col1, img_col2 = st.columns(2)
@@ -399,12 +416,9 @@ def render_fish_registry_page():
 
             submit = st.form_submit_button("💾 Register Fish", use_container_width=True)
 
-        # Handle Form Submission Logic
         if submit:
-            # Re-verify latest sequential ID before submission
             assigned_fish_id = generate_next_fish_id(sheets_service)
 
-            # Handle Image Upload to Google Drive
             final_image_val = manual_image_url
             photo_bytes = None
             if camera_photo is not None:
@@ -421,12 +435,10 @@ def render_fish_registry_page():
                     except Exception as err:
                         st.error(f"Image upload failed: {err}")
 
-            # Selected Tank ID
             selected_tank_id = selected_tank_str.split(" (")[0] if selected_tank_str != "No Available Tanks" else ""
 
-            # Prepare row data for Google Sheets
             new_fish_record = [
-                assigned_fish_id,  # Clean simple integer ID (1, 2, 3...)
+                assigned_fish_id,
                 f"{form_type} - {selected_strain}",
                 gender,
                 computed_grade,
@@ -452,5 +464,72 @@ def render_fish_registry_page():
             except Exception as e:
                 st.error(f"Error saving fish record: {e}")
 
+    # ==========================================================================
+    # TAB 2: FISH LIST & DATABASE
+    # ==========================================================================
     with tab_view:
-        st.write("Displaying registered fish list from `Fish_Master` worksheet...")
+        st.subheader("📋 Registered Fish Database")
+        
+        df = get_all_fish_records(sheets_service)
+
+        if df.empty:
+            st.info("No fish records found in `Fish_Master`. Register your first fish above!")
+            return
+
+        # Metrics Overview Row
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Registered", len(df))
+        m2.metric("Males", len(df[df["Gender"] == "Male"]))
+        m3.metric("Females", len(df[df["Gender"] == "Female"]))
+        m4.metric("Show/High Grade", len(df[df["Grade"].isin(["Show Grade", "High Grade"])]))
+
+        st.divider()
+
+        # Filters Bar
+        st.markdown("##### 🔍 Filter Database")
+        f_col1, f_col2, f_col3 = st.columns(3)
+
+        with f_col1:
+            gender_filter = st.multiselect(
+                "Filter Gender",
+                options=list(df["Gender"].unique()) if "Gender" in df else [],
+                default=[]
+            )
+
+        with f_col2:
+            grade_filter = st.multiselect(
+                "Filter Grade",
+                options=list(df["Grade"].unique()) if "Grade" in df else [],
+                default=[]
+            )
+
+        with f_col3:
+            strain_filter = st.multiselect(
+                "Filter Strain / Variety",
+                options=list(df["Variety / Strain"].unique()) if "Variety / Strain" in df else [],
+                default=[]
+            )
+
+        # Apply Filters
+        filtered_df = df.copy()
+        if gender_filter:
+            filtered_df = filtered_df[filtered_df["Gender"].isin(gender_filter)]
+        if grade_filter:
+            filtered_df = filtered_df[filtered_df["Grade"].isin(grade_filter)]
+        if strain_filter:
+            filtered_df = filtered_df[filtered_df["Variety / Strain"].isin(strain_filter)]
+
+        # Interactive Data Table with Image Previews
+        st.dataframe(
+            filtered_df,
+            column_config={
+                "Fish ID": st.column_config.TextColumn("Fish ID", help="Numeric Parent ID (1, 2, 3...)"),
+                "Image URL": st.column_config.ImageColumn("Photo Preview", help="Uploaded Drive Image"),
+                "Purchase Cost": st.column_config.NumberColumn("Cost (₱)", format="₱%.2f"),
+                "Notes": st.column_config.TextColumn("Notes", width="large"),
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(f"Showing {len(filtered_df)} of {len(df)} records.")
