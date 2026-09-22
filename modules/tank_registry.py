@@ -1,3 +1,4 @@
+# modules/tank_registry.py
 import io
 import random
 import datetime
@@ -10,20 +11,12 @@ from modules.drive_service import (
     get_drive_folder_id
 )
 
-HEADER_ROW = [
-    "System ID", "Tank Type", "Tape Code", "Capacity (Liters)",
-    "Status", "Purpose", "Current Occupant", "Photo Drive ID",
-    "QR Drive ID", "Notes", "Date Registered"
-]
-
 def ensure_tanks_tab_exists(sheets_service, spreadsheet_id: str) -> None:
-    """Ensures the 'Tanks' worksheet tab exists with proper headers in Google Sheets."""
+    """
+    Ensures the 'Tanks' worksheet tab exists with proper headers in Google Sheets.
+    """
     try:
-        sheet_metadata = sheets_service.spreadsheets().get(
-            spreadsheetId=spreadsheet_id, 
-            fields="sheets.properties.title"
-        ).execute()
-        
+        sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         sheets = sheet_metadata.get('sheets', [])
         sheet_titles = [s['properties']['title'] for s in sheets]
 
@@ -41,23 +34,28 @@ def ensure_tanks_tab_exists(sheets_service, spreadsheet_id: str) -> None:
                 body=body
             ).execute()
 
-        # 2. Add header row if top-left cell is empty
+        # 2. Add header row if empty
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range='Tanks!A1:K1'
         ).execute()
 
         headers = result.get('values', [])
-        if not headers or not headers[0]:
+        if not headers:
+            header_row = [
+                "System ID", "Tank Type", "Tape Code", "Capacity (Liters)",
+                "Status", "Purpose", "Current Occupant", "Photo Drive ID",
+                "QR Drive ID", "Notes", "Date Registered"
+            ]
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range='Tanks!A1:K1',
                 valueInputOption='USER_ENTERED',
-                body={'values': [HEADER_ROW]}
+                body={'values': [header_row]}
             ).execute()
 
     except Exception as e:
-        st.warning(f"Note on sheet initialization: {e}")
+        print(f"Warning: Failed during ensure_tanks_tab_exists execution: {e}")
 
 def get_next_tank_id(sheets_service, spreadsheet_id: str) -> str:
     """Fetches existing IDs to compute the next sequential integer ID."""
@@ -71,27 +69,38 @@ def get_next_tank_id(sheets_service, spreadsheet_id: str) -> str:
         max_id = 0
 
         for row in rows:
-            if row and str(row[0]).strip().isdigit():
-                max_id = max(max_id, int(row[0].strip()))
+            if row and row[0]:
+                val = str(row[0]).strip()
+                if val.isdigit():
+                    max_id = max(max_id, int(val))
 
         return str(max_id + 1)
     except Exception as e:
         print(f"Error fetching next tank ID: {e}")
         return "1"
 
-def generate_tape_code(tank_type: str) -> str:
-    """Generates a short code for painter's tape labeling."""
-    type_upper = tank_type.upper()
-    if any(k in type_upper for k in ["GROW-OUT", "PLANGGANA"]):
-        prefix = "GO"
-    elif "SPAWNING" in type_upper:
+def generate_tape_code(tank_type: str, purpose: str = "") -> str:
+    """
+    Generates a short code for painter's tape labeling.
+    Checks purpose and type together to ensure roles like Spawning take priority.
+    """
+    combined_text = f"{tank_type} {purpose}".upper()
+    
+    # 1. Check for Spawning or Breeding FIRST
+    if any(k in combined_text for k in ["SPAWNING", "BREEDING", "SPAWN"]):
         prefix = "SPN"
-    elif any(k in type_upper for k in ["JAR", "EMPI", "BOTTLE"]):
+    # 2. Check for explicit Grow-Out containers
+    elif "GROW-OUT" in combined_text or "GROW OUT" in combined_text:
+        prefix = "GO"
+    elif any(k in combined_text for k in ["JAR", "EMPI", "BOTTLE"]):
         prefix = "JAR"
-    elif "SORORITY" in type_upper:
+    elif "SORORITY" in combined_text:
         prefix = "SOR"
-    elif "QUARANTINE" in type_upper:
+    elif "QUARANTINE" in combined_text:
         prefix = "QT"
+    # 3. Fallback prefix for Plangana/Planggana basins without Spawning role
+    elif "PLANGGANA" in combined_text or "PLANGANA" in combined_text:
+        prefix = "PLG"
     else:
         prefix = "TNK"
 
@@ -153,14 +162,7 @@ def upload_to_drive(drive_service, file_data, file_name: str, mime_type: str) ->
 
     return file_id
 
-def register_tank(
-    tank_type: str, 
-    capacity_liters: float, 
-    purpose: str = "General / Multi-purpose", 
-    photo_file=None, 
-    current_occupant: str = "", 
-    notes: str = ""
-) -> dict:
+def register_tank(tank_type: str, capacity_liters: float, purpose: str = "General / Multi-purpose", photo_file=None, current_occupant: str = "", notes: str = "") -> dict:
     """
     Registers a new container, auto-syncs status based on occupant presence, 
     uploads media (photo & QR) to Google Drive, and writes to Google Sheets.
@@ -171,7 +173,8 @@ def register_tank(
     ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
 
     tank_id = get_next_tank_id(sheets_service, spreadsheet_id)
-    location_code = generate_tape_code(tank_type)
+    # Passed both tank_type and purpose so Spawning gets prioritized as SPN
+    location_code = generate_tape_code(tank_type, purpose)
 
     # Auto-determine status based on occupant presence
     status = "Active" if current_occupant.strip() else "Empty / Idle"
@@ -234,25 +237,23 @@ def get_all_tanks() -> list:
         tanks = []
 
         for row in rows:
-            if not row:
+            if not row or len(row) == 0:
                 continue
-
-            # Safely fetch cell by index without array overflow
-            def get_cell(idx: int, default: str = "") -> str:
-                return str(row[idx]) if idx < len(row) and row[idx] is not None else default
+            while len(row) < 11:
+                row.append("")
 
             tanks.append({
-                "id": get_cell(0),
-                "type": get_cell(1),
-                "location": get_cell(2),
-                "capacity": get_cell(3),
-                "status": get_cell(4, "Empty / Idle"),
-                "purpose": get_cell(5, "General / Multi-purpose"),
-                "occupant": get_cell(6),
-                "photo_id": get_cell(7),
-                "qr_id": get_cell(8),
-                "notes": get_cell(9),
-                "date_registered": get_cell(10)
+                "id": str(row[0]),
+                "type": str(row[1]),
+                "location": str(row[2]),
+                "capacity": str(row[3]),
+                "status": str(row[4]) if row[4] else "Empty / Idle",
+                "purpose": str(row[5]) if row[5] else "General / Multi-purpose",
+                "occupant": str(row[6]),
+                "photo_id": str(row[7]),
+                "qr_id": str(row[8]),
+                "notes": str(row[9]),
+                "date_registered": str(row[10])
             })
 
         return tanks
@@ -263,7 +264,8 @@ def get_all_tanks() -> list:
 def update_tank_status(tank_id: str, new_status: str, purpose: str = "", occupant: str = "", notes: str = "") -> bool:
     """
     Locates tank row by ID and updates status, purpose, occupant, and notes across the 11-column schema.
-    Auto-syncs status based on occupant status.
+    Auto-syncs status to 'Active' if an occupant is assigned and status was 'Empty / Idle'.
+    Auto-syncs status to 'Empty / Idle' if occupant is removed and status was 'Active'.
     """
     try:
         drive_service, sheets_service = get_google_services()
@@ -273,14 +275,14 @@ def update_tank_status(tank_id: str, new_status: str, purpose: str = "", occupan
 
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range='Tanks!A:A'
+            range='Tanks!A:K'
         ).execute()
 
         rows = result.get('values', [])
         target_row = None
 
         for idx, row in enumerate(rows):
-            if row and str(row[0]).strip() == str(tank_id).strip():
+            if row and len(row) > 0 and str(row[0]).strip() == str(tank_id).strip():
                 target_row = idx + 1
                 break
 
