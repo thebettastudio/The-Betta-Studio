@@ -48,29 +48,25 @@ def render_tank_page():
                 if selected_type == "➕ Other / Custom Container...":
                     custom_type = st.text_input("Enter Custom Container Name", placeholder="e.g. 20L Storage Box, Styro Box, etc.")
 
-                location_code = st.text_input("Tape / Location Tag *", placeholder="e.g. GO-01, ST-01, B6L-03, Rack 1")
                 capacity = st.number_input("Capacity (Liters)", min_value=0.1, max_value=500.0, value=6.0, step=0.5)
+                purpose = st.selectbox("Container Purpose / Role", CONTAINER_PURPOSES)
 
             with col2:
-                purpose = st.selectbox("Container Purpose / Role", CONTAINER_PURPOSES)
                 occupant = st.text_input("Current Occupant ID (Optional)", placeholder="e.g. BRD-M-20260920 or Spawn #001")
                 photo_file = st.file_uploader("📷 Container Photo (Optional)", type=["jpg", "jpeg", "png"])
                 notes = st.text_area("Notes / Setup Details", placeholder="e.g. Almond leaf tea water, sponge filter installed")
 
-            submit = st.form_submit_button("🏷️ Submit & Generate Tank ID")
+            submit = st.form_submit_button("🏷️ Register Container & Generate Tape Tag")
 
         if submit:
             final_type = custom_type.strip() if selected_type == "➕ Other / Custom Container..." else selected_type
 
             if not final_type:
                 st.error("Please specify a container type.")
-            elif not location_code:
-                st.error("Please provide a Tape Code or Location Tag (e.g. GO-01).")
             else:
-                with st.spinner("Uploading photo & generating Tank ID..."):
+                with st.spinner("Generating Tape Tag & registering container..."):
                     res = register_tank(
                         tank_type=final_type,
-                        location=location_code,
                         capacity_liters=capacity,
                         purpose=purpose,
                         photo_file=photo_file,
@@ -78,8 +74,16 @@ def render_tank_page():
                         notes=notes
                     )
 
-                st.success(f"Container Registered! Assigned System ID: **{res['tank_id']}**")
-                st.info(f"🏷️ **Tape Label Code:** Write `{location_code}` on painter's tape and attach it to your {final_type}.")
+                st.success("Container Successfully Registered!")
+                
+                # Display prominent tape code box to write on physical tank
+                st.markdown(f"""
+                <div style="background-color: #FEF3C7; border: 2px dashed #D97706; padding: 16px; border-radius: 12px; text-align: center; margin: 12px 0;">
+                    <span style="font-size: 14px; color: #92400E; font-weight: bold; text-transform: uppercase;">✍️ WRITE THIS ON PAINTER'S TAPE:</span>
+                    <h1 style="font-size: 42px; color: #B45309; margin: 8px 0; font-family: monospace; letter-spacing: 2px;">{res['location_code']}</h1>
+                    <span style="font-size: 12px; color: #B45309;">System ID: {res['tank_id']}</span>
+                </div>
+                """, unsafe_allow_html=True)
 
                 if res.get("direct_photo_url"):
                     st.image(res["direct_photo_url"], caption="Uploaded Container Photo", width=250)
@@ -138,7 +142,6 @@ def render_tank_page():
                                 key=f"status_{tank_id}"
                             )
                             
-                            # Purpose index matching safely
                             try:
                                 curr_p_idx = CONTAINER_PURPOSES.index(t['purpose'])
                             except ValueError:
