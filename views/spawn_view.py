@@ -13,7 +13,10 @@ from modules.spawn_manager import (
     mark_free_swimming,
     mark_pairing_failed,
     update_spawn_details,
-    format_spawns_sheet
+    format_spawns_sheet,
+    generate_short_spawn_id,
+    calculate_child_generation,
+    get_breeder_details_map
 )
 
 def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
@@ -122,6 +125,8 @@ def render_spawn_page():
                 spawn_id = spawn["id"]
                 status = spawn["status"]
                 pairing_date = spawn["pairing_date"]
+                line_code = spawn.get("line_code", "N/A")
+                generation = spawn.get("generation", "N/A")
 
                 try:
                     days_paired = (datetime.date.today() - datetime.date.fromisoformat(pairing_date)).days
@@ -131,7 +136,7 @@ def render_spawn_page():
                 with st.container(border=True):
                     col_title, col_edit = st.columns([4, 1])
                     with col_title:
-                        st.markdown(f"### 🧪 Spawn: `{spawn_id}`")
+                        st.markdown(f"### 🧪 Spawn: `{spawn_id}` | Line: `{line_code}` (`{generation}`)")
                     with col_edit:
                         # Edit details popover
                         with st.popover("✏️ Edit Spawn", use_container_width=True):
@@ -163,6 +168,7 @@ def render_spawn_page():
                         st.markdown(f"**ID:** `{male.get('id', spawn['male_id'])}`")
                         st.markdown(f"**Variety:** {male.get('variety', 'N/A')}")
                         st.markdown(f"**Grade:** `{male.get('grade', 'N/A')}`")
+                        st.markdown(f"**Line:** `{male.get('line_code', 'UNK')}` (`{male.get('generation', 'P1')}`)")
 
                     # --- Column 2: Male Picture ---
                     with col_m_img:
@@ -181,6 +187,7 @@ def render_spawn_page():
                         st.markdown(f"**ID:** `{female.get('id', spawn['female_id'])}`")
                         st.markdown(f"**Variety:** {female.get('variety', 'N/A')}")
                         st.markdown(f"**Grade:** `{female.get('grade', 'N/A')}`")
+                        st.markdown(f"**Line:** `{female.get('line_code', 'UNK')}` (`{female.get('generation', 'P1')}`)")
 
                     # --- Column 4: Female Picture ---
                     with col_f_img:
@@ -237,45 +244,67 @@ def render_spawn_page():
         
         males, females = get_available_breeders()
         available_tanks = get_available_spawning_tanks()
+        breeders_map = get_breeder_details_map()
 
         if not males or not females:
             st.warning("⚠️ You need at least one Available/Conditioning Male AND Female breeder to create a pair.")
         else:
-            with st.form("new_pairing_form", clear_on_submit=True):
-                col1, col2 = st.columns(2)
+            col1, col2 = st.columns(2)
 
-                with col1:
-                    male_options = {m["label"]: m["id"] for m in males}
-                    selected_male_label = st.selectbox("Select Male Breeder", list(male_options.keys()))
-                    male_id = male_options[selected_male_label]
+            with col1:
+                male_options = {m["label"]: m["id"] for m in males}
+                selected_male_label = st.selectbox("Select Male Breeder", list(male_options.keys()))
+                male_id = male_options[selected_male_label]
 
-                    # Tank Search & Selection
-                    if available_tanks:
-                        tank_options = {t["label"]: t["id"] for t in available_tanks}
-                        selected_tank_label = st.selectbox("Select Spawning Tank", list(tank_options.keys()))
-                        tank_location = tank_options[selected_tank_label]
-                    else:
-                        st.error("⚠️ No available Spawning Tanks. Free up a tank or mark one as Available.")
-                        tank_location = None
+                if available_tanks:
+                    tank_options = {t["label"]: t["id"] for t in available_tanks}
+                    selected_tank_label = st.selectbox("Select Spawning Tank", list(tank_options.keys()))
+                    tank_location = tank_options[selected_tank_label]
+                else:
+                    st.error("⚠️ No available Spawning Tanks. Free up a tank or mark one as Available.")
+                    tank_location = None
 
-                with col2:
-                    female_options = {f["label"]: f["id"] for f in females}
-                    selected_female_label = st.selectbox("Select Female Breeder", list(female_options.keys()))
-                    female_id = female_options[selected_female_label]
+            with col2:
+                female_options = {f["label"]: f["id"] for f in females}
+                selected_female_label = st.selectbox("Select Female Breeder", list(female_options.keys()))
+                female_id = female_options[selected_female_label]
 
-                    line_goal = st.text_input("Line / Breeding Goal", placeholder="e.g. Improve caudal spread & clean dorsal")
+                line_goal = st.text_input("Line / Breeding Goal", placeholder="e.g. Improve caudal spread & clean dorsal")
 
-                notes = st.text_area("Pairing Notes", placeholder="e.g. Both pre-conditioned for 7 days on bloodworms")
-                
-                submit_pair = st.form_submit_button("💞 Initiate Pairing", disabled=not available_tanks)
+            # Dynamic Preview Box for Line, Generation, and Spawn ID
+            if male_id and female_id:
+                male_info = breeders_map.get(male_id, {})
+                female_info = breeders_map.get(female_id, {})
+
+                preview_line, preview_gen = calculate_child_generation(
+                    male_gen=male_info.get("generation"),
+                    female_gen=female_info.get("generation"),
+                    male_line=male_info.get("line_code"),
+                    female_line=female_info.get("line_code")
+                )
+                preview_spawn_id = generate_short_spawn_id()
+
+                st.info(
+                    f"📋 **Next Spawn ID:** `{preview_spawn_id}` | "
+                    f"🧬 **Target Line:** `{preview_line}` | "
+                    f"🏷️ **Resulting Generation:** `{preview_gen}`"
+                )
+
+            notes = st.text_area("Pairing Notes", placeholder="e.g. Both pre-conditioned for 7 days on bloodworms")
+            
+            submit_pair = st.button("💞 Initiate Pairing", disabled=not available_tanks, type="primary")
 
             if submit_pair:
                 if not tank_location:
                     st.error("Please select a valid Spawning Tank Location.")
                 else:
                     with st.spinner("Setting up pairing..."):
-                        spawn_id = create_new_spawn(male_id, female_id, tank_location, line_goal, notes)
-                    st.success(f"Pairing initiated! Spawn ID: **{spawn_id}** assigned to Tank **{tank_location}**")
+                        spawn_id, line_code, child_gen = create_new_spawn(
+                            male_id, female_id, tank_location, line_goal, notes
+                        )
+                    st.success(
+                        f"Pairing initiated! Spawn ID: **{spawn_id}** | Line: **{line_code}** ({child_gen}) assigned to Tank **{tank_location}**"
+                    )
                     st.rerun()
 
     # ==========================================
@@ -286,7 +315,7 @@ def render_spawn_page():
         spawns = get_all_spawns()
         if spawns:
             df = pd.DataFrame(spawns)
-            # Remove internal helper keys if present
+            
             if "row_index" in df.columns:
                 df = df.drop(columns=["row_index"])
 
