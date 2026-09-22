@@ -1,5 +1,6 @@
 # modules/tank_registry.py
 import io
+import random
 import datetime
 import qrcode
 import streamlit as st
@@ -9,6 +10,25 @@ from modules.drive_service import (
     get_spreadsheet_id,
     get_drive_folder_id
 )
+
+def generate_tape_code(tank_type: str) -> str:
+    """Generates a short, easy-to-write code for painter's tape (e.g. GO-8492, JAR-1039)."""
+    type_upper = tank_type.upper()
+    if "GROW-OUT" in type_upper or "PLANGGANA" in type_upper:
+        prefix = "GO"
+    elif "SPAWNING" in type_upper:
+        prefix = "SPN"
+    elif "JAR" in type_upper or "EMPI" in type_upper or "BOTTLE" in type_upper:
+        prefix = "JAR"
+    elif "SORORITY" in type_upper:
+        prefix = "SOR"
+    elif "QUARANTINE" in type_upper:
+        prefix = "QT"
+    else:
+        prefix = "TNK"
+
+    random_num = random.randint(1000, 9999)
+    return f"{prefix}-{random_num}"
 
 def generate_tank_qr(tank_id):
     """Generates a QR Code image stream for a given Tank ID."""
@@ -64,19 +84,20 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
 
     return file_id
 
-def register_tank(tank_type, location, capacity_liters, purpose="General / Multi-purpose", photo_file=None, current_occupant="", notes=""):
+def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose", photo_file=None, current_occupant="", notes=""):
     """
-    1. Generates a unique Tank ID upon submission.
+    1. Generates a unique Tank ID and short Tape Code upon submission.
     2. Uploads container photo (if provided) and QR Tag to Google Drive.
     3. Saves record in Google Sheets.
     """
     drive_service, sheets_service = get_google_services()
     spreadsheet_id = get_spreadsheet_id()
 
-    # Generate unique Tank ID dynamically upon submission
+    # Generate unique Tank ID and short Tape Code upon submission
     type_prefix = tank_type.replace(" ", "")[:3].upper()
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     tank_id = f"TNK-{type_prefix}-{timestamp}"
+    location_code = generate_tape_code(tank_type)
 
     # 1. Upload Container Photo (if uploaded)
     photo_id = ""
@@ -101,7 +122,7 @@ def register_tank(tank_type, location, capacity_liters, purpose="General / Multi
     row = [
         tank_id,               # A: Tank System ID
         tank_type,             # B: Tank / Container Type
-        location,              # C: Tape Code / Location Tag
+        location_code,         # C: Auto-Generated Tape Code
         capacity_liters,       # D: Capacity (Liters)
         "Active",              # E: Status
         purpose,               # F: Container Purpose / Usage
@@ -123,6 +144,7 @@ def register_tank(tank_type, location, capacity_liters, purpose="General / Multi
 
     return {
         "tank_id": tank_id,
+        "location_code": location_code,
         "photo_id": photo_id,
         "qr_id": qr_id,
         "direct_photo_url": direct_photo_url
