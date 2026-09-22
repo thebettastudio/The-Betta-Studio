@@ -151,6 +151,44 @@ def format_spawns_sheet():
 # 1. READ / FETCH DATA
 # ==========================================
 
+def get_available_spawning_tanks():
+    """
+    Fetches tanks from 'Tanks' sheet that are type 'Spawning' and currently 'Available'.
+    Returns a list of dicts with tank details.
+    """
+    _, sheets_service = get_google_services()
+    try:
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Tanks!A2:E'
+        ).execute()
+
+        rows = result.get('values', [])
+        available_tanks = []
+
+        # Expected Tanks structure:
+        # Col A (0): Tank ID | Col B (1): Type | Col C (2): Location | Col D (3): Status
+        for row in rows:
+            if not row or len(row) < 4:
+                continue
+            tank_id = row[0]
+            tank_type = row[1]
+            location = row[2]
+            status = row[3]
+
+            if tank_type.strip().lower() == "spawning" and status.strip().lower() in ["available", "empty", "ready"]:
+                available_tanks.append({
+                    "id": tank_id,
+                    "location": location,
+                    "label": f"📍 {tank_id} ({location})"
+                })
+
+        return available_tanks
+    except Exception as e:
+        # Fallback if 'Tanks' sheet does not exist yet
+        return []
+
+
 def get_breeder_details_map():
     """Fetches all breeders and maps them by Breeder ID for fast lookup."""
     _, sheets_service = get_google_services()
@@ -167,8 +205,6 @@ def get_breeder_details_map():
             continue
         breeder_id = row[0]
 
-        # Col A (0): ID | Col B (1): Sex | Col C (2): Variety | Col D (3): Status
-        # Col E (4): Tank | Col F (5): Grade | Col G (6): Photo ID / Image URL | Col H (7): Notes
         photo_val = row[6] if len(row) > 6 else ""
 
         breeders_map[breeder_id] = {
@@ -271,7 +307,7 @@ def get_active_pairings_with_details():
 # ==========================================
 
 def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goal="", notes=""):
-    """Appends clean 12-column spawn row under Spawns sheet."""
+    """Appends clean 12-column spawn row under Spawns sheet and updates breeder/tank statuses."""
     _, sheets_service = get_google_services()
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     spawn_id = f"SPN-{timestamp}"
@@ -300,8 +336,12 @@ def create_new_spawn(male_breeder_id, female_breeder_id, tank_location, line_goa
         body={'values': [row]}
     ).execute()
 
+    # Update breeders status to "In Pairing"
     _update_breeder_status(sheets_service, male_breeder_id, "In Pairing")
     _update_breeder_status(sheets_service, female_breeder_id, "In Pairing")
+
+    # Update tank status to "Occupied"
+    _update_tank_status(sheets_service, tank_location, "Occupied")
 
     return spawn_id
 
@@ -327,6 +367,7 @@ def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
     row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
         male_id, female_id = spawn_data[1], spawn_data[2]
+        tank_location = spawn_data[9] if len(spawn_data) > 9 else ""
         free_swim_date = datetime.date.today().isoformat()
 
         update_values = [["Free Swimming", batch_name, free_swim_date, est_fry_count]]
@@ -339,13 +380,16 @@ def mark_free_swimming(spawn_id, batch_name, est_fry_count=0):
 
         _update_breeder_status(sheets_service, male_id, "Available")
         _update_breeder_status(sheets_service, female_id, "Available")
+        if tank_location:
+            _update_tank_status(sheets_service, tank_location, "Available")
 
 
 def mark_pairing_failed(spawn_id, failure_reason):
     _, sheets_service = get_google_services()
-    row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_data if 'spawn_data' in locals() else spawn_id)
+    row_idx, spawn_data = _find_spawn_by_id(sheets_service, spawn_id)
     if row_idx:
         male_id, female_id = spawn_data[1], spawn_data[2]
+        tank_location = spawn_data[9] if len(spawn_data) > 9 else ""
 
         sheets_service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
@@ -363,6 +407,8 @@ def mark_pairing_failed(spawn_id, failure_reason):
 
         _update_breeder_status(sheets_service, male_id, "Available")
         _update_breeder_status(sheets_service, female_id, "Available")
+        if tank_location:
+            _update_tank_status(sheets_service, tank_location, "Available")
 
 
 # ==========================================
@@ -396,3 +442,24 @@ def _update_breeder_status(sheets_service, breeder_id, new_status):
                 body={'values': [[new_status]]}
             ).execute()
             break
+
+
+def _update_tank_status(sheets_service, tank_identifier, new_status):
+    """Updates tank status in Tanks sheet matching either Tank ID or Location string."""
+    try:
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Tanks!A2:D'
+        ).execute()
+        rows = result.get('values', [])
+        for idx, row in enumerate(rows, start=2):
+            if row and (row[0] == tank_identifier or (len(row) > 2 and row[2] == tank_identifier)):
+                sheets_service.spreadsheets().values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f'Tanks!D{idx}',
+                    valueInputOption='USER_ENTERED',
+                    body={'values': [[new_status]]}
+                ).execute()
+                break
+    except Exception:
+        pass
