@@ -45,8 +45,8 @@ def ensure_fish_master_sheet_exists(sheets_service):
     ensure_sheet_exists(sheets_service, 'Fish_Master', headers)
 
 
-def generate_next_fish_id(sheets_service) -> str:
-    """Fetch all existing Fish IDs from Column A and return the next sequential ID."""
+def generate_next_fish_id(sheets_service) -> int:
+    """Fetch all existing Fish IDs from Column A and return the next integer sequence."""
     try:
         res = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
@@ -62,9 +62,9 @@ def generate_next_fish_id(sheets_service) -> str:
                 if val_str.isdigit():
                     max_id = max(max_id, int(val_str))
                     
-        return str(max_id + 1)
+        return max_id + 1
     except Exception:
-        return "1"
+        return 1
 
 
 def get_registered_strains(sheets_service):
@@ -162,7 +162,7 @@ def delete_strain_from_db(sheets_service, strain_to_remove):
                 ).execute()
 
         st.toast(f"🗑️ Removed '{strain_to_remove}' from Strain Registry!", icon="✨")
-    except Exception as e:
+    except Exception:
         st.toast(f"Removed '{strain_to_remove}' from UI view.", icon="ℹ️")
 
 
@@ -190,6 +190,28 @@ def get_available_tanks(sheets_service):
             {"id": "B-01", "type": "6L Bottle", "status": "Available"},
             {"id": "T-01", "type": "Tubo Container", "status": "Available"},
         ]
+
+
+def mark_tank_occupied(sheets_service, tank_id: str):
+    """Updates the assigned tank's status to 'Occupied' in the Tanks sheet."""
+    try:
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Tanks!A2:C'
+        ).execute()
+        rows = res.get('values', [])
+        
+        for idx, r in enumerate(rows, start=2):
+            if r and r[0].strip().lower() == tank_id.strip().lower():
+                sheets_service.spreadsheets().values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f'Tanks!C{idx}',
+                    valueInputOption='USER_ENTERED',
+                    body={'values': [["Occupied"]]}
+                ).execute()
+                break
+    except Exception as e:
+        st.warning(f"Note: Could not update tank '{tank_id}' status to Occupied: {e}")
 
 
 def get_all_fish_records(sheets_service):
@@ -291,8 +313,10 @@ def render_fish_registry_page():
         st.subheader("🛒 Purchased / Imported Fish Details")
 
         ensure_fish_master_sheet_exists(sheets_service)
-        next_fish_id = generate_next_fish_id(sheets_service)
-        st.info(f"📌 Next Assigned Fish ID: **#FISH-{next_fish_id.zfill(4)}**")
+        next_fish_num = generate_next_fish_id(sheets_service)
+        assigned_fish_id = f"FISH-{str(next_fish_num).zfill(4)}"
+        
+        st.info(f"📌 Next Assigned Fish ID: **#{assigned_fish_id}**")
 
         strains_list = get_registered_strains(sheets_service)
 
@@ -418,8 +442,6 @@ def render_fish_registry_page():
             submit = st.form_submit_button("💾 Register Fish", use_container_width=True)
 
         if submit:
-            assigned_fish_id = f"FISH-{generate_next_fish_id(sheets_service).zfill(4)}"
-
             final_image_val = manual_image_url
             photo_bytes = None
             if camera_photo is not None:
@@ -459,6 +481,10 @@ def render_fish_registry_page():
                     valueInputOption='USER_ENTERED',
                     body={'values': [new_fish_record]}
                 ).execute()
+
+                # Mark Tank as Occupied if assigned
+                if selected_tank_id:
+                    mark_tank_occupied(sheets_service, selected_tank_id)
 
                 st.balloons()
                 st.success(f"🎉 Fish **#{assigned_fish_id}** ({selected_strain}) successfully registered! Grade: **{computed_grade}**.")
