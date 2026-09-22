@@ -1,7 +1,9 @@
 # modules/spawn_manager.py
 import datetime
 import re
+import streamlit as st
 from modules.drive_service import get_google_services, SPREADSHEET_ID
+from modules.tank_registry import get_all_tanks
 
 # ==========================================
 # 0. SHEET FORMATTING & MOTIVATIONAL STYLING
@@ -152,47 +154,76 @@ def format_spawns_sheet():
 # 1. READ / FETCH DATA
 # ==========================================
 
+def clean_text(text: str) -> str:
+    """Strips special characters/emojis for reliable keyword matching."""
+    return re.sub(r'[^\w\s]', '', str(text)).strip().lower()
+
+
 def get_available_spawning_tanks():
     """
-    Fetches tanks from 'Tanks' sheet that are designed for Spawning/Breeding and currently Available.
-    Flexibly checks both Tank Purpose and Tank Type.
+    Fetches available tanks directly using get_all_tanks() to ensure total sync 
+    with tank_view.py definitions.
     """
-    _, sheets_service = get_google_services()
     try:
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Tanks!A2:G'
-        ).execute()
+        tanks = get_all_tanks()
+        if not tanks:
+            return []
 
-        rows = result.get('values', [])
         available_tanks = []
+        
+        # Valid statuses aligned with tank_view.py
+        valid_statuses = ["empty / idle", "empty", "idle", "available", "ready", "clean", "vacant", ""]
 
-        valid_statuses = ["available", "empty", "idle", "ready", "empty / idle", "clean"]
+        for t in tanks:
+            status_clean = clean_text(t.get('status', ''))
+            occupant_clean = clean_text(t.get('occupant', ''))
+            purpose_clean = clean_text(t.get('purpose', ''))
+            type_clean = clean_text(t.get('type', ''))
 
-        for row in rows:
-            if not row or len(row) < 4:
-                continue
-            
-            tank_id = row[0].strip()
-            tank_type = row[1].strip() if len(row) > 1 else ""
-            location = row[2].strip() if len(row) > 2 else ""
-            status = row[3].strip().lower() if len(row) > 3 else ""
-            purpose = row[5].strip().lower() if len(row) > 5 else ""
+            # Check 1: Is the container available? (Either valid status OR no current occupant)
+            is_available = (status_clean in valid_statuses) or (occupant_clean in ["", "none", "empty", "na"])
 
-            # Check if purpose or type indicates Spawning / Breeding setup
-            is_spawning_tank = "spaw" in purpose or "breed" in purpose or "spaw" in tank_type.lower() or "breed" in tank_type.lower()
-            is_available = status in valid_statuses or not status
+            # Check 2: Is it designated or suitable for spawning/breeding?
+            is_spawning_suitable = (
+                "spaw" in purpose_clean or "breed" in purpose_clean or
+                "spaw" in type_clean or "breed" in type_clean or
+                purpose_clean in ["", "general", "multi-purpose", "unassigned"]
+            )
 
-            if is_spawning_tank and is_available:
-                loc_display = location if location else tank_id
+            if is_available and is_spawning_suitable:
+                tank_id = t.get('id', '')
+                location_code = t.get('location', tank_id)
+                tank_type = t.get('type', '')
+
+                label_text = f"📍 {location_code} ({tank_type})" if tank_type else f"📍 {location_code}"
+
                 available_tanks.append({
                     "id": tank_id,
-                    "location": loc_display,
-                    "label": f"📍 {loc_display} ({tank_type})" if tank_type else f"📍 {loc_display}"
+                    "location": location_code,
+                    "label": label_text
                 })
 
+        # Fallback: If no explicit spawning tanks are set, pull ALL available tanks
+        if not available_tanks:
+            for t in tanks:
+                status_clean = clean_text(t.get('status', ''))
+                occupant_clean = clean_text(t.get('occupant', ''))
+
+                if (status_clean in valid_statuses) or (occupant_clean in ["", "none", "empty", "na"]):
+                    tank_id = t.get('id', '')
+                    location_code = t.get('location', tank_id)
+                    tank_type = t.get('type', '')
+
+                    available_tanks.append({
+                        "id": tank_id,
+                        "location": location_code,
+                        "label": f"📍 {location_code}" + (f" ({tank_type})" if tank_type else "")
+                    })
+
         return available_tanks
-    except Exception:
+
+    except Exception as e:
+        st.error(f"Error loading spawning tanks: {e}")
         return []
 
 
