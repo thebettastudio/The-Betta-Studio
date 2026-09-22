@@ -10,10 +10,15 @@ from modules.dashboard import render_dashboard      # Main Studio Dashboard View
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
 from modules.spawn_manager import format_spawns_sheet
 
-st.set_page_config(page_title="The Betta Studio", page_icon="🐟", layout="wide")
+st.set_page_config(
+    page_title="The Betta Studio", 
+    page_icon="🐟", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 # ==============================================================================
-# GLOBAL STYLING: Applies Clean Light Theme (White Background)
+# GLOBAL STYLING: Applies Clean Light Theme
 # ==============================================================================
 st.markdown("""
 <style>
@@ -55,10 +60,10 @@ st.markdown("""
 
   /* 5. Betta Image Styling */
   .spawn-card-img {
-      width: 40px;
-      height: 40px;
+      width: 44px;
+      height: 44px;
       object-fit: cover;
-      border-radius: 6px;
+      border-radius: 8px;
       border: 1.5px solid #CBD5E1;
       box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
       transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
@@ -160,10 +165,10 @@ st.sidebar.title("🐟 The Betta Studio")
 page = st.sidebar.radio("Navigation", [
     "📊 Studio Dashboard",
     "🔍 Global Search Studio",
-    "Breeder Registry",
+    "🐟 Breeder Registry",
     "🪣 Tank & Container Registry",
-    "Pair & Spawn Tracker",
-    "Activity Log"
+    "❤️ Pair & Spawn Tracker",
+    "📝 Activity Log"
 ])
 
 st.sidebar.markdown("---")
@@ -174,11 +179,11 @@ if page == "📊 Studio Dashboard":
     render_dashboard()
 elif page == "🔍 Global Search Studio":
     render_search_page()
-elif page == "Breeder Registry":
+elif page == "🐟 Breeder Registry":
     render_breeder_page()
 elif page == "🪣 Tank & Container Registry":
     render_tank_page()
-elif page == "Pair & Spawn Tracker":
+elif page == "❤️ Pair & Spawn Tracker":
     render_spawn_page()
-elif page == "Activity Log":
+elif page == "📝 Activity Log":
     render_activity_log_page()
