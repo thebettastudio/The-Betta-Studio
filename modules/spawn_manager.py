@@ -1,4 +1,3 @@
-# modules/spawn_manager.py
 import datetime
 import re
 import streamlit as st
@@ -125,8 +124,8 @@ def format_spawns_sheet():
                     "ranges": [{
                         "sheetId": spawns_sheet_id,
                         "startRowIndex": 1,
-                        "startColumnIndex": 4,
-                        "endColumnIndex": 5
+                        "endColumnIndex": 5,
+                        "startColumnIndex": 4
                     }],
                     "booleanRule": {
                         "condition": {
@@ -170,8 +169,6 @@ def get_available_spawning_tanks():
             return []
 
         available_tanks = []
-        
-        # Valid statuses aligned with tank_view.py
         valid_statuses = ["empty / idle", "empty", "idle", "available", "ready", "clean", "vacant", ""]
 
         for t in tanks:
@@ -180,10 +177,7 @@ def get_available_spawning_tanks():
             purpose_clean = clean_text(t.get('purpose', ''))
             type_clean = clean_text(t.get('type', ''))
 
-            # Check 1: Is the container available? (Either valid status OR no current occupant)
             is_available = (status_clean in valid_statuses) or (occupant_clean in ["", "none", "empty", "na"])
-
-            # Check 2: Is it designated or suitable for spawning/breeding?
             is_spawning_suitable = (
                 "spaw" in purpose_clean or "breed" in purpose_clean or
                 "spaw" in type_clean or "breed" in type_clean or
@@ -203,7 +197,7 @@ def get_available_spawning_tanks():
                     "label": label_text
                 })
 
-        # Fallback: If no explicit spawning tanks are set, pull ALL available tanks
+        # Fallback: Pull all available tanks if no explicit spawning tanks match
         if not available_tanks:
             for t in tanks:
                 status_clean = clean_text(t.get('status', ''))
@@ -242,7 +236,7 @@ def get_breeder_details_map():
         for idx, row in enumerate(rows, start=2):
             if not row or not row[0].strip():
                 continue
-            
+
             breeder_id = row[0].strip()
             photo_val = row[6] if len(row) > 6 else ""
 
@@ -278,13 +272,13 @@ def get_available_breeders():
         for idx, row in enumerate(rows, start=2):
             if len(row) < 4:
                 continue
-            
+
             breeder_id = row[0].strip()
             sex = row[1].strip()
             variety = row[2].strip()
             status = row[3].strip()
 
-            if status.title() in ["Available", "Conditioning", "Idle", "Ready"]:
+            if status.lower() in ["available", "conditioning", "idle", "ready"]:
                 label = f"{breeder_id} | {variety}"
                 item = {"row_index": idx, "id": breeder_id, "label": label}
                 if sex.lower() == "male":
@@ -312,7 +306,7 @@ def get_all_spawns():
         for idx, row in enumerate(rows, start=2):
             if not row or not row[0].strip():
                 continue
-            
+
             spawns.append({
                 "row_index": idx,
                 "id": row[0].strip() if len(row) > 0 else "",
@@ -448,18 +442,16 @@ def mark_pairing_failed(spawn_id, failure_reason):
         male_id, female_id = spawn_data[1], spawn_data[2]
         tank_location = spawn_data[9] if len(spawn_data) > 9 else ""
 
-        sheets_service.spreadsheets().values().update(
+        # Batch update status and failure reason in one API request
+        sheets_service.spreadsheets().values().batchUpdate(
             spreadsheetId=SPREADSHEET_ID,
-            range=f'Spawns!E{row_idx}',
-            valueInputOption='USER_ENTERED',
-            body={'values': [["Failed"]]}
-        ).execute()
-
-        sheets_service.spreadsheets().values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f'Spawns!I{row_idx}',
-            valueInputOption='USER_ENTERED',
-            body={'values': [[failure_reason]]}
+            body={
+                'valueInputOption': 'USER_ENTERED',
+                'data': [
+                    {'range': f'Spawns!E{row_idx}', 'values': [["Failed"]]},
+                    {'range': f'Spawns!I{row_idx}', 'values': [[failure_reason]]}
+                ]
+            }
         ).execute()
 
         _update_breeder_status(sheets_service, male_id, "Available")
@@ -487,28 +479,17 @@ def update_spawn_details(spawn_id, batch_name=None, fry_count=None, status=None,
     new_goal = line_goal if line_goal is not None else current_goal
     new_notes = notes if notes is not None else current_notes
 
-    # Update Status, Batch Name
-    sheets_service.spreadsheets().values().update(
+    # Single batch update across all targeted ranges
+    sheets_service.spreadsheets().values().batchUpdate(
         spreadsheetId=SPREADSHEET_ID,
-        range=f'Spawns!E{row_idx}:F{row_idx}',
-        valueInputOption='USER_ENTERED',
-        body={'values': [[new_status, new_batch]]}
-    ).execute()
-
-    # Update Fry Count
-    sheets_service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f'Spawns!H{row_idx}',
-        valueInputOption='USER_ENTERED',
-        body={'values': [[new_fry]]}
-    ).execute()
-
-    # Update Line Goal and Notes
-    sheets_service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f'Spawns!K{row_idx}:L{row_idx}',
-        valueInputOption='USER_ENTERED',
-        body={'values': [[new_goal, new_notes]]}
+        body={
+            'valueInputOption': 'USER_ENTERED',
+            'data': [
+                {'range': f'Spawns!E{row_idx}:F{row_idx}', 'values': [[new_status, new_batch]]},
+                {'range': f'Spawns!H{row_idx}', 'values': [[new_fry]]},
+                {'range': f'Spawns!K{row_idx}:L{row_idx}', 'values': [[new_goal, new_notes]]}
+            ]
+        }
     ).execute()
 
     return True
@@ -571,27 +552,23 @@ def _update_tank_status(sheets_service, tank_identifier, new_status, occupant=No
         for idx, row in enumerate(rows, start=2):
             if not row:
                 continue
-            
+
             tid = row[0].strip() if len(row) > 0 else ""
             tloc = row[2].strip() if len(row) > 2 else ""
 
             if tid == tank_identifier or tloc == tank_identifier:
-                # Update Status (Col D)
-                sheets_service.spreadsheets().values().update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f'Tanks!D{idx}',
-                    valueInputOption='USER_ENTERED',
-                    body={'values': [[new_status]]}
-                ).execute()
+                data_updates = [{'range': f'Tanks!D{idx}', 'values': [[new_status]]}]
 
-                # Update Occupant (Col G) if provided
                 if occupant is not None:
-                    sheets_service.spreadsheets().values().update(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range=f'Tanks!G{idx}',
-                        valueInputOption='USER_ENTERED',
-                        body={'values': [[occupant]]}
-                    ).execute()
+                    data_updates.append({'range': f'Tanks!G{idx}', 'values': [[occupant]]})
+
+                sheets_service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=SPREADSHEET_ID,
+                    body={
+                        'valueInputOption': 'USER_ENTERED',
+                        'data': data_updates
+                    }
+                ).execute()
                 break
     except Exception:
         pass
