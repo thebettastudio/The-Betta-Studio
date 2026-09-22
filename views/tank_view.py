@@ -26,28 +26,27 @@ def render_tank_page():
     with tab1:
         st.subheader("Register New Tank or Container")
 
-        with st.form("tank_register_form"):
+        with st.form("tank_register_form", clear_on_submit=True):
             col1, col2 = st.columns(2)
 
             with col1:
                 selected_type = st.selectbox("Container / Tank Type", DEFAULT_CONTAINER_TYPES)
                 
-                # Custom input trigger
                 custom_type = ""
                 if selected_type == "➕ Other / Custom Container...":
                     custom_type = st.text_input("Enter Custom Container Name", placeholder="e.g. 20L Storage Box, Styro Box, etc.")
 
-                location_code = st.text_input("Tape / Location Tag", placeholder="e.g. GO-01, ST-01, B6L-03, Rack 1")
+                location_code = st.text_input("Tape / Location Tag *", placeholder="e.g. GO-01, ST-01, B6L-03, Rack 1")
                 capacity = st.number_input("Capacity (Liters)", min_value=0.1, max_value=500.0, value=6.0, step=0.5)
 
             with col2:
                 occupant = st.text_input("Current Occupant ID (Optional)", placeholder="e.g. BRD-M-20260920 or Spawn #001")
+                photo_file = st.file_uploader("📷 Container Photo (Optional)", type=["jpg", "jpeg", "png"])
                 notes = st.text_area("Notes / Setup Details", placeholder="e.g. Almond leaf tea water, sponge filter installed")
 
-            submit = st.form_submit_button("🏷️ Register Container")
+            submit = st.form_submit_button("🏷️ Submit & Generate Tank ID")
 
         if submit:
-            # Determine final container type name
             final_type = custom_type.strip() if selected_type == "➕ Other / Custom Container..." else selected_type
 
             if not final_type:
@@ -55,17 +54,21 @@ def render_tank_page():
             elif not location_code:
                 st.error("Please provide a Tape Code or Location Tag (e.g. GO-01).")
             else:
-                with st.spinner("Registering container..."):
+                with st.spinner("Uploading photo & generating Tank ID..."):
                     res = register_tank(
                         tank_type=final_type,
                         location=location_code,
                         capacity_liters=capacity,
+                        photo_file=photo_file,
                         current_occupant=occupant,
                         notes=notes
                     )
 
                 st.success(f"Container Registered! Assigned System ID: **{res['tank_id']}**")
                 st.info(f"🏷️ **Tape Label Code:** Write `{location_code}` on painter's tape and attach it to your {final_type}.")
+
+                if res.get("direct_photo_url"):
+                    st.image(res["direct_photo_url"], caption="Uploaded Container Photo", width=250)
 
     # TAB 2: CONTAINER INVENTORY
     with tab2:
@@ -92,6 +95,10 @@ def render_tank_page():
                 tank_id = t['id']
                 with cols[idx % 3]:
                     with st.container(border=True):
+                        # Display photo if uploaded
+                        if t.get('photo_id'):
+                            st.image(f"https://drive.google.com/thumbnail?id={t['photo_id']}&sz=w800", use_container_width=True)
+
                         st.markdown(f"### 🏷️ `{t['location']}`")
                         st.caption(f"**System ID:** `{tank_id}`")
                         st.write(f"🪣 **Type:** {t['type']}")
