@@ -2,6 +2,7 @@ import io
 import datetime
 import streamlit as st
 from views.breeder_view import render_breeder_page
+from views.fish_registry_view import render_fish_registry_page  # Fish Master Registry View
 from views.spawn_view import render_spawn_page
 from views.activity_log_view import render_activity_log_page
 from views.tank_view import render_tank_page       # Tank Registry View
@@ -165,6 +166,7 @@ st.sidebar.title("🐟 The Betta Studio")
 page = st.sidebar.radio("Navigation", [
     "📊 Studio Dashboard",
     "🔍 Global Search Studio",
+    "🐠 Fish Master Registry",
     "🐟 Breeder Registry",
     "🪣 Tank & Container Registry",
     "❤️ Pair & Spawn Tracker",
@@ -179,6 +181,8 @@ if page == "📊 Studio Dashboard":
     render_dashboard()
 elif page == "🔍 Global Search Studio":
     render_search_page()
+elif page == "🐠 Fish Master Registry":
+    render_fish_registry_page()
 elif page == "🐟 Breeder Registry":
     render_breeder_page()
 elif page == "🪣 Tank & Container Registry":
