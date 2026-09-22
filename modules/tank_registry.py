@@ -59,6 +59,28 @@ def ensure_tanks_tab_exists(sheets_service, spreadsheet_id):
     except Exception as e:
         print(f"Warning: Failed during ensure_tanks_tab_exists execution: {e}")
 
+def get_next_tank_id(sheets_service, spreadsheet_id) -> str:
+    """Fetches all existing rows to compute the next sequential integer ID (starting at 1)."""
+    try:
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range='Tanks!A2:A'
+        ).execute()
+
+        rows = result.get('values', [])
+        max_id = 0
+
+        for row in rows:
+            if row and row[0]:
+                val = str(row[0]).strip()
+                if val.isdigit():
+                    max_id = max(max_id, int(val))
+
+        return str(max_id + 1)
+    except Exception as e:
+        print(f"Error fetching next tank ID: {e}")
+        return "1"
+
 def generate_tape_code(tank_type: str) -> str:
     """Generates a short, easy-to-write code for painter's tape (e.g. GO-8492, JAR-1039)."""
     type_upper = tank_type.upper()
@@ -135,7 +157,7 @@ def upload_to_drive(drive_service, file_data, file_name, mime_type):
 def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose", photo_file=None, current_occupant="", notes=""):
     """
     1. Verifies/creates sheet tab & header structure.
-    2. Generates a unique Tank ID and short Tape Code upon submission.
+    2. Generates sequential Tank ID (1, 2, 3...) and short Tape Code upon submission.
     3. Uploads container photo (if provided) and QR Tag to Google Drive.
     4. Saves record in Google Sheets.
     """
@@ -145,17 +167,15 @@ def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose",
     # Ensure worksheet tab & A1:K1 headers exist prior to append operation
     ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
 
-    # Generate unique Tank ID and short Tape Code upon submission
-    type_prefix = tank_type.replace(" ", "")[:3].upper()
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    tank_id = f"TNK-{type_prefix}-{timestamp}"
+    # Generate sequential Tank ID starting from 1
+    tank_id = get_next_tank_id(sheets_service, spreadsheet_id)
     location_code = generate_tape_code(tank_type)
 
     # 1. Upload Container Photo (if uploaded)
     photo_id = ""
     if photo_file is not None:
         try:
-            photo_name = f"{tank_id}_photo.jpg"
+            photo_name = f"tank_{tank_id}_photo.jpg"
             photo_id = upload_to_drive(drive_service, photo_file, photo_name, 'image/jpeg')
         except Exception as e:
             st.error(f"Failed to upload photo: {e}")
@@ -164,7 +184,7 @@ def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose",
     qr_id = ""
     try:
         qr_stream = generate_tank_qr(tank_id)
-        qr_name = f"{tank_id}_QR.png"
+        qr_name = f"tank_{tank_id}_QR.png"
         qr_id = upload_to_drive(drive_service, qr_stream, qr_name, 'image/png')
     except Exception as e:
         print(f"Warning: Failed to generate QR Code: {e}")
@@ -172,7 +192,7 @@ def register_tank(tank_type, capacity_liters, purpose="General / Multi-purpose",
     date_registered = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     row = [
-        tank_id,               # A: Tank System ID
+        tank_id,               # A: Tank System ID (1, 2, 3...)
         tank_type,             # B: Tank / Container Type
         location_code,         # C: Auto-Generated Tape Code
         capacity_liters,       # D: Capacity (Liters)
