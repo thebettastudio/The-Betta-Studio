@@ -165,7 +165,10 @@ def delete_strain_from_db(sheets_service, strain_to_remove):
 
 
 def get_available_tanks(sheets_service):
-    """Fetch tanks from Tanks sheet matching tank_view criteria (empty/idle or no occupant)."""
+    """
+    Fetch tanks from 'Tanks' sheet using the schema defined in tank_view.py:
+    Col A: Tank ID | Col B: Type | Col C: Location Code / Tape Tag | Col F: Status | Col G: Occupant
+    """
     available_statuses = ["empty / idle", "empty", "idle", "available", "ready", "clean"]
     try:
         res = sheets_service.spreadsheets().values().get(
@@ -186,6 +189,7 @@ def get_available_tanks(sheets_service):
                 status_clean = status.lower()
                 occupant_clean = occupant.lower()
 
+                # Tank is available if status matches idle OR occupant is empty
                 is_avail = (status_clean in available_statuses) or (not occupant_clean or occupant_clean in ["empty", "none", "n/a"])
 
                 if is_avail and tank_id:
@@ -205,7 +209,10 @@ def get_available_tanks(sheets_service):
 
 
 def update_tank_occupancy(sheets_service, tank_id: str, occupant_id: str, status: str = "Active"):
-    """Updates Tank status and occupant columns in the Tanks sheet to maintain parity with tank_view."""
+    """
+    Updates Tank status (Col F) and occupant (Col G) in the 'Tanks' sheet 
+    to maintain full parity with tank_view.py.
+    """
     if not tank_id or tank_id == "Unassigned":
         return
 
@@ -217,8 +224,9 @@ def update_tank_occupancy(sheets_service, tank_id: str, occupant_id: str, status
         rows = res.get('values', [])
         
         for idx, r in enumerate(rows, start=2):
+            # Match by system Tank ID (Col A) or Location Code (Col C)
             if r and (r[0].strip().lower() == tank_id.strip().lower() or (len(r) > 2 and r[2].strip().lower() == tank_id.strip().lower())):
-                # Update Status (Column F / Index 6) and Occupant (Column G / Index 7)
+                # Update Status (Column F) and Occupant (Column G)
                 sheets_service.spreadsheets().values().update(
                     spreadsheetId=SPREADSHEET_ID,
                     range=f'Tanks!F{idx}:G{idx}',
@@ -231,7 +239,7 @@ def update_tank_occupancy(sheets_service, tank_id: str, occupant_id: str, status
 
 
 def transfer_or_assign_tank(sheets_service, fish_id: str, old_tank_id: str, new_tank_id: str) -> bool:
-    """Updates tank assignment in Fish_Master and toggles tank status/occupant in Tanks sheet."""
+    """Updates tank assignment in Fish_Master and synchronizes status/occupant in Tanks sheet."""
     try:
         # 1. Update Fish_Master sheet with new Tank ID
         res = sheets_service.spreadsheets().values().get(
@@ -250,7 +258,7 @@ def transfer_or_assign_tank(sheets_service, fish_id: str, old_tank_id: str, new_
                 ).execute()
                 break
 
-        # 2. Release old tank if applicable
+        # 2. Free up previous tank if applicable
         if old_tank_id and old_tank_id != "Unassigned":
             update_tank_occupancy(sheets_service, old_tank_id, occupant_id="", status="Empty / Idle")
 
@@ -511,7 +519,6 @@ def render_fish_registry_page():
 
             selected_tank_id = ""
             if selected_tank_str != "Leave Unassigned":
-                # Parse system tank ID inside parentheses: Location (TANK-ID | Type)
                 parsed_id = selected_tank_str.split(" (")[1].split(" | ")[0]
                 selected_tank_id = parsed_id
 
