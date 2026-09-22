@@ -98,65 +98,114 @@ def render_tank_page():
         if not tanks:
             st.info("No containers registered yet.")
         else:
-            search_query = st.text_input("🔍 Search by ID, Tape Code, Type, Purpose, or Occupant:", "").strip().lower()
+            # ------------------------------------------------------------------
+            # AVAILABILITY & SEARCH FILTERS
+            # ------------------------------------------------------------------
+            f_col1, f_col2 = st.columns([1, 2])
 
-            filtered = [
-                t for t in tanks
-                if search_query in t['id'].lower()
-                or search_query in t['type'].lower()
-                or search_query in t['location'].lower()
-                or search_query in t['purpose'].lower()
-                or search_query in t['occupant'].lower()
-            ]
+            with f_col1:
+                availability_filter = st.selectbox(
+                    "🟢 Container Availability",
+                    options=["All Containers", "Available / Empty Only", "Occupied / In Use Only"],
+                    index=0
+                )
 
-            cols = st.columns(3)
-            for idx, t in enumerate(filtered):
-                tank_id = t['id']
-                with cols[idx % 3]:
-                    with st.container(border=True):
-                        # Display photo if uploaded
-                        if t.get('photo_id'):
-                            st.image(f"https://drive.google.com/thumbnail?id={t['photo_id']}&sz=w800", use_container_width=True)
+            with f_col2:
+                search_query = st.text_input("🔍 Search Inventory", placeholder="Search ID, Tape Code, Type, Purpose, or Occupant...").strip().lower()
 
-                        st.markdown(f"### 🏷️ `{t['location']}`")
-                        st.caption(f"**System ID:** `{tank_id}`")
-                        st.write(f"🪣 **Type:** {t['type']}")
-                        st.write(f"🎯 **Purpose:** {t['purpose']}")
-                        st.write(f"🧪 **Capacity:** {t['capacity']} L | **Status:** `{t['status']}`")
-                        
-                        if t['occupant']:
-                            st.write(f"🐟 **Occupant:** `{t['occupant']}`")
-                        else:
-                            st.write("🐟 **Occupant:** *Empty*")
+            # Define terms that represent available/vacant containers
+            available_statuses = ["empty / idle", "empty", "idle", "available", "ready", "clean"]
 
-                        if t['notes']:
-                            st.caption(f"📝 {t['notes']}")
+            filtered = []
+            for t in tanks:
+                status_str = str(t.get('status', '')).strip().lower()
+                occupant_str = str(t.get('occupant', '')).strip().lower()
+                
+                # Determine availability based on status or occupant presence
+                is_available = (status_str in available_statuses) or (not occupant_str or occupant_str in ["empty", "none", "n/a"])
 
-                        st.divider()
+                # Filter 1: Availability
+                if availability_filter == "Available / Empty Only" and not is_available:
+                    continue
+                elif availability_filter == "Occupied / In Use Only" and is_available:
+                    continue
 
-                        # Quick Update Status Popover
-                        with st.popover("⚙️ Update Container", use_container_width=True):
-                            new_status = st.selectbox(
-                                "Status",
-                                ["Active", "Cleaning / Quarantine", "Empty / Idle", "Retired"],
-                                key=f"status_{tank_id}"
-                            )
+                # Filter 2: Text Search Query
+                if search_query:
+                    searchable_fields = [
+                        str(t.get('id', '')),
+                        str(t.get('type', '')),
+                        str(t.get('location', '')),
+                        str(t.get('purpose', '')),
+                        str(t.get('occupant', '')),
+                        str(t.get('notes', ''))
+                    ]
+                    if not any(search_query in field.lower() for field in searchable_fields):
+                        continue
+
+                filtered.append(t)
+
+            # Display quick status count header
+            avail_count = sum(
+                1 for t in tanks 
+                if str(t.get('status', '')).strip().lower() in available_statuses 
+                or not str(t.get('occupant', '')).strip() 
+                or str(t.get('occupant', '')).strip().lower() in ["empty", "none", "n/a"]
+            )
+            st.caption(f"Showing **{len(filtered)}** of **{len(tanks)}** containers | 🟢 **{avail_count}** Available / Empty Containers")
+            st.markdown("---")
+
+            if not filtered:
+                st.warning("No containers match your filter criteria.")
+            else:
+                cols = st.columns(3)
+                for idx, t in enumerate(filtered):
+                    tank_id = t['id']
+                    with cols[idx % 3]:
+                        with st.container(border=True):
+                            # Display photo if uploaded
+                            if t.get('photo_id'):
+                                st.image(f"https://drive.google.com/thumbnail?id={t['photo_id']}&sz=w800", use_container_width=True)
+
+                            st.markdown(f"### 🏷️ `{t['location']}`")
+                            st.caption(f"**System ID:** `{tank_id}`")
+                            st.write(f"🪣 **Type:** {t['type']}")
+                            st.write(f"🎯 **Purpose:** {t['purpose']}")
+                            st.write(f"🧪 **Capacity:** {t['capacity']} L | **Status:** `{t['status']}`")
                             
-                            try:
-                                curr_p_idx = CONTAINER_PURPOSES.index(t['purpose'])
-                            except ValueError:
-                                curr_p_idx = 0
+                            if t.get('occupant'):
+                                st.write(f"🐟 **Occupant:** `{t['occupant']}`")
+                            else:
+                                st.write("🐟 **Occupant:** *Empty*")
 
-                            new_purpose = st.selectbox(
-                                "Container Purpose",
-                                CONTAINER_PURPOSES,
-                                index=curr_p_idx,
-                                key=f"purpose_{tank_id}"
-                            )
-                            new_occ = st.text_input("Current Occupant ID", value=t['occupant'], key=f"occ_{tank_id}")
-                            new_notes = st.text_area("Notes", value=t['notes'], key=f"notes_{tank_id}")
+                            if t.get('notes'):
+                                st.caption(f"📝 {t['notes']}")
 
-                            if st.button("Save Changes", key=f"save_{tank_id}", type="primary"):
-                                if update_tank_status(tank_id, new_status, new_purpose, new_occ, new_notes):
-                                    st.success("Updated!")
-                                    st.rerun()
+                            st.divider()
+
+                            # Quick Update Status Popover
+                            with st.popover("⚙️ Update Container", use_container_width=True):
+                                new_status = st.selectbox(
+                                    "Status",
+                                    ["Active", "Cleaning / Quarantine", "Empty / Idle", "Retired"],
+                                    key=f"status_{tank_id}"
+                                )
+                                
+                                try:
+                                    curr_p_idx = CONTAINER_PURPOSES.index(t['purpose'])
+                                except (ValueError, KeyError):
+                                    curr_p_idx = 0
+
+                                new_purpose = st.selectbox(
+                                    "Container Purpose",
+                                    CONTAINER_PURPOSES,
+                                    index=curr_p_idx,
+                                    key=f"purpose_{tank_id}"
+                                )
+                                new_occ = st.text_input("Current Occupant ID", value=t.get('occupant', ''), key=f"occ_{tank_id}")
+                                new_notes = st.text_area("Notes", value=t.get('notes', ''), key=f"notes_{tank_id}")
+
+                                if st.button("Save Changes", key=f"save_{tank_id}", type="primary"):
+                                    if update_tank_status(tank_id, new_status, new_purpose, new_occ, new_notes):
+                                        st.success("Updated!")
+                                        st.rerun()
