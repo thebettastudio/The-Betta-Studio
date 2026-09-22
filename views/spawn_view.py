@@ -1,8 +1,10 @@
+# views/spawn_view.py
 import re
 import datetime
 import streamlit as st
 from modules.spawn_manager import (
     get_available_breeders,
+    get_available_spawning_tanks,
     get_all_spawns,
     get_active_pairings_with_details,
     create_new_spawn,
@@ -137,7 +139,7 @@ def render_spawn_page():
                         st.markdown(f"**Variety:** {male.get('variety', 'N/A')}")
                         st.markdown(f"**Grade:** `{male.get('grade', 'N/A')}`")
 
-                    # --- Column 2: Male Picture (Fills column width) ---
+                    # --- Column 2: Male Picture ---
                     with col_m_img:
                         male_img_src = (
                             male.get("photo_id") or 
@@ -155,7 +157,7 @@ def render_spawn_page():
                         st.markdown(f"**Variety:** {female.get('variety', 'N/A')}")
                         st.markdown(f"**Grade:** `{female.get('grade', 'N/A')}`")
 
-                    # --- Column 4: Female Picture (Fills column width) ---
+                    # --- Column 4: Female Picture ---
                     with col_f_img:
                         female_img_src = (
                             female.get("photo_id") or 
@@ -209,9 +211,10 @@ def render_spawn_page():
         st.subheader("Pair Male & Female Breeder")
         
         males, females = get_available_breeders()
+        available_tanks = get_available_spawning_tanks()
 
         if not males or not females:
-            st.warning("You need at least one Available/Conditioning Male AND Female breeder to create a pair.")
+            st.warning("⚠️ You need at least one Available/Conditioning Male AND Female breeder to create a pair.")
         else:
             with st.form("new_pairing_form", clear_on_submit=True):
                 col1, col2 = st.columns(2)
@@ -221,7 +224,14 @@ def render_spawn_page():
                     selected_male_label = st.selectbox("Select Male Breeder", list(male_options.keys()))
                     male_id = male_options[selected_male_label]
 
-                    tank = st.text_input("Tank Location", placeholder="e.g. Tank A1")
+                    # Tank Search & Selection
+                    if available_tanks:
+                        tank_options = {t["label"]: t["id"] for t in available_tanks}
+                        selected_tank_label = st.selectbox("Select Spawning Tank", list(tank_options.keys()))
+                        tank_location = tank_options[selected_tank_label]
+                    else:
+                        st.error("⚠️ No available Spawning Tanks. Free up a tank or mark one as Available.")
+                        tank_location = None
 
                 with col2:
                     female_options = {f["label"]: f["id"] for f in females}
@@ -231,15 +241,16 @@ def render_spawn_page():
                     line_goal = st.text_input("Line / Breeding Goal", placeholder="e.g. Improve caudal spread & clean dorsal")
 
                 notes = st.text_area("Pairing Notes", placeholder="e.g. Both pre-conditioned for 7 days on bloodworms")
-                submit_pair = st.form_submit_button("💞 Initiate Pairing")
+                
+                submit_pair = st.form_submit_button("💞 Initiate Pairing", disabled=not available_tanks)
 
             if submit_pair:
-                if not tank:
-                    st.error("Please specify a Tank Location.")
+                if not tank_location:
+                    st.error("Please select a valid Spawning Tank Location.")
                 else:
                     with st.spinner("Setting up pairing..."):
-                        spawn_id = create_new_spawn(male_id, female_id, tank, line_goal, notes)
-                    st.success(f"Pairing initiated! Spawn ID: **{spawn_id}**")
+                        spawn_id = create_new_spawn(male_id, female_id, tank_location, line_goal, notes)
+                    st.success(f"Pairing initiated! Spawn ID: **{spawn_id}** assigned to Tank **{tank_location}**")
                     st.rerun()
 
     # ==========================================
