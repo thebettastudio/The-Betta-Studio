@@ -367,7 +367,7 @@ def get_available_breeders():
 
 
 def get_all_spawns():
-    """Fetches all spawn records safely with row index included."""
+    """Fetches all spawn records safely with row index and explicit tank key included."""
     _, sheets_service = get_google_services()
     try:
         result = sheets_service.spreadsheets().values().get(
@@ -414,6 +414,14 @@ def get_all_spawns():
                 status = row[12].strip() if len(row) > 12 else "In Pairing"
                 notes = row[13].strip() if len(row) > 13 else ""
 
+            # Safely extract tank location embedded in notes string
+            tank_loc = "Unassigned"
+            if "Tank:" in notes:
+                try:
+                    tank_loc = notes.split("Tank:")[1].split("|")[0].strip()
+                except Exception:
+                    pass
+
             spawns.append({
                 "row_index": idx,
                 "id": batch_id,
@@ -435,6 +443,7 @@ def get_all_spawns():
                 "estimated_fry_count": fry_count,
                 "fry_count": fry_count,
                 "status": status,
+                "tank": tank_loc,
                 "notes": notes
             })
         return spawns
