@@ -4,6 +4,7 @@
 # database, photo_service, id_generator.
 # Session 16 — Added "View Lineage" button on each fish card.
 # Session 18 — Strains fully DB-managed (no more hardcoded defaults).
+# Session 20 — Added milestone tracking section on each fish card.
 
 import io
 import datetime
@@ -24,6 +25,8 @@ from database import (
     create_strain,
     delete_strain,
     get_all_fish,
+    get_milestones_for_fish,
+    get_milestone_counts_by_fish,
 )
 from modules.fish_manager import (
     register_new_fish,
@@ -42,6 +45,15 @@ from modules.tank_registry import (
 )
 from modules.id_generator import generate_fish_id
 from modules.photo_service import upload_photo, photo_url
+from modules.fish_milestones import (
+    add_milestone,
+    edit_milestone,
+    remove_milestone,
+    milestone_is_due,
+    compute_trend,
+    suggest_action,
+    MILESTONE_INTERVAL_DAYS,
+)
 
 
 # ============================================================
@@ -364,13 +376,155 @@ def render_register_tab():
 
 
 # ============================================================
+# MILESTONE UI
+# ============================================================
+
+def _render_milestone_add_form(fish: dict):
+    """Inline form to add a milestone. Uses a form to avoid rerun churn."""
+    fish_uuid = fish["id"]
+
+    with st.form(f"add_milestone_{fish_uuid}", clear_on_submit=True):
+        st.markdown("**➕ Add Milestone**")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            m_date = st.date_input(
+                "Date",
+                value=datetime.date.today(),
+                key=f"m_date_{fish_uuid}",
+            )
+        with col_b:
+            photo_file = st.file_uploader(
+                "Photo",
+                type=["jpg", "jpeg", "png", "heic", "heif"],
+                key=f"m_photo_{fish_uuid}",
+            )
+
+        st.caption("Optional re-score (leave blank to skip):")
+        chk_col, shape_col = st.columns([3, 2])
+        with chk_col:
+            c1 = st.checkbox("Caudal 180°", key=f"m_c1_{fish_uuid}")
+            c2 = st.checkbox("Caudal branching", key=f"m_c2_{fish_uuid}")
+            c3 = st.checkbox("Dorsal structure", key=f"m_c3_{fish_uuid}")
+            c4 = st.checkbox("Anal structure", key=f"m_c4_{fish_uuid}")
+            c5 = st.checkbox("Ventral fins", key=f"m_c5_{fish_uuid}")
+            c6 = st.checkbox("Pectoral fins", key=f"m_c6_{fish_uuid}")
+        with shape_col:
+            m_shape = st.selectbox(
+                "Body Shape",
+                options=["", "Bullet Head", "Regular", "Spoonhead"],
+                index=0,
+                key=f"m_shape_{fish_uuid}",
+            )
+
+        notes = st.text_area(
+            "Notes",
+            placeholder="e.g. Starting to color up, dorsal showing good rays",
+            key=f"m_notes_{fish_uuid}",
+        )
+
+        submit = st.form_submit_button("Save Milestone", type="primary", use_container_width=True)
+
+    if not submit:
+        return
+
+    # Compute score if any checkbox checked OR shape selected
+    checks = {
+        "caudal_180": c1,
+        "caudal_prop": c2,
+        "dorsal_struct": c3,
+        "anal_struct": c4,
+        "ventral_fins": c5,
+        "pectoral_fins": c6,
+    }
+    any_check = any(checks.values())
+    score = None
+    if any_check or m_shape:
+        _, score = calculate_form_grade(checks, m_shape or "Regular")
+
+    add_milestone(
+        fish_id=fish_uuid,
+        milestone_date=str(m_date),
+        photo_file=photo_file,
+        form_score=score,
+        body_shape=m_shape,
+        fin_checks=checks if any_check else {},
+        notes=notes,
+    )
+    st.success("Milestone added.")
+    st.rerun()
+
+
+def _render_milestone_timeline(milestones: list[dict]):
+    """Display milestones as a photo grid with dates + scores."""
+    if not milestones:
+        st.caption("No milestones yet.")
+        return
+
+    # Trend summary
+    trend = compute_trend(milestones)
+    if trend["direction"] == "rising":
+        st.success(f"📈 Rising — latest score **{trend['latest_score']}** (+{trend['delta']})")
+    elif trend["direction"] == "falling":
+        st.warning(f"📉 Falling — latest score **{trend['latest_score']}** ({trend['delta']})")
+    elif trend["direction"] == "flat":
+        st.info(f"➡️ Flat — latest score **{trend['latest_score']}**")
+    # insufficient → no message
+
+    # Photo grid + metadata
+    cols = st.columns(3)
+    for idx, m in enumerate(milestones):
+        with cols[idx % 3]:
+            st.markdown(f"**{m.get('milestone_date') or '—'}**")
+            if m.get("photo_id"):
+                st.image(photo_url(m["photo_id"]), use_container_width=True)
+            else:
+                st.caption("📷 *No photo*")
+            if m.get("form_score") is not None:
+                st.caption(f"Score: **{m['form_score']}**")
+            if m.get("body_shape"):
+                st.caption(f"Shape: {m['body_shape']}")
+            if m.get("notes"):
+                st.caption(f"📝 {m['notes']}")
+
+            # Delete button per milestone
+            if st.button("🗑️ Delete", key=f"del_m_{m['id']}", use_container_width=True):
+                if remove_milestone(m["id"]):
+                    st.success("Milestone deleted.")
+                    st.rerun()
+
+
+def _render_milestones_section(fish: dict, milestones: list[dict]):
+    """Full milestones expander content: suggestions, add form, timeline."""
+    # 1. Suggestion banner (if trend-based suggestion exists)
+    suggestion = suggest_action(fish, milestones)
+    if suggestion:
+        if suggestion["kind"] == "promote":
+            st.success(f"{suggestion['icon']} **{suggestion['label']}** — {suggestion['reason']}")
+        else:
+            st.warning(f"{suggestion['icon']} **{suggestion['label']}** — {suggestion['reason']}")
+
+    # 2. Due indicator
+    if milestone_is_due(fish, milestones):
+        st.info(f"⏰ Milestone due — last check was {MILESTONE_INTERVAL_DAYS}+ days ago.")
+
+    # 3. Add milestone form (collapsible by using expander inside)
+    with st.expander("➕ Add Milestone", expanded=False):
+        _render_milestone_add_form(fish)
+
+    # 4. Timeline
+    st.markdown(f"**📸 Milestones ({len(milestones)})**")
+    _render_milestone_timeline(milestones)
+
+
+# ============================================================
 # CARD RENDERING
 # ============================================================
 
 CARD_PAGE_SIZE = 20
 
 
-def _render_fish_card(fish: dict):
+def _render_fish_card(fish: dict, milestone_count: int = 0):
     with st.container(border=True):
         if fish.get("photo_id"):
             st.image(photo_url(fish["photo_id"]), use_container_width=True)
@@ -392,8 +546,17 @@ def _render_fish_card(fish: dict):
         if fish.get("location"):
             st.write(f"🪣 **Location:** `{fish['location']}`")
 
+        # Milestone badge
+        if milestone_count:
+            st.caption(f"📸 {milestone_count} milestone{'s' if milestone_count != 1 else ''}")
+
         with st.expander("⚙️ Manage"):
             _render_card_actions(fish)
+
+        # Milestones expander (populated lazily to keep list fast)
+        with st.expander("📸 Milestones", expanded=False):
+            milestones = get_milestones_for_fish(fish["id"])
+            _render_milestones_section(fish, milestones)
 
 
 def _render_card_actions(fish: dict):
@@ -461,6 +624,9 @@ def render_list_tab():
         st.info("No fish registered yet. Use the Register tab to add your first fish.")
         return
 
+    # Fast milestone count lookup
+    milestone_counts = get_milestone_counts_by_fish()
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Fish", len(all_fish))
     m2.metric("Males", sum(1 for f in all_fish if (f.get("gender") or "").lower() == "male"))
@@ -512,7 +678,7 @@ def render_list_tab():
     cols = st.columns(2)
     for idx, fish in enumerate(page_items):
         with cols[idx % 2]:
-            _render_fish_card(fish)
+            _render_fish_card(fish, milestone_count=milestone_counts.get(fish["id"], 0))
 
 
 # ============================================================
