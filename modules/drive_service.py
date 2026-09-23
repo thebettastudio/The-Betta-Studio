@@ -1,9 +1,10 @@
 # modules/drive_service.py
 # Betta Farm Management System
-# Drive stays; Sheets support is being phased out (Session 18).
-# Session 7 fix: no import-time secret loading, safe fallbacks.
+# Session 7 — Drive-only. No import-time secret crash.
+# Session 17 — Removed Sheets remnants (SPREADSHEET_ID, get_spreadsheet_id).
 
 import os
+
 import streamlit as st
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -12,67 +13,46 @@ from googleapiclient.discovery import build
 
 SCOPES = [
     'https://www.googleapis.com/auth/drive.file',
-    'https://www.googleapis.com/auth/spreadsheets',   # kept for legacy modules
 ]
 
-DEFAULT_SPREADSHEET_ID = "1wYEjEyZgnWS7YEU_Xde4bjhQrOxMYfe2q-PV8YMVfIo"
 DEFAULT_DRIVE_FOLDER_ID = "1F0PmaZN_sUP5qDfIeSvsY6hSiYFSNO0y"
 
 
 # ============================================================
-# SECRET READERS — never raise at import time
+# SECRET READERS
 # ============================================================
 
 def _secret(name: str, default: str = "") -> str:
-    """
-    Read a secret from streamlit secrets or environment.
-    Returns default if secrets aren't available (e.g., local import tests).
-    """
-    # try streamlit secrets (may raise if no secrets file exists)
+    """Read a secret from streamlit secrets or environment. Never raises."""
     try:
         val = st.secrets.get(name)
         if val is not None:
             return str(val).strip()
     except Exception:
         pass
-    # try environment
     env = os.getenv(name)
     if env:
         return str(env).strip()
     return default
 
 
-def get_spreadsheet_id() -> str:
-    """Returns the sheet ID, or a safe default. Never raises."""
-    sid = _secret("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)
-    if len(sid) < 40:
-        return DEFAULT_SPREADSHEET_ID
-    return sid
-
-
 def get_drive_folder_id() -> str:
-    """Returns the Drive folder ID, or a safe default. Never raises."""
+    """Returns the Drive folder ID, or a safe default."""
     return _secret("DRIVE_FOLDER_ID", DEFAULT_DRIVE_FOLDER_ID)
 
 
-# ============================================================
-# BACKWARD-COMPAT GLOBALS
-# ============================================================
-# Old modules do `from modules.drive_service import SPREADSHEET_ID`.
-# We still define it, but now it can't crash at import time.
-SPREADSHEET_ID = get_spreadsheet_id()
+# Backward-compat global (nothing reads it anymore, but kept for safety)
 DRIVE_FOLDER_ID = get_drive_folder_id()
 
 
 # ============================================================
-# GOOGLE SERVICES
+# GOOGLE DRIVE
 # ============================================================
 
 def get_google_services():
     """
-    Returns (drive_service, sheets_service).
-    Only called from functions that actually need Drive/Sheets —
-    not at import time.
+    Returns (drive_service, None). The second element is always None
+    now that Sheets is retired — kept for backward-compat callers.
     """
     creds = None
 
@@ -88,7 +68,6 @@ def get_google_services():
                 scopes=SCOPES,
             )
     except Exception:
-        # No secrets file available (local import test) — fall through
         pass
 
     if creds and (not creds.valid or creds.expired):
@@ -105,13 +84,8 @@ def get_google_services():
         raise RuntimeError("Missing [oauth_token] configuration in Streamlit secrets.")
 
     drive_service = build('drive', 'v3', credentials=creds)
-    sheets_service = build('sheets', 'v4', credentials=creds)
-    return drive_service, sheets_service
+    return drive_service, None
 
-
-# ============================================================
-# DRIVE-ONLY (no Sheets) — used by photo_service and new modules
-# ============================================================
 
 def get_drive_service():
     """Returns just the Drive service. Preferred for new code."""
