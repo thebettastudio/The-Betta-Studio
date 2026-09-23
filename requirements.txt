@@ -8,3 +8,7 @@ gspread
 supabase
 python-dateutil
 graphviz
+plotly
+pillow
+qrcode[pil]
+pillow-heif
