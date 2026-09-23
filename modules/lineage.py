@@ -1,9 +1,7 @@
 # modules/lineage.py
 # Betta Farm Management System
 # Session 16 — Lineage tree traversal + Graphviz rendering.
-#
-# Builds nested tree dicts by walking fish.sire_id / fish.dam_id
-# upward (ancestors) or downward (descendants).
+# Session 19 — Added check_inbreeding() for pairing warnings.
 #
 # Node shape:
 #   {
@@ -67,11 +65,9 @@ def _build_ancestor_node(
     gen: int,
     depth: int,
 ) -> Optional[dict]:
-    # Base cases
     if gen > depth:
         return None
     if not fish_id or fish_id not in fish_by_id:
-        # Unknown once, don't recurse
         return _unknown_node(gen)
 
     fish = fish_by_id[fish_id]
@@ -90,23 +86,15 @@ def _build_ancestor_node(
 
 
 # ============================================================
-# DESCENDANTS (walk down via sire_id / dam_id and spawn links)
+# DESCENDANTS (walk down via sire_id / dam_id)
 # ============================================================
 
 def get_descendants(fish_id: str, depth: int = 4) -> Optional[dict]:
     """
     Return nested tree of descendants for a fish, up to `depth` generations.
-
-    Children are discovered by finding fish whose sire_id or dam_id
-    equals this fish. Each child becomes a node; each node's children are
-    the next generation.
-
-    Unlike ancestors, descendants are NOT binary (a fish can have many
-    children). We store them in a list under the "children" key.
     """
     fish_by_id = {f["id"]: f for f in get_all_fish()}
 
-    # Build reverse index: parent_id -> list of child fish
     children_by_parent: dict[str, list[dict]] = {}
     for f in fish_by_id.values():
         if f.get("sire_id"):
@@ -209,24 +197,21 @@ def _node_attrs(fish: Optional[dict], is_unknown: bool, is_focal: bool = False) 
         return 'shape=box, style="rounded,dashed", color="#888888", fontcolor="#666666"'
 
     if is_focal:
-        fill = "#c8e6c9"  # green
+        fill = "#c8e6c9"
     else:
         gender = (fish.get("gender") or "").lower()
         if gender == "male":
-            fill = "#bbdefb"  # blue
+            fill = "#bbdefb"
         elif gender == "female":
-            fill = "#f8bbd0"  # pink
+            fill = "#f8bbd0"
         else:
-            fill = "#e0e0e0"  # grey
+            fill = "#e0e0e0"
 
     return f'shape=box, style="rounded,filled", fillcolor="{fill}", color="#333333"'
 
 
 def tree_to_dot_ancestors(root: Optional[dict]) -> str:
-    """
-    Convert an ancestor tree to a Graphviz DOT string.
-    Layout: focal fish at bottom, ancestors above.
-    """
+    """Ancestor tree → Graphviz DOT. Focal fish at bottom, ancestors above."""
     if not root:
         return "digraph G {}"
 
@@ -250,14 +235,12 @@ def tree_to_dot_ancestors(root: Optional[dict]) -> str:
         attrs = _node_attrs(fish, is_unk, is_focal)
         lines.append(f'  {nid} [label="{label}", {attrs}];')
 
-        # Sire child
         sire = node.get("sire")
         if sire:
             sid = emit(sire)
             if sid:
                 lines.append(f"  {sid} -> {nid};")
 
-        # Dam child
         dam = node.get("dam")
         if dam:
             did = emit(dam)
@@ -272,10 +255,7 @@ def tree_to_dot_ancestors(root: Optional[dict]) -> str:
 
 
 def tree_to_dot_descendants(root: Optional[dict]) -> str:
-    """
-    Convert a descendant tree to a Graphviz DOT string.
-    Layout: focal fish at top, descendants below.
-    """
+    """Descendant tree → Graphviz DOT. Focal fish at top, descendants below."""
     if not root:
         return "digraph G {}"
 
@@ -352,3 +332,188 @@ def tree_to_text_descendants(node: Optional[dict], prefix: str = "") -> list[str
     for child in node.get("children") or []:
         out.extend(tree_to_text_descendants(child, prefix + "  "))
     return out
+
+
+# ============================================================
+# INBREEDING DETECTION (Session 19)
+# ============================================================
+#
+# Compares the ancestor trees of two fish and reports:
+#   - whether they share ancestors within 4 generations
+#   - the closest shared ancestor's generation on each side
+#   - a warning level: clear / distant / caution / risky / dangerous
+#
+# This is NOT a full Wright's coefficient. It's a simple, explainable
+# check that catches the common cases: siblings, parent-child,
+# half-siblings, cousins.
+
+_RELATIONSHIP_LEVELS = {
+    1: ("dangerous", "🔴", "Siblings or parent-child"),
+    2: ("risky",     "🟠", "Half-siblings or first cousins"),
+    3: ("caution",   "🟡", "Second cousins (great-grandparent shared)"),
+    4: ("distant",   "🟢", "Distant relation (4+ generations back)"),
+}
+
+
+def _collect_ancestors(
+    fish_id: str,
+    fish_by_id: dict,
+    max_depth: int = 4,
+) -> dict:
+    """
+    Walk up the ancestor tree. Returns { ancestor_id: min_generation_seen }.
+    Excludes the focal fish itself.
+    """
+    seen: dict[str, int] = {}
+
+    def walk(current_id: str, depth: int):
+        if depth > max_depth:
+            return
+        if not current_id or current_id not in fish_by_id:
+            return
+        prev = seen.get(current_id)
+        if prev is not None and prev <= depth:
+            return
+        seen[current_id] = depth
+
+        fish = fish_by_id[current_id]
+        walk(fish.get("sire_id"), depth + 1)
+        walk(fish.get("dam_id"), depth + 1)
+
+    focal = fish_by_id.get(fish_id)
+    if focal:
+        walk(focal.get("sire_id"), 1)
+        walk(focal.get("dam_id"), 1)
+
+    return seen
+
+
+def check_inbreeding(
+    male_id: str,
+    female_id: str,
+    max_depth: int = 4,
+) -> dict:
+    """
+    Compare ancestor trees of two fish.
+    Returns:
+      {
+        "level":       "clear" | "distant" | "caution" | "risky" | "dangerous",
+        "icon":        emoji,
+        "label":       short text,
+        "summary":     human-readable explanation,
+        "shared":      [ {id, system_id, male_gen, female_gen, closer_gen}, ... ],
+        "closest_gen": int or None,
+      }
+    """
+    fish_by_id = {f["id"]: f for f in get_all_fish()}
+
+    if male_id not in fish_by_id or female_id not in fish_by_id:
+        return {
+            "level": "clear",
+            "icon": "🟢",
+            "label": "Clear",
+            "summary": "Could not evaluate (missing parent record).",
+            "shared": [],
+            "closest_gen": None,
+        }
+
+    male_anc = _collect_ancestors(male_id, fish_by_id, max_depth)
+    female_anc = _collect_ancestors(female_id, fish_by_id, max_depth)
+
+    # Direct parent-child relationship (one is ancestor of the other)
+    if male_id in female_anc:
+        gen = female_anc[male_id]
+        target = fish_by_id.get(male_id, {})
+        return {
+            "level": "dangerous",
+            "icon": "🔴",
+            "label": "Dangerous",
+            "summary": (
+                f"Male is a direct ancestor of female "
+                f"({target.get('system_id', '?')}, {gen} generation"
+                f"{'s' if gen != 1 else ''} back)."
+            ),
+            "shared": [{
+                "id": male_id,
+                "system_id": target.get("system_id"),
+                "male_gen": 0,
+                "female_gen": gen,
+                "closer_gen": gen,
+            }],
+            "closest_gen": gen,
+        }
+
+    if female_id in male_anc:
+        gen = male_anc[female_id]
+        target = fish_by_id.get(female_id, {})
+        return {
+            "level": "dangerous",
+            "icon": "🔴",
+            "label": "Dangerous",
+            "summary": (
+                f"Female is a direct ancestor of male "
+                f"({target.get('system_id', '?')}, {gen} generation"
+                f"{'s' if gen != 1 else ''} back)."
+            ),
+            "shared": [{
+                "id": female_id,
+                "system_id": target.get("system_id"),
+                "male_gen": gen,
+                "female_gen": 0,
+                "closer_gen": gen,
+            }],
+            "closest_gen": gen,
+        }
+
+    shared_ids = set(male_anc.keys()) & set(female_anc.keys())
+
+    if not shared_ids:
+        return {
+            "level": "clear",
+            "icon": "🟢",
+            "label": "Clear",
+            "summary": "No shared ancestors within 4 generations. Safe pairing.",
+            "shared": [],
+            "closest_gen": None,
+        }
+
+    shared_list = []
+    for sid in shared_ids:
+        a = male_anc[sid]
+        b = female_anc[sid]
+        shared_list.append({
+            "id": sid,
+            "system_id": (fish_by_id.get(sid) or {}).get("system_id"),
+            "male_gen": a,
+            "female_gen": b,
+            "closer_gen": min(a, b),
+        })
+
+    shared_list.sort(key=lambda x: x["closer_gen"])
+    closest_gen = shared_list[0]["closer_gen"]
+
+    if closest_gen in _RELATIONSHIP_LEVELS:
+        level, icon, label = _RELATIONSHIP_LEVELS[closest_gen]
+    else:
+        level, icon, label = ("distant", "🟢", "Distant relation")
+
+    if closest_gen == 1:
+        summary = "Shared parent detected (siblings or parent-child)."
+    elif closest_gen == 2:
+        summary = "Shared grandparent detected (half-siblings or first cousins)."
+    elif closest_gen == 3:
+        summary = "Shared great-grandparent detected (second cousins)."
+    else:
+        summary = f"Shared ancestor detected {closest_gen} generations back."
+
+    if len(shared_list) > 1:
+        summary += f" {len(shared_list)} shared ancestors total."
+
+    return {
+        "level": level,
+        "icon": icon,
+        "label": label,
+        "summary": summary,
+        "shared": shared_list,
+        "closest_gen": closest_gen,
+    }
