@@ -1,31 +1,55 @@
 # modules/activity_logger.py
-from modules.drive_service import get_google_services, SPREADSHEET_ID
+# Betta Farm Management System
+# Session 14 — Ported to Supabase.
+#
+# Note: the DB table is `activity_log` (with an underscore).
+# All writes happen via database.log_activity() from other modules.
+# This module just provides read/filter helpers.
 
-def fetch_activity_logs():
-    """Fetches all activity log records from Google Sheets."""
-    _, sheets_service = get_google_services()
-    
-    try:
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Activity_Log!A2:E'
-        ).execute()
+from database import get_activity_log
 
-        rows = result.get('values', [])
-        logs = []
-        
-        for row in rows:
-            if not row:
+
+def fetch_activity_logs(limit: int = 500) -> list[dict]:
+    """
+    Fetch the most recent activity entries, newest first.
+    Each row: {id, ts, action_type, entity_type, entity_id,
+               description, photo_id, photo_url, metadata}
+    """
+    return get_activity_log(limit=limit)
+
+
+def filter_logs(
+    logs: list[dict],
+    query: str = "",
+    action_type: str = "",
+    entity_type: str = "",
+) -> list[dict]:
+    """
+    Filter activity entries by free-text query and/or exact action/entity type.
+    Query is matched against description, action_type, entity_type.
+    """
+    q = (query or "").strip().lower()
+    out = []
+    for entry in logs:
+        if action_type and (entry.get("action_type") or "") != action_type:
+            continue
+        if entity_type and (entry.get("entity_type") or "") != entity_type:
+            continue
+        if q:
+            haystack = " ".join([
+                str(entry.get("description") or ""),
+                str(entry.get("action_type") or ""),
+                str(entry.get("entity_type") or ""),
+            ]).lower()
+            if q not in haystack:
                 continue
-            logs.append({
-                "timestamp": row[0] if len(row) > 0 else "",
-                "action_type": row[1] if len(row) > 1 else "",
-                "description": row[2] if len(row) > 2 else "",
-                "photo_id": row[3] if len(row) > 3 else "",
-                "photo_url": row[4] if len(row) > 4 else ""
-            })
-            
-        return logs
-    except Exception as e:
-        print(f"Error fetching activity logs: {e}")
-        return []
+        out.append(entry)
+    return out
+
+
+def distinct_action_types(logs: list[dict]) -> list[str]:
+    return sorted({(e.get("action_type") or "").strip() for e in logs if e.get("action_type")})
+
+
+def distinct_entity_types(logs: list[dict]) -> list[str]:
+    return sorted({(e.get("entity_type") or "").strip() for e in logs if e.get("entity_type")})
