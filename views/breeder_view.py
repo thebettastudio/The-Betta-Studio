@@ -33,6 +33,7 @@ RETIREMENT_REASONS = [
     "Other"
 ]
 
+
 def evaluate_grade(caudal_180, caudal_prop, dorsal_good, anal_good, ventral_good, pectoral_good, body_shape, color_good):
     """
     Evaluates fish grade based on physical traits and IBC show criteria.
@@ -70,7 +71,8 @@ def render_merged_breeder_grid(breeders_list: list):
     cols = st.columns(2)
     for idx, b in enumerate(breeders_list):
         breeder_id = b['id']
-        is_retired = str(b.get('status', 'Active')).lower() == 'retired'
+        status_val = str(b.get('status', 'Available')).strip()
+        is_retired = status_val.lower() in ['retired', 'inactive', 'deceased', 'sold']
 
         with cols[idx % 2]:
             with st.container(border=True):
@@ -82,7 +84,7 @@ def render_merged_breeder_grid(breeders_list: list):
                     st.caption("📷 *No Photo Available*")
 
                 st.markdown(f"### {breeder_id}")
-                st.caption(f"**Sex:** {b['sex']} | **Status:** `{b.get('status', 'Active')}`")
+                st.caption(f"**Sex:** {b['sex']} | **Status:** `{status_val}`")
                 st.write(f"🧬 **Variety:** {b['variety']}")
                 st.write(f"🏷️ **Lineage:** {b['lineage']}")
                 st.write(f"📅 **DOB:** {b['dob']}")
@@ -94,7 +96,7 @@ def render_merged_breeder_grid(breeders_list: list):
 
                 # RETIRE BREEDER SECTION
                 if is_retired:
-                    st.caption("🚫 *This breeder is currently retired.*")
+                    st.caption("🚫 *This breeder is currently inactive/retired.*")
                 else:
                     with st.popover("🚫 Retire Breeder", use_container_width=True):
                         st.markdown("### Retire / Deactivate Breeder")
@@ -116,7 +118,7 @@ def render_merged_breeder_grid(breeders_list: list):
                             with st.spinner("Updating status..."):
                                 success = retire_breeder(breeder_id, reason=reason, notes=add_notes)
                             if success:
-                                st.success(f"Breeder {breeder_id} retired!")
+                                st.success(f"Breeder {breeder_id} marked as Retired/Inactive!")
                                 st.rerun()
                             else:
                                 st.error("Failed to update status.")
@@ -130,10 +132,10 @@ def render_breeder_page():
         "📋 Breeder Inventory & Gallery"
     ])
 
-    # Fetch all breeders once
+    # Fetch all breeders
     breeders = get_all_breeders()
 
-    # Split dataset into Males and Females
+    # Separate Males and Females
     males_list = [b for b in breeders if str(b.get("sex", "")).strip().lower() in ["male", "m", "♂️ male"]]
     females_list = [b for b in breeders if str(b.get("sex", "")).strip().lower() in ["female", "f", "♀️ female"]]
 
@@ -231,7 +233,7 @@ def render_breeder_page():
                         st.image(photo_file, caption=f"{full_variety} ({sex}) — {grade}", width=300)
 
     # ====================================================
-    # TAB 2: MERGED INVENTORY & GALLERY (MALE & FEMALE SEPARATED)
+    # TAB 2: INVENTORY & GALLERY (ACTIVE vs. INACTIVE)
     # ====================================================
     with tab2:
         col_title, col_btn = st.columns([4, 1])
@@ -263,14 +265,44 @@ def render_breeder_page():
 
             male_tab, female_tab = st.tabs(["♂️ Male Breeders", "♀️ Female Breeders"])
 
-            # Male Section
-            with male_tab:
-                active_males = sum(1 for b in filtered_males if str(b.get('status', '')).lower() == 'active')
-                st.caption(f"Showing **{len(filtered_males)}** Males | **{active_males}** Active")
-                render_merged_breeder_grid(filtered_males)
+            # Active vs. Inactive helper list splitters
+            def split_active_inactive(fish_list):
+                active = []
+                inactive = []
+                for f in fish_list:
+                    st_val = str(f.get('status', 'Available')).strip().lower()
+                    if st_val in ['retired', 'inactive', 'sold', 'deceased']:
+                        inactive.append(f)
+                    else:
+                        active.append(f)
+                return active, inactive
 
-            # Female Section
+            # --- Male Section ---
+            with male_tab:
+                active_males, inactive_males = split_active_inactive(filtered_males)
+                
+                m_sub_tab1, m_sub_tab2 = st.tabs([
+                    f"🟢 Active Males ({len(active_males)})", 
+                    f"🚫 Inactive / Retired Males ({len(inactive_males)})"
+                ])
+                
+                with m_sub_tab1:
+                    render_merged_breeder_grid(active_males)
+                
+                with m_sub_tab2:
+                    render_merged_breeder_grid(inactive_males)
+
+            # --- Female Section ---
             with female_tab:
-                active_females = sum(1 for b in filtered_females if str(b.get('status', '')).lower() == 'active')
-                st.caption(f"Showing **{len(filtered_females)}** Females | **{active_females}** Active")
-                render_merged_breeder_grid(filtered_females)
+                active_females, inactive_females = split_active_inactive(filtered_females)
+                
+                f_sub_tab1, f_sub_tab2 = st.tabs([
+                    f"🟢 Active Females ({len(active_females)})", 
+                    f"🚫 Inactive / Retired Females ({len(inactive_females)})"
+                ])
+                
+                with f_sub_tab1:
+                    render_merged_breeder_grid(active_females)
+                
+                with f_sub_tab2:
+                    render_merged_breeder_grid(inactive_females)
