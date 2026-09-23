@@ -3,6 +3,7 @@
 # Session 11 — Ported to Supabase via fish_manager, tank_registry,
 # database, photo_service, id_generator.
 # Session 16 — Added "View Lineage" button on each fish card.
+# Session 18 — Strains fully DB-managed (no more hardcoded defaults).
 
 import io
 import datetime
@@ -46,19 +47,6 @@ from modules.photo_service import upload_photo, photo_url
 # ============================================================
 # CONSTANTS
 # ============================================================
-
-DEFAULT_STRAINS = [
-    "Yellow Koi Galaxy",
-    "Red Koi Galaxy",
-    "Blue Rim",
-    "Avatar",
-    "Black Star / Samurai",
-    "Red Dragon",
-    "Copper Light",
-    "Fancy Marble",
-    "Super Red",
-    "Super Black",
-]
 
 FISH_TABLE_ICON = "🐠"
 
@@ -104,10 +92,8 @@ def _normalize_image_bytes(raw: bytes) -> bytes:
 # ============================================================
 
 def _get_strain_names() -> list[str]:
-    """Merged list of DB strains + defaults, deduped, sorted."""
-    db_strains = [s.get("name") for s in get_all_strains() if s.get("name")]
-    merged = set(DEFAULT_STRAINS) | set(db_strains)
-    return sorted(merged)
+    """All strain names from the DB, sorted."""
+    return sorted({s.get("name") for s in get_all_strains() if s.get("name")})
 
 
 def _strain_name_to_id(name: str) -> Optional[str]:
@@ -118,7 +104,7 @@ def _strain_name_to_id(name: str) -> Optional[str]:
 
 
 def _add_strain(name: str) -> bool:
-    """Create a strain in DB (idempotent-ish: skip if exists by name)."""
+    """Create a strain in DB. Refuses duplicates."""
     name = name.strip()
     if not name:
         return False
@@ -131,10 +117,10 @@ def _add_strain(name: str) -> bool:
 
 
 def _delete_strain(name: str) -> bool:
-    """Delete a strain by name if it exists in DB. Defaults can't be deleted."""
+    """Delete a strain by name if it exists in DB."""
     sid = _strain_name_to_id(name)
     if not sid:
-        st.toast(f"'{name}' is a built-in default and cannot be deleted.", icon="⚠️")
+        st.toast(f"'{name}' not found.", icon="⚠️")
         return False
     return delete_strain(sid)
 
