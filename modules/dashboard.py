@@ -1,89 +1,123 @@
+# modules/dashboard.py
+# Betta Farm Management System
+# Session 13 — Ported to Supabase via database + module helpers.
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from modules.tank_registry import get_all_tanks
-from modules.breeder_registry import get_all_breeders
-from modules.spawn_manager import get_all_spawns
+
+from database import get_all_fish, get_all_tanks, get_all_spawns, get_dashboard_counts
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _resolve_tank_location(tank_id, tank_by_id: dict) -> str:
+    """Given a tank uuid, return its location_code. Fallback: 'Unassigned'."""
+    if not tank_id:
+        return "Unassigned"
+    t = tank_by_id.get(tank_id)
+    return (t.get("location_code") if t else None) or "Unassigned"
+
+
+def _tanks_dataframe(tanks: list) -> pd.DataFrame:
+    """Build a display-ready dataframe from tank rows."""
+    if not tanks:
+        return pd.DataFrame()
+    rows = []
+    for t in tanks:
+        rows.append({
+            "System ID": t.get("system_id") or t.get("id"),
+            "Location": t.get("location_code") or "",
+            "Type": t.get("tank_type") or "",
+            "Capacity (L)": t.get("capacity_liters") or 0,
+            "Status": t.get("status") or "",
+            "Purpose": t.get("purpose") or "",
+            "Occupant": t.get("occupant_label") or "",
+            "Notes": t.get("notes") or "",
+        })
+    return pd.DataFrame(rows)
+
+
+def _breeders_dataframe(fish: list) -> pd.DataFrame:
+    """Build a display-ready dataframe from breeder fish rows."""
+    breeders = [f for f in fish if f.get("is_breeder")]
+    if not breeders:
+        return pd.DataFrame()
+    rows = []
+    for f in breeders:
+        rows.append({
+            "System ID": f.get("system_id") or "",
+            "Gender": f.get("gender") or "",
+            "Variety": f.get("variety") or "",
+            "Line": f.get("line_code") or "",
+            "Gen": f.get("generation") or "",
+            "Grade": f.get("grade") or "",
+            "Breeder Status": f.get("breeder_status") or "",
+            "Location": f.get("location") or "",
+            "Notes": f.get("notes") or "",
+        })
+    return pd.DataFrame(rows)
+
+
+def _spawns_dataframe(spawns: list, tank_by_id: dict) -> pd.DataFrame:
+    """Build a display-ready dataframe from spawn rows."""
+    if not spawns:
+        return pd.DataFrame()
+    rows = []
+    for s in spawns:
+        rows.append({
+            "Spawn ID": s.get("system_id") or s.get("id"),
+            "Code": s.get("spawn_code") or "",
+            "Line": s.get("line_code") or "",
+            "Gen": s.get("generation") or "",
+            "Male": s.get("male_id") or "",
+            "Female": s.get("female_id") or "",
+            "Pairing Date": s.get("pairing_date") or "",
+            "Status": s.get("status") or "",
+            "Batch": s.get("batch_name") or "",
+            "Free Swim": s.get("free_swimming_date") or "",
+            "Fry (est)": s.get("estimated_fry_count") or 0,
+            "Fry (final)": s.get("fry_count") or 0,
+            "Tank": _resolve_tank_location(s.get("tank_id"), tank_by_id),
+            "Goal": s.get("line_goal") or "",
+            "Notes": s.get("notes") or "",
+        })
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
 
 def render_dashboard():
     st.title("📊 Studio Overview Dashboard")
     st.caption("Central hub for tanks, breeder inventory, active spawning pairs, and facility metrics.")
 
     # --------------------------------------------------------------------------
-    # 1. DATA FETCHING & PREPARATION
+    # 1. DATA FETCH
     # --------------------------------------------------------------------------
+    fish = get_all_fish() or []
     tanks = get_all_tanks() or []
-    breeders = get_all_breeders() or []
     spawns = get_all_spawns() or []
 
-    df_tanks = pd.DataFrame(tanks) if tanks else pd.DataFrame()
-    df_breeders = pd.DataFrame(breeders) if breeders else pd.DataFrame()
-    df_spawns = pd.DataFrame(spawns) if spawns else pd.DataFrame()
-
-    # Normalize column names to lowercase for safe access
-    if not df_tanks.empty:
-        df_tanks.columns = [str(c).strip().lower() for c in df_tanks.columns]
-    if not df_breeders.empty:
-        df_breeders.columns = [str(c).strip().lower() for c in df_breeders.columns]
-    if not df_spawns.empty:
-        df_spawns.columns = [str(c).strip().lower() for c in df_spawns.columns]
-
-    # Normalize Tanks
-    if not df_tanks.empty:
-        if 'status' not in df_tanks.columns:
-            df_tanks['status'] = "Active"
-        else:
-            df_tanks['status'] = df_tanks['status'].fillna("Active").replace("", "Active")
-        
-        if 'type' not in df_tanks.columns:
-            df_tanks['type'] = "Unspecified"
-        else:
-            df_tanks['type'] = df_tanks['type'].fillna("Unspecified").replace("", "Unspecified")
-
-        total_tanks = len(df_tanks)
-        active_tanks = len(df_tanks[df_tanks['status'].astype(str).str.lower() == 'active'])
-        available_tanks = len(df_tanks[df_tanks['status'].astype(str).str.lower().isin(['available', 'empty', 'ready', 'idle', 'empty / idle'])])
-    else:
-        total_tanks = active_tanks = available_tanks = 0
-
-    # Normalize Breeders (handles both 'gender' and 'sex' keys)
-    if not df_breeders.empty:
-        if 'sex' in df_breeders.columns and 'gender' not in df_breeders.columns:
-            df_breeders['gender'] = df_breeders['sex']
-
-        if 'status' not in df_breeders.columns:
-            df_breeders['status'] = "Active"
-        else:
-            df_breeders['status'] = df_breeders['status'].fillna("Active").replace("", "Active")
-
-        if 'gender' not in df_breeders.columns:
-            df_breeders['gender'] = "Unknown"
-        else:
-            df_breeders['gender'] = df_breeders['gender'].fillna("Unknown").replace("", "Unknown")
-
-        total_breeders = len(df_breeders)
-        male_breeders = len(df_breeders[df_breeders['gender'].astype(str).str.lower().isin(['male', 'm'])])
-        female_breeders = len(df_breeders[df_breeders['gender'].astype(str).str.lower().isin(['female', 'f'])])
-    else:
-        total_breeders = male_breeders = female_breeders = 0
-
-    # Normalize Spawns
-    if not df_spawns.empty:
-        if 'status' not in df_spawns.columns:
-            df_spawns['status'] = "In Pairing"
-        else:
-            df_spawns['status'] = df_spawns['status'].fillna("In Pairing").replace("", "In Pairing")
-
-        total_spawns = len(df_spawns)
-        active_spawns = len(df_spawns[df_spawns['status'].astype(str).str.lower().isin([
-            'active', 'in pairing', 'pending (success)', 'free swimming', 'pairing', 'eggs'
-        ])])
-    else:
-        total_spawns = active_spawns = 0
+    tank_by_id = {t["id"]: t for t in tanks}
+    fish_by_id = {f["id"]: f for f in fish}
 
     # --------------------------------------------------------------------------
-    # 2. TOP KPI CARDS SUMMARY
+    # 2. KPI METRICS (use database aggregate for speed)
     # --------------------------------------------------------------------------
+    counts = get_dashboard_counts() or {}
+
+    total_tanks = counts.get("total_tanks", len(tanks))
+    available_tanks = counts.get("available_tanks", 0)
+    total_breeders = counts.get("total_breeders", 0)
+    male_breeders = counts.get("male_breeders", 0)
+    female_breeders = counts.get("female_breeders", 0)
+    total_spawns = counts.get("total_spawns", len(spawns))
+    active_spawns = counts.get("active_spawns", 0)
+
     st.subheader("🚀 Operational Quick Metrics")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Total Tanks", total_tanks)
@@ -96,92 +130,92 @@ def render_dashboard():
     st.markdown("---")
 
     # --------------------------------------------------------------------------
-    # 3. VISUAL DISTRIBUTION CHARTS
+    # 3. CHARTS
     # --------------------------------------------------------------------------
     st.subheader("📈 Studio Status & Asset Breakdown")
     chart_col1, chart_col2, chart_col3 = st.columns(3)
 
+    # Tank statuses
     with chart_col1:
         st.markdown("**🪣 Tank Statuses**")
-        if not df_tanks.empty and 'status' in df_tanks.columns:
-            tank_counts = df_tanks['status'].value_counts().reset_index()
-            tank_counts.columns = ['Status', 'Count']
-            fig_tanks = px.pie(
-                tank_counts, 
-                names='Status', 
-                values='Count',
+        if tanks:
+            df_t = pd.DataFrame([{"Status": t.get("status") or "Empty / Idle"} for t in tanks])
+            tank_counts = df_t["Status"].value_counts().reset_index()
+            tank_counts.columns = ["Status", "Count"]
+            fig = px.pie(
+                tank_counts, names="Status", values="Count",
                 hole=0.4,
-                color_discrete_sequence=px.colors.qualitative.Pastel
+                color_discrete_sequence=px.colors.qualitative.Pastel,
             )
-            fig_tanks.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=True)
-            st.plotly_chart(fig_tanks, use_container_width=True)
+            fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=True)
+            st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No tank data available.")
 
+    # Breeder gender balance
     with chart_col2:
         st.markdown("**🐟 Breeder Gender Balance**")
-        if not df_breeders.empty and 'gender' in df_breeders.columns:
-            breeder_counts = df_breeders['gender'].value_counts().reset_index()
-            breeder_counts.columns = ['Gender', 'Count']
-            fig_breeders = px.pie(
-                breeder_counts,
-                names='Gender',
-                values='Count',
+        breeders = [f for f in fish if f.get("is_breeder")]
+        if breeders:
+            df_b = pd.DataFrame([{"Gender": b.get("gender") or "Unknown"} for b in breeders])
+            gender_counts = df_b["Gender"].value_counts().reset_index()
+            gender_counts.columns = ["Gender", "Count"]
+            fig = px.pie(
+                gender_counts, names="Gender", values="Count",
                 hole=0.4,
-                color_discrete_sequence=['#1f77b4', '#e377c2', '#7f7f7f']
+                color_discrete_sequence=["#1f77b4", "#e377c2", "#7f7f7f"],
             )
-            fig_breeders.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=True)
-            st.plotly_chart(fig_breeders, use_container_width=True)
+            fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=True)
+            st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No breeder data available.")
 
+    # Spawn status breakdown
     with chart_col3:
-        st.markdown("**🧬 Active Spawning Stages**")
-        if not df_spawns.empty and 'status' in df_spawns.columns:
-            spawn_counts = df_spawns['status'].value_counts().reset_index()
-            spawn_counts.columns = ['Stage', 'Count']
-            fig_spawns = px.bar(
-                spawn_counts,
-                x='Stage',
-                y='Count',
-                text='Count',
-                color='Stage'
+        st.markdown("**🧬 Spawn Stages**")
+        if spawns:
+            df_s = pd.DataFrame([{"Stage": s.get("status") or "In Pairing"} for s in spawns])
+            spawn_counts = df_s["Stage"].value_counts().reset_index()
+            spawn_counts.columns = ["Stage", "Count"]
+            fig = px.bar(
+                spawn_counts, x="Stage", y="Count",
+                text="Count", color="Stage",
             )
-            fig_spawns.update_traces(textposition='outside')
-            fig_spawns.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10))
-            st.plotly_chart(fig_spawns, use_container_width=True)
+            fig.update_traces(textposition="outside")
+            fig.update_layout(showlegend=False, margin=dict(t=10, b=10, l=10, r=10))
+            st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No spawn records available.")
 
     st.markdown("---")
 
     # --------------------------------------------------------------------------
-    # 4. TABBED INVENTORY QUICK VIEWS
+    # 4. TABBED INVENTORY VIEWS
     # --------------------------------------------------------------------------
     st.subheader("📋 Studio Inventory Quick Inspection")
-    tab_tanks, tab_breeders, tab_spawns = st.tabs(["🪣 Tanks & Containers", "🐟 Breeder Inventory", "❤️ Pairings & Spawns"])
+    tab_tanks, tab_breeders, tab_spawns = st.tabs([
+        "🪣 Tanks & Containers",
+        "🐟 Breeder Inventory",
+        "❤️ Pairings & Spawns",
+    ])
 
     with tab_tanks:
-        if not df_tanks.empty:
-            cols_to_show = [c for c in ['id', 'location', 'type', 'capacity', 'status', 'purpose', 'occupant', 'notes'] if c in df_tanks.columns]
-            st.dataframe(df_tanks[cols_to_show if cols_to_show else df_tanks.columns], use_container_width=True, hide_index=True)
+        df = _tanks_dataframe(tanks)
+        if not df.empty:
+            st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.write("No registered tanks.")
 
     with tab_breeders:
-        if not df_breeders.empty:
-            cols_to_show = [c for c in ['id', 'tag_code', 'type', 'gender', 'sex', 'line_code', 'generation', 'status', 'variety', 'location', 'tank', 'notes'] if c in df_breeders.columns]
-            st.dataframe(df_breeders[cols_to_show if cols_to_show else df_breeders.columns], use_container_width=True, hide_index=True)
+        df = _breeders_dataframe(fish)
+        if not df.empty:
+            st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.write("No registered breeders.")
 
     with tab_spawns:
-        if not df_spawns.empty:
-            cols_to_show = [c for c in [
-                'id', 'line_code', 'generation', 'male_id', 'female_id', 
-                'pairing_date', 'status', 'batch_name', 'free_swim_date', 
-                'fry_count', 'failure_reason', 'tank', 'line_goal', 'notes'
-            ] if c in df_spawns.columns]
-            st.dataframe(df_spawns[cols_to_show if cols_to_show else df_spawns.columns], use_container_width=True, hide_index=True)
+        df = _spawns_dataframe(spawns, tank_by_id)
+        if not df.empty:
+            st.dataframe(df, use_container_width=True, hide_index=True)
         else:
-            st.write("No active spawns.")
+            st.write("No spawns.")
