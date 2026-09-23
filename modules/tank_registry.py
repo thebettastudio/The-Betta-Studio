@@ -1,404 +1,369 @@
 # modules/tank_registry.py
-import io
-import random
-import datetime
-import qrcode
+# Betta Farm Management System
+# Session 7 — Tank registry ported to Supabase.
+
+from __future__ import annotations
+
+from typing import Optional
+
 import streamlit as st
-from googleapiclient.http import MediaIoBaseUpload
-from modules.drive_service import (
-    get_google_services,
-    get_spreadsheet_id,
-    get_drive_folder_id
+
+from database import (
+    get_all_tanks,
+    get_tank_by_id,
+    create_tank,
+    update_tank,
+    delete_tank,
+    assign_occupant,
+    clear_occupant,
+    get_all_fish,
+    get_fish_by_id,
+    log_activity,
 )
+from modules.id_generator import (
+    generate_tank_system_id,
+    generate_tape_code,
+    get_tank_prefix_for_purpose,
+    all_purposes,
+)
+from modules.photo_service import upload_photo, upload_qr, delete_drive_file
 
-def ensure_tanks_tab_exists(sheets_service, spreadsheet_id: str) -> None:
+
+# ============================================================
+# VALID VALUES
+# ============================================================
+
+VALID_TANK_TYPES = [
+    "Grow-Out Planggana (Large)",
+    "Spawning Planggana (Small)",
+    "6-Liter Water Bottle",
+    "Empi Glass/Jar",
+    "Glass Aquarium",
+    "Sorority Basin",
+    "Quarantine Jar",
+    "Custom",
+]
+
+VALID_STATUSES = [
+    "Empty / Idle",
+    "Active",
+    "Occupied",
+    "Cleaning / Quarantine",
+    "Retired",
+]
+
+VALID_PURPOSES = [
+    "Jarring",
+    "Conditioning",
+    "Spawning",
+    "Fry Nursery",
+    "Grow-Out",
+    "Sorority",
+    "Quarantine",
+    "Sales Display",
+    "Storage",
+    "Other",
+]
+
+
+# ============================================================
+# READ
+# ============================================================
+
+def list_all_tanks() -> list[dict]:
+    return get_all_tanks()
+
+
+def find_tank(identifier: str) -> Optional[dict]:
+    """Look up by uuid, system_id, or location_code."""
+    if not identifier:
+        return None
+    ident = str(identifier).strip()
+    for t in get_all_tanks():
+        if t.get("id") == ident or \
+           t.get("system_id") == ident or \
+           t.get("location_code") == ident:
+            return t
+    return None
+
+
+def list_available_tanks(
+    purpose: Optional[str] = None,
+    include_active: bool = False,
+) -> list[dict]:
     """
-    Ensures the 'Tanks' worksheet tab exists with proper headers in Google Sheets.
+    Tanks that are empty/idle (or active if include_active=True),
+    optionally filtered by purpose.
     """
+    out = []
+    valid_statuses = {"empty / idle", "empty", "idle", "available", "ready"}
+    if include_active:
+        valid_statuses |= {"active", "occupied"}
+
+    for t in get_all_tanks():
+        status = (t.get("status") or "").lower().strip()
+        if status not in valid_statuses:
+            continue
+        if purpose and (t.get("purpose") or "").strip() != purpose:
+            continue
+        out.append(t)
+    return out
+
+
+def list_tanks_by_purpose(purpose: str) -> list[dict]:
+    return [t for t in get_all_tanks() if (t.get("purpose") or "") == purpose]
+
+
+def get_tank_dropdown_items(purpose: Optional[str] = None) -> list[dict]:
+    """
+    Dropdown items for spawning / assignment UIs.
+    Each item: {'id': uuid, 'label': '📍 JAR-0007 (Empi Glass/Jar)'}
+    """
+    out = []
+    for t in list_available_tanks(purpose=purpose):
+        loc = t.get("location_code") or t.get("system_id")
+        ttype = t.get("tank_type") or ""
+        label = f"📍 {loc}" + (f" ({ttype})" if ttype else "")
+        out.append({
+            "id": t["id"],
+            "system_id": t.get("system_id"),
+            "location_code": loc,
+            "label": label,
+        })
+    return out
+
+
+def get_tank_stats() -> dict:
+    tanks = get_all_tanks()
+    def _count(status_val):
+        return sum(1 for t in tanks if (t.get("status") or "").lower() == status_val)
+    return {
+        "total": len(tanks),
+        "empty_idle": _count("empty / idle") + _count("empty") + _count("idle"),
+        "active": _count("active"),
+        "occupied": _count("occupied"),
+        "cleaning": _count("cleaning / quarantine"),
+        "retired": _count("retired"),
+    }
+
+
+# ============================================================
+# CREATE
+# ============================================================
+
+def register_tank(
+    *,
+    tank_type: str,
+    capacity_liters: float,
+    purpose: str = "Other",
+    photo_file=None,
+    current_occupant_id: Optional[str] = None,
+    notes: str = "",
+) -> Optional[dict]:
+    """
+    Register a new tank.
+
+    - system_id is auto-generated (T00001)
+    - location_code (tape code) is auto-generated from PURPOSE
+      e.g. 'Jarring' -> JAR-0001, 'Spawning' -> SPN-0003
+    - status auto-detects from occupant
+    - Photo upload goes to Drive via photo_service
+    - QR code generated + uploaded to Drive
+    """
+    system_id = generate_tank_system_id()
+    location_code = generate_tape_code(purpose)
+
+    # Photo
+    photo_id = None
+    if photo_file is not None:
+        photo_id = upload_photo(photo_file, entity_type="tank", entity_id=system_id)
+
+    # QR
+    qr_id = None
     try:
-        sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-        sheets = sheet_metadata.get('sheets', [])
-        sheet_titles = [s['properties']['title'] for s in sheets]
-
-        # 1. Create 'Tanks' tab if missing
-        if "Tanks" not in sheet_titles:
-            body = {
-                'requests': [{
-                    'addSheet': {
-                        'properties': {'title': 'Tanks'}
-                    }
-                }]
-            }
-            sheets_service.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body=body
-            ).execute()
-
-        # 2. Add header row if empty
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range='Tanks!A1:K1'
-        ).execute()
-
-        headers = result.get('values', [])
-        if not headers:
-            header_row = [
-                "System ID", "Tank Type", "Tape Code", "Capacity (Liters)",
-                "Status", "Purpose", "Current Occupant", "Photo Drive ID",
-                "QR Drive ID", "Notes", "Date Registered"
-            ]
-            sheets_service.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range='Tanks!A1:K1',
-                valueInputOption='USER_ENTERED',
-                body={'values': [header_row]}
-            ).execute()
-
+        qr_bytes = _make_qr_png(location_code)   # QR encodes tape code — that's what humans scan
+        qr_id = upload_qr(qr_bytes, entity_type="tank", entity_id=system_id)
     except Exception as e:
-        print(f"Warning: Failed during ensure_tanks_tab_exists execution: {e}")
+        st.warning(f"QR generation failed: {e}")
 
-def get_next_tank_id(sheets_service, spreadsheet_id: str) -> str:
-    """Fetches existing IDs to compute the next sequential integer ID."""
-    try:
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range='Tanks!A2:A'
-        ).execute()
+    # Occupant + status
+    occupant_id = current_occupant_id or None
+    occupant_label = None
+    status = "Empty / Idle"
+    if occupant_id:
+        fish = get_fish_by_id(occupant_id)
+        if fish:
+            occupant_label = _fish_label(fish)
+            status = "Active"
 
-        rows = result.get('values', [])
-        max_id = 0
+    record = {
+        "system_id": system_id,
+        "tank_type": tank_type,
+        "location_code": location_code,
+        "capacity_liters": float(capacity_liters) if capacity_liters else None,
+        "status": status,
+        "purpose": purpose,
+        "occupant_fish_id": occupant_id,
+        "occupant_label": occupant_label,
+        "photo_id": photo_id,
+        "qr_id": qr_id,
+        "notes": notes,
+    }
 
-        for row in rows:
-            if row and row[0]:
-                val = str(row[0]).strip()
-                if val.isdigit():
-                    max_id = max(max_id, int(val))
+    saved = create_tank(record)
+    if saved:
+        # If we set an occupant, also mirror to fish.location
+        if occupant_id:
+            update_fish_location(occupant_id, location_code)
+        log_activity(
+            action_type="tank_registered",
+            description=f"Registered {location_code} ({tank_type}, {purpose})",
+            entity_type="tank",
+            entity_id=saved["id"],
+        )
+    return saved
 
-        return str(max_id + 1)
-    except Exception as e:
-        print(f"Error fetching next tank ID: {e}")
-        return "1"
 
-def generate_tape_code(tank_type: str, purpose: str = "") -> str:
+# ============================================================
+# UPDATE
+# ============================================================
+
+def edit_tank(tank_id: str, updates: dict) -> bool:
     """
-    Generates a short code for painter's tape labeling.
-    Checks purpose and type together to ensure roles like Spawning take priority.
+    Update tank fields. If photo_file in updates, replaces photo.
     """
-    combined_text = f"{tank_type} {purpose}".upper()
-    
-    # 1. Check for Spawning or Breeding FIRST
-    if any(k in combined_text for k in ["SPAWNING", "BREEDING", "SPAWN"]):
-        prefix = "SPN"
-    # 2. Check for explicit Grow-Out containers
-    elif "GROW-OUT" in combined_text or "GROW OUT" in combined_text:
-        prefix = "GO"
-    elif any(k in combined_text for k in ["JAR", "EMPI", "BOTTLE"]):
-        prefix = "JAR"
-    elif "SORORITY" in combined_text:
-        prefix = "SOR"
-    elif "QUARANTINE" in combined_text:
-        prefix = "QT"
-    # 3. Fallback prefix for Plangana/Planggana basins without Spawning role
-    elif "PLANGGANA" in combined_text or "PLANGANA" in combined_text:
-        prefix = "PLG"
-    else:
-        prefix = "TNK"
+    photo_file = updates.pop("photo_file", None)
+    if photo_file is not None:
+        tank = get_tank_by_id(tank_id)
+        old = tank.get("photo_id") if tank else None
+        new_id = upload_photo(photo_file, entity_type="tank", entity_id=tank_id)
+        if new_id:
+            updates["photo_id"] = new_id
+            if old:
+                delete_drive_file(old)
 
-    random_num = random.randint(1000, 9999)
-    return f"{prefix}-{random_num}"
+    ok = update_tank(tank_id, updates)
+    if ok:
+        log_activity(
+            action_type="tank_updated",
+            description=f"Updated fields: {', '.join(updates.keys())}",
+            entity_type="tank",
+            entity_id=tank_id,
+        )
+    return ok
 
-def generate_tank_qr(tank_id: str) -> io.BytesIO:
-    """Generates a QR Code PNG stream for a given Tank ID."""
+
+def set_tank_status(tank_id: str, new_status: str) -> bool:
+    """
+    Change status. Does NOT auto-sync occupant — use assign/clear for that.
+    """
+    return update_tank(tank_id, {"status": new_status})
+
+
+def assign_fish_to_tank(tank_id: str, fish_id: str) -> bool:
+    """
+    Assign a fish to a tank. Sets occupant_fish_id, occupant_label,
+    status='Active', and mirrors fish.location.
+    """
+    fish = get_fish_by_id(fish_id)
+    if not fish:
+        st.error(f"Fish {fish_id} not found.")
+        return False
+
+    label = _fish_label(fish)
+    ok = assign_occupant(tank_id, fish_id, label)
+    if ok:
+        tank = get_tank_by_id(tank_id)
+        loc = tank.get("location_code") if tank else None
+        if loc:
+            update_fish_location(fish_id, loc)
+        log_activity(
+            action_type="tank_assigned",
+            description=f"Assigned {fish.get('system_id')} to {loc}",
+            entity_type="tank",
+            entity_id=tank_id,
+        )
+    return ok
+
+
+def unassign_tank(tank_id: str) -> bool:
+    """
+    Remove occupant. Sets status='Empty / Idle'. Clears fish.location.
+    """
+    tank = get_tank_by_id(tank_id)
+    if not tank:
+        return False
+
+    fish_id = tank.get("occupant_fish_id")
+    if fish_id:
+        update_fish_location(fish_id, None)
+
+    ok = clear_occupant(tank_id)
+    if ok:
+        log_activity(
+            action_type="tank_unassigned",
+            description=f"Cleared occupant from {tank.get('location_code')}",
+            entity_type="tank",
+            entity_id=tank_id,
+        )
+    return ok
+
+
+def delete_tank_and_media(tank_id: str) -> bool:
+    """Delete tank + Drive media. Frees any assigned fish."""
+    tank = get_tank_by_id(tank_id)
+    if not tank:
+        return False
+
+    # Free the assigned fish
+    if tank.get("occupant_fish_id"):
+        update_fish_location(tank["occupant_fish_id"], None)
+
+    for f_id in (tank.get("photo_id"), tank.get("qr_id")):
+        if f_id:
+            delete_drive_file(f_id)
+
+    ok = delete_tank(tank_id)
+    if ok:
+        log_activity(
+            action_type="tank_deleted",
+            description=f"Deleted {tank.get('location_code')}",
+            entity_type="tank",
+        )
+    return ok
+
+
+# ============================================================
+# INTERNAL HELPERS
+# ============================================================
+
+def update_fish_location(fish_id: str, location: Optional[str]) -> bool:
+    """Mirror the tank tape code onto the fish row."""
+    from database import update_fish
+    return update_fish(fish_id, {"location": location})
+
+
+def _fish_label(fish: dict) -> str:
+    parts = [fish.get("system_id") or "?"]
+    if fish.get("gender"):  parts.append(fish["gender"])
+    if fish.get("variety"): parts.append(fish["variety"])
+    return " | ".join(str(p) for p in parts)
+
+
+def _make_qr_png(data: str):
+    """Generate a QR code PNG as bytes. Matches old box_size/border for printed labels."""
+    import io
+    import qrcode
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
         box_size=10,
         border=4,
     )
-    qr.add_data(str(tank_id))
+    qr.add_data(str(data))
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
-    
-    img_stream = io.BytesIO()
-    img.save(img_stream, format='PNG')
-    img_stream.seek(0)
-    return img_stream
-
-def upload_to_drive(drive_service, file_data, file_name: str, mime_type: str) -> str:
-    """Uploads a file directly to Google Drive and makes it readable."""
-    if hasattr(file_data, 'seek'):
-        file_data.seek(0)
-
-    if hasattr(file_data, 'getvalue'):
-        raw_bytes = file_data.getvalue()
-    elif hasattr(file_data, 'read'):
-        raw_bytes = file_data.read()
-    else:
-        raw_bytes = file_data
-
-    stream = io.BytesIO(raw_bytes)
-    media = MediaIoBaseUpload(stream, mimetype=mime_type, resumable=False)
-    folder_id = get_drive_folder_id()
-
-    metadata = {'name': file_name}
-    if folder_id:
-        metadata['parents'] = [folder_id]
-
-    uploaded = drive_service.files().create(
-        body=metadata,
-        media_body=media,
-        fields='id'
-    ).execute()
-    
-    file_id = uploaded.get('id')
-
-    try:
-        drive_service.permissions().create(
-            fileId=file_id,
-            body={'type': 'anyone', 'role': 'reader'}
-        ).execute()
-    except Exception as e:
-        print(f"Warning: Could not set permission on file {file_id}: {e}")
-
-    return file_id
-
-def register_tank(tank_type: str, capacity_liters: float, purpose: str = "General / Multi-purpose", photo_file=None, current_occupant: str = "", notes: str = "") -> dict:
-    """
-    Registers a new container, auto-syncs status based on occupant presence, 
-    uploads media (photo & QR) to Google Drive, and writes to Google Sheets.
-    """
-    drive_service, sheets_service = get_google_services()
-    spreadsheet_id = get_spreadsheet_id()
-
-    ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
-
-    tank_id = get_next_tank_id(sheets_service, spreadsheet_id)
-    # Passed both tank_type and purpose so Spawning gets prioritized as SPN
-    location_code = generate_tape_code(tank_type, purpose)
-
-    # Auto-determine status based on occupant presence
-    status = "Active" if current_occupant.strip() else "Empty / Idle"
-
-    photo_id = ""
-    if photo_file is not None:
-        try:
-            photo_name = f"tank_{tank_id}_photo.jpg"
-            photo_id = upload_to_drive(drive_service, photo_file, photo_name, 'image/jpeg')
-        except Exception as e:
-            st.error(f"Failed to upload photo: {e}")
-
-    qr_id = ""
-    try:
-        qr_stream = generate_tank_qr(tank_id)
-        qr_name = f"tank_{tank_id}_QR.png"
-        qr_id = upload_to_drive(drive_service, qr_stream, qr_name, 'image/png')
-    except Exception as e:
-        print(f"Warning: Failed to generate QR Code: {e}")
-
-    date_registered = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    row = [
-        tank_id, tank_type, location_code, str(capacity_liters),
-        status, purpose, current_occupant.strip(), photo_id,
-        qr_id, notes, date_registered
-    ]
-
-    sheets_service.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range='Tanks!A:K',
-        valueInputOption='USER_ENTERED',
-        body={'values': [row]}
-    ).execute()
-
-    direct_photo_url = f"https://drive.google.com/thumbnail?id={photo_id}&sz=w800" if photo_id else None
-
-    return {
-        "tank_id": tank_id,
-        "location_code": location_code,
-        "photo_id": photo_id,
-        "qr_id": qr_id,
-        "direct_photo_url": direct_photo_url
-    }
-
-def get_all_tanks() -> list:
-    """Fetches all registered tank records from Google Sheets (Columns A through K)."""
-    drive_service, sheets_service = get_google_services()
-    spreadsheet_id = get_spreadsheet_id()
-
-    try:
-        ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
-
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range='Tanks!A2:K'
-        ).execute()
-
-        rows = result.get('values', [])
-        tanks = []
-
-        for row in rows:
-            if not row or len(row) == 0:
-                continue
-            while len(row) < 11:
-                row.append("")
-
-            tanks.append({
-                "id": str(row[0]),
-                "type": str(row[1]),
-                "location": str(row[2]),
-                "capacity": str(row[3]),
-                "status": str(row[4]) if row[4] else "Empty / Idle",
-                "purpose": str(row[5]) if row[5] else "General / Multi-purpose",
-                "occupant": str(row[6]),
-                "photo_id": str(row[7]),
-                "qr_id": str(row[8]),
-                "notes": str(row[9]),
-                "date_registered": str(row[10])
-            })
-
-        return tanks
-    except Exception as e:
-        print(f"Error fetching tanks: {e}")
-        return []
-
-def update_tank_status(tank_id: str, new_status: str, purpose: str = "", occupant: str = "", notes: str = "") -> bool:
-    """
-    Locates tank row by ID and updates status, purpose, occupant, and notes across the 11-column schema.
-    Auto-syncs status to 'Active' if an occupant is assigned and status was 'Empty / Idle'.
-    Auto-syncs status to 'Empty / Idle' if occupant is removed and status was 'Active'.
-    """
-    try:
-        drive_service, sheets_service = get_google_services()
-        spreadsheet_id = get_spreadsheet_id()
-
-        ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
-
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range='Tanks!A:K'
-        ).execute()
-
-        rows = result.get('values', [])
-        target_row = None
-
-        for idx, row in enumerate(rows):
-            if row and len(row) > 0 and str(row[0]).strip() == str(tank_id).strip():
-                target_row = idx + 1
-                break
-
-        if not target_row:
-            return False
-
-        clean_occ = occupant.strip()
-
-        # Automatic status sync rule
-        if clean_occ and new_status == "Empty / Idle":
-            final_status = "Active"
-        elif not clean_occ and new_status == "Active":
-            final_status = "Empty / Idle"
-        else:
-            final_status = new_status
-
-        data = [
-            {
-                'range': f'Tanks!E{target_row}:G{target_row}',
-                'values': [[final_status, purpose, clean_occ]]
-            },
-            {
-                'range': f'Tanks!J{target_row}',
-                'values': [[notes]]
-            }
-        ]
-
-        sheets_service.spreadsheets().values.batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={
-                'valueInputOption': 'USER_ENTERED',
-                'data': data
-            }
-        ).execute()
-
-        return True
-    except Exception as e:
-        print(f"Error updating tank status: {e}")
-        return False
-
-def delete_tank(tank_id: str) -> bool:
-    """
-    Deletes a tank row from Google Sheets and deletes its associated photo and QR files from Google Drive.
-    """
-    try:
-        drive_service, sheets_service = get_google_services()
-        spreadsheet_id = get_spreadsheet_id()
-
-        ensure_tanks_tab_exists(sheets_service, spreadsheet_id)
-
-        # 1. Fetch worksheet metadata to find the internal sheetId for 'Tanks'
-        sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-        tanks_sheet_id = None
-        for s in sheet_metadata.get('sheets', []):
-            if s['properties']['title'] == 'Tanks':
-                tanks_sheet_id = s['properties']['sheetId']
-                break
-
-        if tanks_sheet_id is None:
-            st.error("Could not find 'Tanks' sheet tab.")
-            return False
-
-        # 2. Retrieve all rows (A:K) to locate target row index and Drive file IDs
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range='Tanks!A:K'
-        ).execute()
-
-        rows = result.get('values', [])
-        target_row_idx = None
-        photo_id = ""
-        qr_id = ""
-
-        for idx, row in enumerate(rows):
-            if row and str(row[0]).strip() == str(tank_id).strip():
-                target_row_idx = idx  # 0-indexed position
-                if len(row) > 7:
-                    photo_id = str(row[7])
-                if len(row) > 8:
-                    qr_id = str(row[8])
-                break
-
-        if target_row_idx is None:
-            st.error(f"Tank ID '{tank_id}' not found in Google Sheets.")
-            return False
-
-        # 3. Delete row via Google Sheets batchUpdate (deleteDimension request)
-        body = {
-            "requests": [
-                {
-                    "deleteDimension": {
-                        "range": {
-                            "sheetId": tanks_sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": target_row_idx,
-                            "endIndex": target_row_idx + 1
-                        }
-                    }
-                }
-            ]
-        }
-        sheets_service.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body=body
-        ).execute()
-
-        # 4. Cleanup media files from Google Drive if present
-        for file_id in [photo_id, qr_id]:
-            clean_file_id = file_id.strip()
-            if clean_file_id:
-                try:
-                    drive_service.files().delete(fileId=clean_file_id).execute()
-                except Exception as file_err:
-                    print(f"Warning: Could not delete Drive file {clean_file_id}: {file_err}")
-
-        return True
-    except Exception as e:
-        st.error(f"Error deleting tank: {e}")
-        return False
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf.getvalue()
