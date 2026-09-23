@@ -1,6 +1,7 @@
 # app.py
 # Betta Farm Management System
 # Session 17 — Navigation cleanup, Supabase diagnostic, new pages added.
+# Session 21 — Added Lines & Varieties page.
 
 import datetime
 
@@ -15,6 +16,7 @@ from views.tank_view            import render_tank_page
 from views.search_view          import render_search_page
 from views.fry_batch_view       import render_fry_batch_page
 from views.lineage_view         import render_lineage_page
+from views.lines_view           import render_lines_page
 from modules.dashboard          import render_dashboard
 
 
@@ -137,7 +139,7 @@ def run_supabase_diagnostic():
 
         st.divider()
         st.caption(
-            f"Session: 17 · Build: {datetime.date.today().isoformat()}"
+            f"Session: 21 · Build: {datetime.date.today().isoformat()}"
         )
 
 
@@ -156,6 +158,7 @@ page = st.sidebar.radio("Navigation", [
     "❤️ Pair & Spawn Tracker",
     "🐣 Fry Batch Tracking",
     "🌳 Lineage Tree",
+    "🧬 Lines & Varieties",
     "📝 Activity Log",
 ])
 
@@ -183,5 +186,7 @@ elif page == "🐣 Fry Batch Tracking":
     render_fry_batch_page()
 elif page == "🌳 Lineage Tree":
     render_lineage_page()
+elif page == "🧬 Lines & Varieties":
+    render_lines_page()
 elif page == "📝 Activity Log":
     render_activity_log_page()
