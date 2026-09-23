@@ -195,10 +195,10 @@ def get_all_breeders():
 
 def get_available_breeders():
     """
-    Fetches active breeders that are NOT currently assigned to any tank container.
-    Used by tank dropdowns to list available occupants.
+    Fetches active breeders that are NOT retired/inactive AND 
+    not currently assigned to any active tank container.
+    Used by pairing and tank dropdowns.
     """
-    # Import inside function to prevent top-level circular dependency with tank_registry
     try:
         from modules.tank_registry import get_all_tanks
         all_tanks = get_all_tanks()
@@ -213,19 +213,22 @@ def get_available_breeders():
     for t in all_tanks:
         occupant_raw = str(t.get('occupant', '')).strip()
         if occupant_raw and occupant_raw.lower() not in ["empty", "none", "n/a", ""]:
-            # Handle cases where occupant format is 'BRD-M-1234 | Variety' or raw ID 'BRD-M-1234'
+            # Extract raw ID from label formats like 'BRD-M-1234 | Variety'
             occ_id = occupant_raw.split(" | ")[0].strip()
             assigned_occupant_ids.add(occ_id)
 
-    # Filter breeders that are Active/Available and NOT assigned to a tank
+    # Valid statuses for available breeders
+    active_statuses = ["available", "active", "ready", "conditioning", "idle"]
+
     available = []
     for b in all_breeders:
         status_clean = str(b.get('status', 'Available')).strip().lower()
         breeder_id = str(b.get('id', '')).strip()
 
-        is_active = status_clean in ["available", "active"]
+        is_active = status_clean in active_statuses
         is_unassigned = breeder_id not in assigned_occupant_ids
 
+        # Exclude any breeder that is Retired, Inactive, Sold, or Deceased
         if is_active and is_unassigned:
             available.append(b)
 
@@ -236,6 +239,7 @@ def retire_breeder(breeder_id: str, reason: str, notes: str = "") -> bool:
     1. Locates breeder row by Breeder ID in Google Sheets.
     2. Updates Status (Column F) to 'Retired'.
     3. Appends retirement reason and extra notes to Notes (Column I).
+    4. Automatically frees up any tank occupied by this breeder in the Tanks sheet.
     """
     try:
         drive_service, sheets_service = get_google_services()
@@ -268,7 +272,7 @@ def retire_breeder(breeder_id: str, reason: str, notes: str = "") -> bool:
         retire_tag = f"[Retired: {reason}]"
         updated_notes = f"{existing_notes} | {retire_tag} {notes}".strip(" |") if existing_notes else f"{retire_tag} {notes}".strip()
 
-        # 1. Update Status in Column F (F{target_row_idx})
+        # 1. Update Status in Column F (F{target_row_idx}) to 'Retired'
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=f'Breeders!F{target_row_idx}',
@@ -283,6 +287,32 @@ def retire_breeder(breeder_id: str, reason: str, notes: str = "") -> bool:
             valueInputOption='USER_ENTERED',
             body={'values': [[updated_notes]]}
         ).execute()
+
+        # 3. Unlink from any occupied tank in Tanks worksheet
+        try:
+            tanks_res = sheets_service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range='Tanks!A2:G'
+            ).execute()
+            tank_rows = tanks_res.get('values', [])
+
+            for t_idx, t_row in enumerate(tank_rows, start=2):
+                if len(t_row) > 6:
+                    occ = str(t_row[6]).strip()
+                    if breeder_id in occ:
+                        # Clear occupant and set tank to Empty / Idle
+                        sheets_service.spreadsheets().values().batchUpdate(
+                            spreadsheetId=spreadsheet_id,
+                            body={
+                                'valueInputOption': 'USER_ENTERED',
+                                'data': [
+                                    {'range': f'Tanks!E{t_idx}', 'values': [["Empty / Idle"]]},
+                                    {'range': f'Tanks!G{t_idx}', 'values': [[""]]}
+                                ]
+                            }
+                        ).execute()
+        except Exception as tank_err:
+            print(f"Warning: Could not clear tank for retired breeder {breeder_id}: {tank_err}")
 
         return True
     except Exception as e:
