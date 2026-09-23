@@ -15,7 +15,7 @@ def format_spawns_sheet():
     - Navy blue Header Row with white bold text on Row 1
     - Resets rows 2+ to plain white background and dark text
     - Freezes top header row & configures row height
-    - Column G conditional color formatting for lifecycle statuses
+    - Conditional color formatting for lifecycle statuses
     """
     _, sheets_service = get_google_services()
 
@@ -282,12 +282,12 @@ def get_available_spawning_tanks():
 
 
 def get_breeder_details_map():
-    """Fetches all breeders and maps them by Breeder ID for fast lookup."""
+    """Fetches all breeders and maps them by Breeder ID with correct column indices."""
     _, sheets_service = get_google_services()
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Breeders!A2:Z'
+            range='Breeders!A2:J'
         ).execute()
 
         rows = result.get('values', [])
@@ -298,45 +298,48 @@ def get_breeder_details_map():
                 continue
 
             breeder_id = row[0].strip()
+            variety = row[2].strip() if len(row) > 2 else ""
+            lineage = row[3].strip() if len(row) > 3 else "UNK"
+            status = row[5].strip() if len(row) > 5 else "Available"
             photo_val = row[6] if len(row) > 6 else ""
+            notes = row[8] if len(row) > 8 else ""
 
-            line_code = "UNK"
-            generation = "P1"
-
-            if len(row) > 8 and row[8] and not row[8].startswith("["):
-                line_code = row[8].strip()
-            elif len(row) > 2 and row[2]:
-                line_code = row[2].strip()
-
-            if len(row) > 9 and row[9] and not row[9].startswith("["):
-                generation = row[9].strip()
+            # Extract Grade from Notes if present
+            grade = "N/A"
+            if "Grade:" in notes:
+                try:
+                    grade = notes.split("Grade:")[1].split("|")[0].strip()
+                except Exception:
+                    pass
 
             breeders_map[breeder_id] = {
                 "row_index": idx,
                 "id": breeder_id,
                 "sex": row[1] if len(row) > 1 else "",
-                "variety": row[2] if len(row) > 2 else "",
-                "status": row[3] if len(row) > 3 else "",
-                "tank": row[4] if len(row) > 4 else "",
-                "grade": row[5] if len(row) > 5 else "N/A",
+                "variety": variety,
+                "lineage": lineage,
+                "dob": row[4] if len(row) > 4 else "",
+                "status": status,
                 "photo_id": photo_val,
                 "image_url": photo_val,
-                "notes": row[7] if len(row) > 7 else "",
-                "line_code": line_code,
-                "generation": generation
+                "grade": grade,
+                "notes": notes,
+                "line_code": lineage or variety,
+                "generation": "P1"
             }
         return breeders_map
-    except Exception:
+    except Exception as e:
+        st.error(f"Error fetching breeder details map: {e}")
         return {}
 
 
 def get_available_breeders():
-    """Fetches active male and female breeders ready for pairing (excludes Retired/Inactive)."""
+    """Fetches active male and female breeders ready for pairing (Col F = Status)."""
     _, sheets_service = get_google_services()
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Breeders!A2:L'
+            range='Breeders!A2:F'
         ).execute()
 
         rows = result.get('values', [])
@@ -345,20 +348,20 @@ def get_available_breeders():
         active_statuses = ["available", "conditioning", "idle", "ready"]
 
         for idx, row in enumerate(rows, start=2):
-            if len(row) < 4:
+            if len(row) < 6:
                 continue
 
             breeder_id = row[0].strip()
-            sex = row[1].strip()
+            sex = row[1].strip().lower()
             variety = row[2].strip()
-            status = row[3].strip().lower()
+            status = row[5].strip().lower()  # Column F (Index 5) is Status
 
             if status in active_statuses:
                 label = f"{breeder_id} | {variety}"
                 item = {"row_index": idx, "id": breeder_id, "label": label}
-                if sex.lower() == "male":
+                if sex == "male":
                     males.append(item)
-                elif sex.lower() == "female":
+                elif sex == "female":
                     females.append(item)
 
         return males, females
@@ -666,19 +669,20 @@ def _find_spawn_by_id(sheets_service, spawn_id):
 
 
 def _update_breeder_status(sheets_service, breeder_id, new_status):
+    """Updates breeder status in Column F (Index 5)."""
     if not breeder_id:
         return
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Breeders!A2:D'
+            range='Breeders!A2:F'
         ).execute()
         rows = result.get('values', [])
         for idx, row in enumerate(rows, start=2):
             if row and row[0].strip() == breeder_id.strip():
                 sheets_service.spreadsheets().values().update(
                     spreadsheetId=SPREADSHEET_ID,
-                    range=f'Breeders!D{idx}',
+                    range=f'Breeders!F{idx}',
                     valueInputOption='USER_ENTERED',
                     body={'values': [[new_status]]}
                 ).execute()
@@ -709,7 +713,7 @@ def _update_tank_status(sheets_service, tank_identifier, new_status, occupant=No
                 if occupant is not None:
                     data_updates.append({'range': f'Tanks!G{idx}', 'values': [[occupant]]})
 
-                sheets_service.spreadsheets().values().batchUpdate(
+                sheets_service.spreadsheets().values.batchUpdate(
                     spreadsheetId=SPREADSHEET_ID,
                     body={
                         'valueInputOption': 'USER_ENTERED',
