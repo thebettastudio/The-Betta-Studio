@@ -1,6 +1,7 @@
 # modules/fish_manager.py
 # Betta Farm Management System
 # Session 6 — Fish + Breeder unified. Uses Supabase via database.py.
+# Session 9 — Added list_breeders() and register_breeder() for breeder_view.
 # breeder_registry.py is retired; all breeder logic lives here.
 
 from __future__ import annotations
@@ -21,7 +22,6 @@ from database import (
     get_available_breeders,
     get_all_tanks,
     get_all_spawns,
-    get_fish_by_id as _get_fish_by_id,  # alias for readability below
     log_activity,
 )
 from modules.id_generator import generate_fish_id, generate_batch_fish_id
@@ -83,18 +83,15 @@ def find_fish(identifier: str) -> Optional[dict]:
     """
     if not identifier:
         return None
-    # Try system_id first (more common from UI)
     fish = get_fish_by_system_id(identifier)
     if fish:
         return fish
-    # Fall back to uuid
     return get_fish_by_id(identifier)
 
 
 def get_fish_dropdown_items() -> list[dict]:
     """
-    Lightweight list for dropdowns. Returns id + label.
-    Excludes Deceased / Sold / Retired by default.
+    Lightweight list for dropdowns. Excludes Deceased / Sold / Retired.
     """
     out = []
     for f in get_all_fish():
@@ -224,7 +221,6 @@ def register_fish_from_spawn(
     if photo_file is not None:
         photo_id = upload_photo(photo_file, entity_type="fish", entity_id=system_id)
 
-    # Inherit variety from sire's variety if available
     variety = ""
     sire = get_fish_by_id(spawn.get("male_id"))
     if sire:
@@ -296,7 +292,6 @@ def change_location(fish_id: str, new_location: str) -> bool:
     if not fish:
         return False
 
-    # Free old tank if it was pointing at this fish
     old_loc = fish.get("location")
     if old_loc:
         for t in get_all_tanks():
@@ -305,7 +300,6 @@ def change_location(fish_id: str, new_location: str) -> bool:
                 clear_occupant(t["id"])
                 break
 
-    # Assign new tank if exists
     if new_location:
         for t in get_all_tanks():
             if t.get("location_code") == new_location:
@@ -322,7 +316,6 @@ def delete_fish_and_photos(fish_id: str) -> bool:
     if not fish:
         return False
 
-    # Free any tank holding this fish
     for t in get_all_tanks():
         if t.get("occupant_fish_id") == fish_id:
             from database import clear_occupant
@@ -345,6 +338,68 @@ def delete_fish_and_photos(fish_id: str) -> bool:
 # ============================================================
 # BREEDER BEHAVIOR
 # ============================================================
+
+def list_breeders(include_retired: bool = False) -> list[dict]:
+    """
+    Return all fish marked as breeders.
+    By default excludes Retired / Inactive breeder_status.
+    Used by breeder_view and any breeder inventory UI.
+    """
+    out = []
+    for f in get_all_fish():
+        if not f.get("is_breeder"):
+            continue
+        bs = (f.get("breeder_status") or "").strip().lower()
+        if not include_retired and bs in ("retired", "inactive"):
+            continue
+        out.append(f)
+    return out
+
+
+def register_breeder(
+    *,
+    sex: str,
+    variety: str,
+    lineage: str = "",
+    dob: Optional[str] = None,
+    photo_file=None,
+    notes: str = "",
+    grade: str = "Pet Grade",
+    body_shape: str = "",
+    fin_checks: Optional[dict] = None,
+) -> Optional[dict]:
+    """
+    Convenience wrapper: register a new fish AND immediately promote to breeder.
+    Used by breeder_view's Register Breeder form.
+
+    `lineage` becomes line_code (sanitized, upper-cased).
+    `dob` is stored in purchase_date (schema has no separate dob column).
+    """
+    from modules.id_generator import _sanitize
+
+    line_code = _sanitize(lineage, max_len=16) if lineage else "UNK"
+
+    fish = register_new_fish(
+        origin="Purchased",
+        gender=sex,
+        variety=variety,
+        form_type="HMPK",       # matches old breeder_view hardcoded prefix
+        grade=grade,
+        body_shape=body_shape,
+        fin_checks=fin_checks or {},
+        purchase_date=dob,
+        notes=notes,
+        photo_file=photo_file,
+        line_code=line_code,
+        generation="P1",
+        status="Conditioning",
+    )
+    if not fish:
+        return None
+
+    promote_to_breeder(fish["id"], breeder_status="Available")
+    return get_fish_by_id(fish["id"])
+
 
 def promote_to_breeder(fish_id: str, breeder_status: str = "Available") -> bool:
     """
@@ -381,8 +436,7 @@ def retire_breeder(fish_id: str, reason: str = "", notes: str = "") -> bool:
 
 def list_available_breeders(gender: Optional[str] = None) -> list[dict]:
     """
-    Available breeders, optionally filtered by gender.
-    Returns fish rows.
+    Available breeders, optionally filtered by gender. Returns fish rows.
     """
     breeders = get_available_breeders()
     if gender:
