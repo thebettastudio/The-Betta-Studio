@@ -1,425 +1,488 @@
-"""
-Supabase data layer for The Betta Studio.
-Replaces the old SQLite version.
+# database.py
+# Betta Farm Management System — Supabase wrapper
+# Session 3 deliverable — replaces all Google Sheets access.
 
-All functions return Python dicts (or lists of dicts) for easy
-consumption by Streamlit views.
-"""
-from typing import Optional
-from modules.supabase_client import get_supabase
+from __future__ import annotations
+
+import datetime as _dt
+from typing import Any, Optional
+
+import streamlit as st
+from supabase import create_client, Client
+
+from modules.supabase_client import get_supabase_client
 
 
 # ============================================================
-# TANKS
+# HELPERS
 # ============================================================
-def add_tank(tag_id: str, name: str, tank_type: str,
-             capacity_liters: Optional[float] = None,
-             status: str = "empty",
-             location_note: Optional[str] = None,
-             photo_url: Optional[str] = None,
-             qr_url: Optional[str] = None,
-             notes: Optional[str] = None) -> Optional[dict]:
-    """Insert a new tank. Returns the created row or None."""
-    data = {
-        "tag_id": tag_id,
-        "name": name,
-        "tank_type": tank_type,
-        "capacity_liters": capacity_liters,
-        "status": status,
-        "location_note": location_note,
-        "photo_url": photo_url,
-        "qr_url": qr_url,
-        "notes": notes,
-    }
-    data = {k: v for k, v in data.items() if v is not None}
-    res = get_supabase().table("tanks").insert(data).execute()
-    return res.data[0] if res.data else None
+
+def _sb() -> Client:
+    """Returns the shared Supabase client."""
+    return get_supabase_client()
 
 
-def get_tanks(status: Optional[str] = None,
-              tank_type: Optional[str] = None) -> list[dict]:
-    """List tanks, optionally filtered."""
-    q = get_supabase().table("tanks").select("*")
-    if status:
-        q = q.eq("status", status)
-    if tank_type:
-        q = q.eq("tank_type", tank_type)
-    return q.order("created_at", desc=True).execute().data
+def _today_iso() -> str:
+    return _dt.date.today().isoformat()
 
 
-def get_tank_by_id(tank_id: str) -> Optional[dict]:
-    res = get_supabase().table("tanks").select("*").eq("id", tank_id).execute()
-    return res.data[0] if res.data else None
-
-
-def get_tank_by_tag(tag_id: str) -> Optional[dict]:
-    res = get_supabase().table("tanks").select("*").eq("tag_id", tag_id).execute()
-    return res.data[0] if res.data else None
-
-
-def update_tank(tank_id: str, **fields) -> Optional[dict]:
-    res = get_supabase().table("tanks").update(fields).eq("id", tank_id).execute()
-    return res.data[0] if res.data else None
-
-
-def delete_tank(tank_id: str) -> bool:
-    res = get_supabase().table("tanks").delete().eq("id", tank_id).execute()
-    return bool(res.data)
+def _now_iso() -> str:
+    return _dt.datetime.now().isoformat(timespec="seconds")
 
 
 # ============================================================
 # FISH
 # ============================================================
-def add_fish(tag_id: Optional[str] = None,
-             name: Optional[str] = None,
-             variety: Optional[str] = None,
-             gender: str = "unknown",
-             stage: str = "fry",
-             status: str = "active",
-             birth_date: Optional[str] = None,
-             hatch_date: Optional[str] = None,
-             sire_id: Optional[str] = None,
-             dam_id: Optional[str] = None,
-             batch_id: Optional[str] = None,
-             batch_tag: Optional[str] = None,
-             tank_id: Optional[str] = None,
-             photo_url: Optional[str] = None,
-             qr_url: Optional[str] = None,
-             notes: Optional[str] = None) -> Optional[dict]:
-    """Insert a new fish record. Returns the created row."""
-    data = {
-        "tag_id": tag_id,
-        "name": name,
-        "variety": variety,
-        "gender": gender,
-        "stage": stage,
-        "status": status,
-        "birth_date": birth_date,
-        "hatch_date": hatch_date,
-        "sire_id": sire_id,
-        "dam_id": dam_id,
-        "batch_id": batch_id,
-        "batch_tag": batch_tag,
-        "tank_id": tank_id,
-        "photo_url": photo_url,
-        "qr_url": qr_url,
-        "notes": notes,
-    }
-    data = {k: v for k, v in data.items() if v is not None}
-    res = get_supabase().table("fish").insert(data).execute()
-    return res.data[0] if res.data else None
+
+FISH_FIELDS = [
+    "system_id", "origin", "batch_id", "line_code", "generation",
+    "sire_id", "dam_id", "gender", "variety", "strain", "form_type",
+    "grade", "body_shape", "form_score", "fin_checks",
+    "seller", "purchase_date", "purchase_cost",
+    "photo_id", "qr_id", "location",
+    "status", "is_breeder", "breeder_status",
+    "notes",
+]
 
 
-def get_fish(stage: Optional[str] = None,
-             status: Optional[str] = None,
-             gender: Optional[str] = None,
-             variety: Optional[str] = None,
-             limit: int = 500) -> list[dict]:
-    """List fish, optionally filtered."""
-    q = get_supabase().table("fish").select("*")
-    if stage:
-        q = q.eq("stage", stage)
-    if status:
-        q = q.eq("status", status)
-    if gender:
-        q = q.eq("gender", gender)
-    if variety:
-        q = q.eq("variety", variety)
-    return q.order("created_at", desc=True).limit(limit).execute().data
+def get_all_fish() -> list[dict]:
+    """Return every fish row, newest first."""
+    try:
+        res = _sb().table("fish").select("*").order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_all_fish failed: {e}")
+        return []
 
 
 def get_fish_by_id(fish_id: str) -> Optional[dict]:
-    res = get_supabase().table("fish").select("*").eq("id", fish_id).execute()
-    return res.data[0] if res.data else None
+    """Fetch one fish by its uuid."""
+    try:
+        res = _sb().table("fish").select("*").eq("id", fish_id).limit(1).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"get_fish_by_id failed: {e}")
+        return None
 
 
-def get_fish_by_tag(tag_id: str) -> Optional[dict]:
-    res = get_supabase().table("fish").select("*").eq("tag_id", tag_id).execute()
-    return res.data[0] if res.data else None
+def get_fish_by_system_id(system_id: str) -> Optional[dict]:
+    """Fetch one fish by its human-readable ID (e.g. FISH-0042)."""
+    try:
+        res = _sb().table("fish").select("*").eq("system_id", system_id).limit(1).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"get_fish_by_system_id failed: {e}")
+        return None
 
 
-def get_fish_by_batch(batch_id: str) -> list[dict]:
-    return (get_supabase().table("fish").select("*")
-            .eq("batch_id", batch_id)
-            .order("created_at").execute().data)
+def create_fish(data: dict) -> Optional[dict]:
+    """Insert a new fish row. `data` keys must match FISH_FIELDS."""
+    payload = {k: data.get(k) for k in FISH_FIELDS if k in data}
+    try:
+        res = _sb().table("fish").insert(payload).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_fish failed: {e}")
+        return None
 
 
-def get_breeders(gender: Optional[str] = None) -> list[dict]:
-    """Get fish with stage='breeder'."""
-    q = get_supabase().table("fish").select("*").eq("stage", "breeder")
-    if gender:
-        q = q.eq("gender", gender)
-    return q.order("tag_id").execute().data
-
-
-def update_fish(fish_id: str, **fields) -> Optional[dict]:
-    res = get_supabase().table("fish").update(fields).eq("id", fish_id).execute()
-    return res.data[0] if res.data else None
+def update_fish(fish_id: str, updates: dict) -> bool:
+    """Update a fish row by uuid. Only FISH_FIELDS keys are accepted."""
+    payload = {k: v for k, v in updates.items() if k in FISH_FIELDS}
+    if not payload:
+        return False
+    try:
+        _sb().table("fish").update(payload).eq("id", fish_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"update_fish failed: {e}")
+        return False
 
 
 def delete_fish(fish_id: str) -> bool:
-    res = get_supabase().table("fish").delete().eq("id", fish_id).execute()
-    return bool(res.data)
+    try:
+        _sb().table("fish").delete().eq("id", fish_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_fish failed: {e}")
+        return False
+
+
+def promote_fish_to_breeder(fish_id: str, breeder_status: str = "Available") -> bool:
+    """Flip is_breeder=true and set breeder_status."""
+    return update_fish(fish_id, {
+        "is_breeder": True,
+        "breeder_status": breeder_status,
+        "status": "Conditioning",
+    })
+
+
+def retire_fish(fish_id: str, reason: str = "", extra_notes: str = "") -> bool:
+    """Retire a breeder — clears tank link, sets status."""
+    fish = get_fish_by_id(fish_id)
+    if not fish:
+        return False
+    tag = f"[Retired: {reason}]" if reason else "[Retired]"
+    new_notes = (fish.get("notes") or "").strip()
+    new_notes = f"{new_notes} | {tag} {extra_notes}".strip(" |") if new_notes else f"{tag} {extra_notes}".strip()
+
+    ok = update_fish(fish_id, {
+        "is_breeder": False,
+        "breeder_status": "Retired",
+        "status": "Retired",
+        "notes": new_notes,
+        "location": None,
+    })
+
+    # Free any tank holding this fish
+    if fish.get("tank_id"):
+        update_tank(fish["tank_id"], {"occupant_fish_id": None, "occupant_label": None, "status": "Empty / Idle"})
+    return ok
+
+
+def get_available_breeders() -> list[dict]:
+    """Active breeders ready for pairing."""
+    try:
+        res = (_sb().table("fish")
+               .select("*")
+               .eq("is_breeder", True)
+               .in_("breeder_status", ["Available", "Conditioning", "Ready", "Idle"])
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_available_breeders failed: {e}")
+        return []
+
+
+def get_next_fish_sequence(prefix: str = "FISH-") -> str:
+    """Generate FISH-NNNN by counting existing system_ids with the prefix."""
+    try:
+        res = _sb().table("fish").select("system_id").like("system_id", f"{prefix}%").execute()
+        nums = []
+        for r in (res.data or []):
+            sid = r.get("system_id") or ""
+            tail = sid.replace(prefix, "").strip()
+            if tail.isdigit():
+                nums.append(int(tail))
+        nxt = (max(nums) + 1) if nums else 1
+        return f"{prefix}{nxt:04d}"
+    except Exception as e:
+        st.error(f"get_next_fish_sequence failed: {e}")
+        return f"{prefix}0001"
+
+
+# ============================================================
+# TANKS
+# ============================================================
+
+TANK_FIELDS = [
+    "system_id", "tank_type", "location_code", "capacity_liters",
+    "status", "purpose", "occupant_fish_id", "occupant_label",
+    "photo_id", "qr_id", "notes",
+]
+
+
+def get_all_tanks() -> list[dict]:
+    try:
+        res = _sb().table("tanks").select("*").order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_all_tanks failed: {e}")
+        return []
+
+
+def get_tank_by_id(tank_id: str) -> Optional[dict]:
+    try:
+        res = _sb().table("tanks").select("*").eq("id", tank_id).limit(1).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"get_tank_by_id failed: {e}")
+        return None
+
+
+def create_tank(data: dict) -> Optional[dict]:
+    payload = {k: data.get(k) for k in TANK_FIELDS if k in data}
+    try:
+        res = _sb().table("tanks").insert(payload).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_tank failed: {e}")
+        return None
+
+
+def update_tank(tank_id: str, updates: dict) -> bool:
+    payload = {k: v for k, v in updates.items() if k in TANK_FIELDS or k in ("date_registered",)}
+    if not payload:
+        return False
+    try:
+        _sb().table("tanks").update(payload).eq("id", tank_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"update_tank failed: {e}")
+        return False
+
+
+def delete_tank(tank_id: str) -> bool:
+    try:
+        _sb().table("tanks").delete().eq("id", tank_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_tank failed: {e}")
+        return False
+
+
+def assign_occupant(tank_id: str, fish_id: str, label: str) -> bool:
+    return update_tank(tank_id, {
+        "occupant_fish_id": fish_id,
+        "occupant_label": label,
+        "status": "Active",
+    })
+
+
+def clear_occupant(tank_id: str) -> bool:
+    return update_tank(tank_id, {
+        "occupant_fish_id": None,
+        "occupant_label": None,
+        "status": "Empty / Idle",
+    })
+
+
+def get_next_tank_sequence() -> str:
+    """Sequential integer string ("1", "2", "3", ...)."""
+    try:
+        res = _sb().table("tanks").select("system_id").execute()
+        nums = [int(r["system_id"]) for r in (res.data or []) if str(r.get("system_id", "")).isdigit()]
+        return str((max(nums) + 1) if nums else 1)
+    except Exception as e:
+        st.error(f"get_next_tank_sequence failed: {e}")
+        return "1"
 
 
 # ============================================================
 # SPAWNS
 # ============================================================
-def add_spawn(spawn_code: str,
-              sire_id: Optional[str] = None,
-              dam_id: Optional[str] = None,
-              pair_date: Optional[str] = None,
-              spawn_date: Optional[str] = None,
-              hatch_date: Optional[str] = None,
-              eggs_count: int = 0,
-              fry_count: int = 0,
-              outcome: str = "pending",
-              tank_id: Optional[str] = None,
-              notes: Optional[str] = None) -> Optional[dict]:
-    data = {
-        "spawn_code": spawn_code,
-        "sire_id": sire_id,
-        "dam_id": dam_id,
-        "pair_date": pair_date,
-        "spawn_date": spawn_date,
-        "hatch_date": hatch_date,
-        "eggs_count": eggs_count,
-        "fry_count": fry_count,
-        "outcome": outcome,
-        "tank_id": tank_id,
-        "notes": notes,
-    }
-    data = {k: v for k, v in data.items() if v is not None}
-    res = get_supabase().table("spawns").insert(data).execute()
-    return res.data[0] if res.data else None
+
+SPAWN_FIELDS = [
+    "system_id", "line_code", "generation",
+    "male_id", "female_id",
+    "pairing_date", "status",
+    "batch_name", "free_swimming_date", "jarring_date",
+    "estimated_fry_count", "fry_count",
+    "failure_reason", "tank_id", "line_goal", "notes",
+]
 
 
-def get_spawns(outcome: Optional[str] = None,
-               limit: int = 200) -> list[dict]:
-    q = get_supabase().table("spawns").select("*")
-    if outcome:
-        q = q.eq("outcome", outcome)
-    return q.order("pair_date", desc=True).limit(limit).execute().data
+def get_all_spawns() -> list[dict]:
+    try:
+        res = _sb().table("spawns").select("*").order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_all_spawns failed: {e}")
+        return []
 
 
 def get_spawn_by_id(spawn_id: str) -> Optional[dict]:
-    res = get_supabase().table("spawns").select("*").eq("id", spawn_id).execute()
-    return res.data[0] if res.data else None
+    try:
+        res = _sb().table("spawns").select("*").eq("id", spawn_id).limit(1).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"get_spawn_by_id failed: {e}")
+        return None
 
 
-def get_spawn_by_code(spawn_code: str) -> Optional[dict]:
-    res = get_supabase().table("spawns").select("*").eq("spawn_code", spawn_code).execute()
-    return res.data[0] if res.data else None
+def create_spawn(data: dict) -> Optional[dict]:
+    payload = {k: data.get(k) for k in SPAWN_FIELDS if k in data}
+    try:
+        res = _sb().table("spawns").insert(payload).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_spawn failed: {e}")
+        return None
 
 
-def update_spawn(spawn_id: str, **fields) -> Optional[dict]:
-    res = get_supabase().table("spawns").update(fields).eq("id", spawn_id).execute()
-    return res.data[0] if res.data else None
+def update_spawn(spawn_id: str, updates: dict) -> bool:
+    payload = {k: v for k, v in updates.items() if k in SPAWN_FIELDS}
+    if not payload:
+        return False
+    try:
+        _sb().table("spawns").update(payload).eq("id", spawn_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"update_spawn failed: {e}")
+        return False
 
 
 def delete_spawn(spawn_id: str) -> bool:
-    res = get_supabase().table("spawns").delete().eq("id", spawn_id).execute()
-    return bool(res.data)
+    try:
+        _sb().table("spawns").delete().eq("id", spawn_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_spawn failed: {e}")
+        return False
+
+
+def get_next_spawn_code() -> str:
+    """SPN-YY-NN, resetting per year."""
+    yy = _dt.date.today().strftime("%y")
+    prefix = f"SPN-{yy}-"
+    try:
+        res = _sb().table("spawns").select("system_id").like("system_id", f"{prefix}%").execute()
+        nums = []
+        for r in (res.data or []):
+            tail = (r.get("system_id") or "").replace(prefix, "").strip()
+            if tail.isdigit():
+                nums.append(int(tail))
+        nxt = (max(nums) + 1) if nums else 1
+        return f"{prefix}{nxt:02d}"
+    except Exception as e:
+        st.error(f"get_next_spawn_code failed: {e}")
+        return f"{prefix}01"
+
+
+# ============================================================
+# STRAINS
+# ============================================================
+
+def get_all_strains() -> list[dict]:
+    try:
+        res = _sb().table("strains").select("*").order("name").execute()
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_all_strains failed: {e}")
+        return []
+
+
+def create_strain(name: str, line_code: str = "", description: str = "") -> Optional[dict]:
+    try:
+        res = _sb().table("strains").insert({
+            "name": name, "line_code": line_code, "description": description,
+        }).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_strain failed: {e}")
+        return None
+
+
+# ============================================================
+# ACTIVITY LOG
+# ============================================================
+
+def log_activity(
+    action_type: str,
+    description: str,
+    entity_type: Optional[str] = None,
+    entity_id: Optional[str] = None,
+    photo_id: Optional[str] = None,
+    photo_url: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> bool:
+    try:
+        _sb().table("activity_log").insert({
+            "action_type": action_type,
+            "description": description,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "photo_id": photo_id,
+            "photo_url": photo_url,
+            "metadata": metadata or {},
+        }).execute()
+        return True
+    except Exception as e:
+        # Logging should never break the app
+        print(f"log_activity failed: {e}")
+        return False
+
+
+def get_activity_log(limit: int = 200) -> list[dict]:
+    try:
+        res = (_sb().table("activity_log")
+               .select("*")
+               .order("ts", desc=True)
+               .limit(limit)
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_activity_log failed: {e}")
+        return []
 
 
 # ============================================================
 # FRY BATCHES
 # ============================================================
-def add_batch(batch_tag: str,
-              spawn_id: str,
-              hatch_date: Optional[str] = None,
-              initial_count: int = 0,
-              current_count: Optional[int] = None,
-              stage: str = "fry",
-              tank_id: Optional[str] = None,
-              notes: Optional[str] = None) -> Optional[dict]:
-    if current_count is None:
-        current_count = initial_count
-    data = {
-        "batch_tag": batch_tag,
-        "spawn_id": spawn_id,
-        "hatch_date": hatch_date,
-        "initial_count": initial_count,
-        "current_count": current_count,
-        "stage": stage,
-        "tank_id": tank_id,
-        "notes": notes,
-    }
-    res = get_supabase().table("fry_batches").insert(data).execute()
-    return res.data[0] if res.data else None
+
+FRY_BATCH_FIELDS = [
+    "batch_tag", "batch_code", "spawn_id", "hatch_date", "jarring_date",
+    "initial_count", "current_count", "stage", "tank_id", "notes",
+]
 
 
-def get_batches(stage: Optional[str] = None) -> list[dict]:
-    q = get_supabase().table("fry_batches").select("*")
-    if stage:
-        q = q.eq("stage", stage)
-    return q.order("created_at", desc=True).execute().data
+def get_all_fry_batches() -> list[dict]:
+    try:
+        res = _sb().table("fry_batches").select("*").order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_all_fry_batches failed: {e}")
+        return []
 
 
-def get_batch_by_id(batch_id: str) -> Optional[dict]:
-    res = get_supabase().table("fry_batches").select("*").eq("id", batch_id).execute()
-    return res.data[0] if res.data else None
+def create_fry_batch(data: dict) -> Optional[dict]:
+    payload = {k: data.get(k) for k in FRY_BATCH_FIELDS if k in data}
+    try:
+        res = _sb().table("fry_batches").insert(payload).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_fry_batch failed: {e}")
+        return None
 
 
-def get_batch_by_tag(batch_tag: str) -> Optional[dict]:
-    res = get_supabase().table("fry_batches").select("*").eq("batch_tag", batch_tag).execute()
-    return res.data[0] if res.data else None
-
-
-def update_batch(batch_id: str, **fields) -> Optional[dict]:
-    res = get_supabase().table("fry_batches").update(fields).eq("id", batch_id).execute()
-    return res.data[0] if res.data else None
-
-
-def delete_batch(batch_id: str) -> bool:
-    res = get_supabase().table("fry_batches").delete().eq("id", batch_id).execute()
-    return bool(res.data)
+def update_fry_batch(batch_id: str, updates: dict) -> bool:
+    payload = {k: v for k, v in updates.items() if k in FRY_BATCH_FIELDS}
+    if not payload:
+        return False
+    try:
+        _sb().table("fry_batches").update(payload).eq("id", batch_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"update_fry_batch failed: {e}")
+        return False
 
 
 # ============================================================
-# PHOTOS
+# DASHBOARD AGGREGATES (single round-trip)
 # ============================================================
-def add_photo(entity_type: str,
-              entity_id: str,
-              photo_url: str,
-              drive_file_id: Optional[str] = None,
-              caption: Optional[str] = None,
-              is_primary: bool = False,
-              taken_at: Optional[str] = None) -> Optional[dict]:
-    data = {
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "photo_url": photo_url,
-        "drive_file_id": drive_file_id,
-        "caption": caption,
-        "is_primary": is_primary,
-        "taken_at": taken_at,
-    }
-    data = {k: v for k, v in data.items() if v is not None}
-    res = get_supabase().table("photos").insert(data).execute()
-    return res.data[0] if res.data else None
 
-
-def get_photos(entity_type: str, entity_id: str) -> list[dict]:
-    return (get_supabase().table("photos").select("*")
-            .eq("entity_type", entity_type)
-            .eq("entity_id", entity_id)
-            .order("created_at", desc=True).execute().data)
-
-
-def get_primary_photo(entity_type: str, entity_id: str) -> Optional[dict]:
-    res = (get_supabase().table("photos").select("*")
-           .eq("entity_type", entity_type)
-           .eq("entity_id", entity_id)
-           .eq("is_primary", True)
-           .limit(1).execute())
-    return res.data[0] if res.data else None
-
-
-def set_primary_photo(entity_type: str, entity_id: str, photo_id: str) -> bool:
-    # Clear existing primary
-    get_supabase().table("photos").update({"is_primary": False}) \
-        .eq("entity_type", entity_type).eq("entity_id", entity_id).execute()
-    # Set new primary
-    res = (get_supabase().table("photos").update({"is_primary": True})
-           .eq("id", photo_id).execute())
-    return bool(res.data)
-
-
-def delete_photo(photo_id: str) -> bool:
-    res = get_supabase().table("photos").delete().eq("id", photo_id).execute()
-    return bool(res.data)
-
-
-# ============================================================
-# EVENTS (audit log)
-# ============================================================
-def log_event(entity_type: str,
-              entity_id: Optional[str],
-              event_type: str,
-              description: Optional[str] = None,
-              metadata: Optional[dict] = None) -> Optional[dict]:
-    data = {
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "event_type": event_type,
-        "description": description,
-        "metadata": metadata,
-    }
-    data = {k: v for k, v in data.items() if v is not None}
-    res = get_supabase().table("events").insert(data).execute()
-    return res.data[0] if res.data else None
-
-
-def get_events(entity_type: Optional[str] = None,
-               entity_id: Optional[str] = None,
-               limit: int = 100) -> list[dict]:
-    q = get_supabase().table("events").select("*")
-    if entity_type:
-        q = q.eq("entity_type", entity_type)
-    if entity_id:
-        q = q.eq("entity_id", entity_id)
-    return q.order("event_date", desc=True).limit(limit).execute().data
-
-
-# ============================================================
-# INVENTORY
-# ============================================================
-def add_inventory(name: str,
-                  category: Optional[str] = None,
-                  quantity: float = 0,
-                  unit: Optional[str] = None,
-                  reorder_level: Optional[float] = None,
-                  notes: Optional[str] = None) -> Optional[dict]:
-    data = {
-        "name": name,
-        "category": category,
-        "quantity": quantity,
-        "unit": unit,
-        "reorder_level": reorder_level,
-        "notes": notes,
-    }
-    data = {k: v for k, v in data.items() if v is not None}
-    res = get_supabase().table("inventory").insert(data).execute()
-    return res.data[0] if res.data else None
-
-
-def get_inventory(category: Optional[str] = None) -> list[dict]:
-    q = get_supabase().table("inventory").select("*")
-    if category:
-        q = q.eq("category", category)
-    return q.order("name").execute().data
-
-
-def update_inventory(item_id: str, **fields) -> Optional[dict]:
-    res = get_supabase().table("inventory").update(fields).eq("id", item_id).execute()
-    return res.data[0] if res.data else None
-
-
-def delete_inventory(item_id: str) -> bool:
-    res = get_supabase().table("inventory").delete().eq("id", item_id).execute()
-    return bool(res.data)
-
-
-# ============================================================
-# DASHBOARD COUNTS (for the main dashboard)
-# ============================================================
 def get_dashboard_counts() -> dict:
-    """Return counts for the dashboard's summary cards."""
-    sb = get_supabase()
+    """Returns the 6 KPI numbers the dashboard needs in one call."""
+    try:
+        fish = _sb().table("fish").select("id,is_breeder,breeder_status,status,gender").execute().data or []
+        tanks = _sb().table("tanks").select("id,status").execute().data or []
+        spawns = _sb().table("spawns").select("id,status").execute().data or []
 
-    def _count(table: str, **filters) -> int:
-        q = sb.table(table).select("*", count="exact")
-        for k, v in filters.items():
-            q = q.eq(k, v)
-        res = q.execute()
-        return res.count or 0
+        total_tanks = len(tanks)
+        available_tanks = sum(
+            1 for t in tanks
+            if (t.get("status") or "").lower() in ("empty / idle", "empty", "idle", "available", "ready")
+        )
 
-    return {
-        "total_fish":       _count("fish"),
-        "active_breeders":  _count("fish", stage="breeder", status="active"),
-        "total_tanks":      _count("tanks"),
-        "occupied_tanks":   _count("tanks", status="occupied"),
-        "total_spawns":     _count("spawns"),
-        "active_batches":   _count("fry_batches"),
-    }
+        total_breeders = sum(1 for f in fish if f.get("is_breeder"))
+        males = sum(1 for f in fish if f.get("is_breeder") and (f.get("gender") or "").lower() == "male")
+        females = sum(1 for f in fish if f.get("is_breeder") and (f.get("gender") or "").lower() == "female")
+
+        active_spawn_states = {"in pairing", "pending (success)", "free swimming", "pairing", "eggs"}
+        active_spawns = sum(
+            1 for s in spawns
+            if (s.get("status") or "").lower() in active_spawn_states
+        )
+
+        return {
+            "total_tanks": total_tanks,
+            "available_tanks": available_tanks,
+            "total_breeders": total_breeders,
+            "male_breeders": males,
+            "female_breeders": females,
+            "total_spawns": len(spawns),
+            "active_spawns": active_spawns,
+        }
+    except Exception as e:
+        st.error(f"get_dashboard_counts failed: {e}")
+        return {}
