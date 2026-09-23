@@ -1,11 +1,12 @@
 # database.py
 # Betta Farm Management System — Supabase wrapper
 # Session 3 deliverable — replaces all Google Sheets access.
+# Session 11 — added delete_strain().
 
 from __future__ import annotations
 
 import datetime as _dt
-from typing import Any, Optional
+from typing import Optional
 
 import streamlit as st
 from supabase import create_client, Client
@@ -39,9 +40,9 @@ FISH_FIELDS = [
     "sire_id", "dam_id", "gender", "variety", "strain", "form_type",
     "grade", "body_shape", "form_score", "fin_checks",
     "seller", "purchase_date", "purchase_cost",
-    "photo_id", "qr_id", "location",
+    "photo_id", "qr_id", "location", "tank_id",
     "status", "is_breeder", "breeder_status",
-    "notes",
+    "notes", "stage",
 ]
 
 
@@ -132,6 +133,7 @@ def retire_fish(fish_id: str, reason: str = "", extra_notes: str = "") -> bool:
         "status": "Retired",
         "notes": new_notes,
         "location": None,
+        "tank_id": None,
     })
 
     # Free any tank holding this fish
@@ -231,11 +233,11 @@ def delete_tank(tank_id: str) -> bool:
         return False
 
 
-def assign_occupant(tank_id: str, fish_id: str, label: str) -> bool:
+def assign_occupant(tank_id: str, fish_id: Optional[str], label: str) -> bool:
     return update_tank(tank_id, {
         "occupant_fish_id": fish_id,
         "occupant_label": label,
-        "status": "Active",
+        "status": "Active" if fish_id else "Empty / Idle",
     })
 
 
@@ -263,7 +265,7 @@ def get_next_tank_sequence() -> str:
 # ============================================================
 
 SPAWN_FIELDS = [
-    "system_id", "line_code", "generation",
+    "system_id", "spawn_code", "line_code", "generation",
     "male_id", "female_id",
     "pairing_date", "status",
     "batch_name", "free_swimming_date", "jarring_date",
@@ -361,6 +363,16 @@ def create_strain(name: str, line_code: str = "", description: str = "") -> Opti
     except Exception as e:
         st.error(f"create_strain failed: {e}")
         return None
+
+
+def delete_strain(strain_id: str) -> bool:
+    """Delete a strain by uuid."""
+    try:
+        _sb().table("strains").delete().eq("id", strain_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_strain failed: {e}")
+        return False
 
 
 # ============================================================
