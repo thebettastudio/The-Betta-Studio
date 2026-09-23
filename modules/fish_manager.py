@@ -86,6 +86,52 @@ def upload_fish_photo_to_drive(image_bytes: bytes, filename_prefix: str = "fish_
     return file_id, f"https://lh3.googleusercontent.com/d/{file_id}"
 
 
+# ------------------------------------------------------------------------------
+# SPAWN & FAMILY TREE INTEGRATION
+# ------------------------------------------------------------------------------
+
+def get_all_spawns() -> List[Dict]:
+    """Retrieves active spawn records from Google Sheets or Session State."""
+    try:
+        _, sheets_service = get_google_services()
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Spawns!A2:K'
+        ).execute()
+        rows = res.get('values', [])
+        
+        spawns = []
+        for r in rows:
+            if r and len(r) >= 1:
+                spawns.append({
+                    "batch_id": r[0].strip(),
+                    "line_code": r[1].strip() if len(r) > 1 else "UNK",
+                    "generation": r[2].strip() if len(r) > 2 else "F1",
+                    "sire_id": r[3].strip() if len(r) > 3 else "N/A",
+                    "dam_id": r[4].strip() if len(r) > 4 else "N/A",
+                    "variety": r[5].strip() if len(r) > 5 else "",
+                    "spawn_date": r[6].strip() if len(r) > 6 else "",
+                    "status": r[7].strip() if len(r) > 7 else "Active"
+                })
+        return spawns
+    except Exception:
+        return st.session_state.get("spawns_registry", [])
+
+
+def generate_batch_fish_id(batch_code: str, existing_ids: List[str]) -> str:
+    """
+    Generates a unique ID for jarred fry from a batch.
+    Format: [BATCH_CODE]-[INDEX]
+    Example: DRG-F1-01, SP01-F1-05
+    """
+    clean_batch = batch_code.strip() if batch_code else "BATCH"
+    prefix = f"{clean_batch}-"
+    
+    matches = [i for i in existing_ids if i.startswith(prefix)]
+    next_idx = len(matches) + 1
+    return f"{prefix}{next_idx:02d}"
+
+
 def generate_purchased_fish_id(variety: str, gender: str, existing_ids: List[str]) -> str:
     """
     Generates a unique ID for purchased fish.
@@ -110,20 +156,6 @@ def generate_purchased_fish_id(variety: str, gender: str, existing_ids: List[str
     return f"{prefix}{next_idx:02d}"
 
 
-def generate_batch_fish_id(batch_code: str, existing_ids: List[str]) -> str:
-    """
-    Generates a unique ID for jarred fry from a batch.
-    Format: [BATCH_CODE]-[INDEX]
-    Example: DRG-F1-01, SP01-F1-05
-    """
-    clean_batch = batch_code.strip() if batch_code else "BATCH"
-    prefix = f"{clean_batch}-"
-    
-    matches = [i for i in existing_ids if i.startswith(prefix)]
-    next_idx = len(matches) + 1
-    return f"{prefix}{next_idx:02d}"
-
-
 def get_all_fish() -> List[Dict]:
     """
     Retrieves all registered fish from session state or storage backend.
@@ -131,6 +163,43 @@ def get_all_fish() -> List[Dict]:
     if "fish_registry" not in st.session_state:
         st.session_state["fish_registry"] = []
     return st.session_state["fish_registry"]
+
+
+def register_jarred_fry_from_spawn(
+    spawn_batch_id: str,
+    gender: str,
+    grade: str,
+    location: str,
+    image_bytes: Optional[bytes] = None,
+    notes: str = ""
+) -> str:
+    """
+    Registers a jarred fry into the Fish Registry by carrying over 
+    Sire ID, Dam ID, Line Code, Generation, and Variety from the Spawn record.
+    """
+    spawns = get_all_spawns()
+    selected_spawn = next((s for s in spawns if s["batch_id"] == spawn_batch_id), None)
+    
+    existing_ids = get_existing_fish_ids()
+    new_fish_id = generate_batch_fish_id(spawn_batch_id, existing_ids)
+
+    lineage_data = {
+        "fish_id": new_fish_id,
+        "origin": "Batch Spawn",
+        "batch_id": spawn_batch_id,
+        "line_code": selected_spawn.get("line_code", "UNK") if selected_spawn else "UNK",
+        "generation": selected_spawn.get("generation", "F1") if selected_spawn else "F1",
+        "sire_id": selected_spawn.get("sire_id", "N/A") if selected_spawn else "N/A",
+        "dam_id": selected_spawn.get("dam_id", "N/A") if selected_spawn else "N/A",
+        "gender": gender,
+        "variety": selected_spawn.get("variety", "") if selected_spawn else "",
+        "grade": grade,
+        "location": location,
+        "status": "Jarred",
+        "notes": f"Jarred from Spawn #{spawn_batch_id}. {notes}".strip()
+    }
+
+    return register_new_fish(lineage_data, image_bytes)
 
 
 def register_new_fish(fish_data: Dict, image_bytes: Optional[bytes] = None) -> str:
@@ -193,7 +262,7 @@ def register_new_fish(fish_data: Dict, image_bytes: Optional[bytes] = None) -> s
 
 def promote_fish_to_breeder(fish_id: str) -> bool:
     """
-    Promotes a registered fish to active breeder status while preserving its exact fish_id.
+    Promotes a registered fish to active breeder status while preserving its exact fish_id and lineage.
     """
     fish_list = get_all_fish()
     for fish in fish_list:
@@ -220,6 +289,7 @@ def promote_fish_to_breeder(fish_id: str) -> bool:
                     "photo_id": fish["image_url"],
                     "sire_id": fish["sire_id"],
                     "dam_id": fish["dam_id"],
+                    "batch_id": fish["batch_id"],
                     "notes": fish["notes"]
                 }
                 st.session_state["breeders"].append(breeder_record)
