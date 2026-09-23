@@ -181,6 +181,18 @@ def render_spawn_page():
                 except Exception:
                     days_paired = 0
 
+                # Safely extract tank location to prevent KeyError
+                tank_loc = spawn.get("tank")
+                if not tank_loc:
+                    notes_text = spawn.get("notes", "")
+                    if "Tank:" in notes_text:
+                        try:
+                            tank_loc = notes_text.split("Tank:")[1].split("|")[0].strip()
+                        except Exception:
+                            tank_loc = "Unassigned"
+                    else:
+                        tank_loc = "Unassigned"
+
                 with st.container(border=True):
                     col_title, col_edit = st.columns([4, 1])
                     with col_title:
@@ -198,7 +210,7 @@ def render_spawn_page():
                                 else:
                                     st.error("Failed to update spawn.")
 
-                    st.caption(f"📍 **Tank:** {spawn['tank']} | 📅 **Paired:** {pairing_date} ({days_paired} days ago) | 🏷️ **Status:** `{status}`")
+                    st.caption(f"📍 **Tank:** {tank_loc} | 📅 **Paired:** {pairing_date} ({days_paired} days ago) | 🏷️ **Status:** `{status}`")
 
                     if spawn.get("line_goal"):
                         st.write(f"🎯 **Goal:** {spawn['line_goal']}")
