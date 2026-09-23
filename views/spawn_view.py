@@ -2,6 +2,7 @@
 # Betta Farm Management System
 # Session 12 — Ported to Supabase via spawn_manager, fish_manager,
 # tank_registry, database, photo_service.
+# Session 19 — Added inbreeding/lineage check to the pairing screen.
 
 import datetime
 from typing import Optional
@@ -29,7 +30,8 @@ from modules.tank_registry import (
     get_tank_dropdown_items,
     list_available_tanks,
 )
-from modules.id_generator import calculate_child_lineage
+from modules.id_generator import calculate_child_lineage, generate_spawn_code
+from modules.lineage import check_inbreeding
 from modules.photo_service import photo_url
 
 
@@ -211,7 +213,6 @@ def _render_active_pairing_card(item: dict):
 
         st.divider()
 
-        # Breeder info: 2-column top-level, each column has info + image
         col_male, col_female = st.columns(2)
         with col_male:
             _render_breeder_block(male, spawn.get("male_id") or "?", "♂️ Male Breeder")
@@ -245,19 +246,55 @@ def render_active_pairings_tab():
 # TAB 2: START NEW PAIRING
 # ============================================================
 
+def _render_lineage_check(male_uuid: str, female_uuid: str) -> dict:
+    """
+    Render the lineage check panel.
+    Returns the check result dict so the caller can decide whether to block.
+    """
+    result = check_inbreeding(male_uuid, female_uuid)
+    level = result.get("level", "clear")
+    icon = result.get("icon", "🟢")
+    label = result.get("label", "Clear")
+    summary = result.get("summary", "")
+
+    # Pick a Streamlit call for the visual style
+    body = f"**{icon} Lineage check: {label}**  \n{summary}"
+
+    if level == "clear":
+        st.success(body)
+    elif level == "distant":
+        st.info(body)
+    elif level == "caution":
+        st.warning(body)
+    else:  # risky or dangerous
+        st.error(body)
+
+    # Details expander if there are shared ancestors
+    shared = result.get("shared") or []
+    if shared:
+        with st.expander(f"🔍 Shared ancestors ({len(shared)})"):
+            for anc in shared:
+                sid = anc.get("system_id") or "?"
+                mg = anc.get("male_gen")
+                fg = anc.get("female_gen")
+                st.markdown(
+                    f"- `{sid}` — male side: {mg} gen"
+                    f"{'s' if mg != 1 else ''}, "
+                    f"female side: {fg} gen"
+                    f"{'s' if fg != 1 else ''}"
+                )
+
+    return result
+
+
 def render_start_pairing_tab():
     st.subheader("Pair Male & Female Breeder")
 
-    # --- Breeder dropdowns (only available ones) ---
-    males_dd, females_dd = [], []
-    for f in get_fish_dropdown_items():
-        # get_fish_dropdown_items excludes Deceased/Sold/Retired but includes all fish.
-        # For pairing we want only fish with gender Male/Female.
-        pass
-
-    # Actually filter from database fish directly for full control
+    # --- Build breeder dropdowns ---
     from database import get_all_fish
     all_fish = get_all_fish()
+
+    males_dd, females_dd = [], []
     for f in all_fish:
         if not f.get("system_id"):
             continue
@@ -315,6 +352,9 @@ def render_start_pairing_tab():
             placeholder="e.g. Improve caudal spread & clean dorsal",
         )
 
+    # --- Lineage / inbreeding check ---
+    lineage_result = _render_lineage_check(male_uuid, female_uuid)
+
     # --- Live preview of line/gen/spawn_id ---
     male_fish = next((f for f in all_fish if f["id"] == male_uuid), None)
     female_fish = next((f for f in all_fish if f["id"] == female_uuid), None)
@@ -326,7 +366,6 @@ def render_start_pairing_tab():
             female_line=female_fish.get("line_code") or "UNK",
             female_gen=female_fish.get("generation") or "P1",
         )
-        from modules.id_generator import generate_spawn_code
         preview_code = generate_spawn_code()
 
         st.info(
@@ -340,7 +379,23 @@ def render_start_pairing_tab():
         placeholder="e.g. Both pre-conditioned for 7 days on bloodworms",
     )
 
-    if st.button("💞 Initiate Pairing", type="primary", use_container_width=True):
+    # --- Dangerous pairs require confirmation ---
+    dangerous = lineage_result.get("level") == "dangerous"
+    confirm_dangerous = True
+    if dangerous:
+        confirm_dangerous = st.checkbox(
+            "⚠️ I understand this pairing is a dangerous inbreeding. Proceed anyway.",
+            key="confirm_dangerous_pairing",
+        )
+
+    submit_disabled = dangerous and not confirm_dangerous
+
+    if st.button(
+        "💞 Initiate Pairing",
+        type="primary",
+        use_container_width=True,
+        disabled=submit_disabled,
+    ):
         with st.spinner("Setting up pairing..."):
             saved = create_new_spawn(
                 male_id=male_uuid,
