@@ -1,364 +1,78 @@
+# views/fish_registry_view.py
+# Betta Farm Management System
+# Session 11 — Ported to Supabase via fish_manager, tank_registry,
+# database, photo_service, id_generator.
+
 import io
 import datetime
-import pandas as pd
+from typing import Optional
+
 import streamlit as st
 from PIL import Image
 
-# Register HEIC opener for iPhone support
+# HEIC support (iPhone)
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
 except ImportError:
-    pass  # Fallback if pillow_heif is not installed
+    pass
 
-# Import Drive & Sheets services
-from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
-
-# ------------------------------------------------------------------------------
-# Helper Functions: Sheet Initialization, Strains, Tanks, Grades & ID
-# ------------------------------------------------------------------------------
-
-def ensure_sheet_exists(sheets_service, sheet_name, default_headers):
-    """Ensures that a specified worksheet tab exists in Google Sheets with headers."""
-    try:
-        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-        sheets = spreadsheet.get('sheets', [])
-        sheet_titles = [s['properties']['title'] for s in sheets]
-
-        if sheet_name not in sheet_titles:
-            requests = [{'addSheet': {'properties': {'title': sheet_name}}}]
-            sheets_service.spreadsheets().batchUpdate(
-                spreadsheetId=SPREADSHEET_ID,
-                body={'requests': requests}
-            ).execute()
-
-            sheets_service.spreadsheets().values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f'{sheet_name}!A1',
-                valueInputOption='USER_ENTERED',
-                body={'values': [default_headers]}
-            ).execute()
-    except Exception as e:
-        st.warning(f"Note: Auto-creation check for '{sheet_name}' failed ({e})")
+from database import (
+    get_all_strains,
+    create_strain,
+    delete_strain,
+    get_all_fish,
+)
+from modules.fish_manager import (
+    register_new_fish,
+    edit_fish,
+    delete_fish_and_photos,
+    promote_to_breeder,
+    VALID_GRADES,
+    VALID_GENDERS,
+    _fish_label,
+)
+from modules.tank_registry import (
+    list_available_tanks,
+    find_tank,
+    assign_fish_to_tank,
+    unassign_tank,
+)
+from modules.id_generator import generate_fish_id
+from modules.photo_service import upload_photo, photo_url
 
 
-def ensure_fish_master_sheet_exists(sheets_service):
-    headers = [
-        "Fish ID", "Variety / Strain", "Gender", "Grade", 
-        "Tank ID", "Seller", "Purchase Date", "Purchase Cost", 
-        "Image URL", "Notes"
-    ]
-    ensure_sheet_exists(sheets_service, 'Fish_Master', headers)
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+DEFAULT_STRAINS = [
+    "Yellow Koi Galaxy",
+    "Red Koi Galaxy",
+    "Blue Rim",
+    "Avatar",
+    "Black Star / Samurai",
+    "Red Dragon",
+    "Copper Light",
+    "Fancy Marble",
+    "Super Red",
+    "Super Black",
+]
+
+FISH_TABLE_ICON = "🐠"
 
 
-def generate_next_fish_id(sheets_service) -> int:
-    """Fetch all existing Fish IDs from Column A and return the next integer sequence."""
-    try:
-        res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Fish_Master!A2:A'
-        ).execute()
-        rows = res.get('values', [])
-        
-        max_id = 0
-        for r in rows:
-            if r and r[0].strip():
-                raw_id = r[0].strip()
-                val_str = raw_id.replace("FISH-", "").strip()
-                if val_str.isdigit():
-                    max_id = max(max_id, int(val_str))
-                    
-        return max_id + 1
-    except Exception:
-        return 1
-
-
-def get_registered_strains(sheets_service):
-    """Fetch list of saved strains from 'Master_Strains' sheet or return defaults."""
-    default_strains = [
-        "Yellow Koi Galaxy",
-        "Red Koi Galaxy",
-        "Blue Rim",
-        "Avatar",
-        "Black Star / Samurai",
-        "Red Dragon",
-        "Copper Light",
-        "Fancy Marble",
-        "Super Red",
-        "Super Black"
-    ]
-    try:
-        res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Master_Strains!A2:A'
-        ).execute()
-        rows = res.get('values', [])
-        strains = [r[0] for r in rows if r and r[0].strip()]
-        
-        all_strains = set(default_strains + strains)
-        removed_strains = st.session_state.get("removed_strains_list", set())
-        active_strains = [s for s in all_strains if s not in removed_strains]
-        
-        return sorted(active_strains)
-    except Exception:
-        removed_strains = st.session_state.get("removed_strains_list", set())
-        return sorted([s for s in default_strains if s not in removed_strains])
-
-
-def add_new_strain_to_db(sheets_service, new_strain):
-    """Save a new strain to the 'Master_Strains' worksheet."""
-    try:
-        ensure_sheet_exists(sheets_service, 'Master_Strains', ["Strain Name"])
-        
-        if "removed_strains_list" in st.session_state:
-            st.session_state["removed_strains_list"].discard(new_strain.strip())
-            
-        sheets_service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Master_Strains!A:A',
-            valueInputOption='USER_ENTERED',
-            body={'values': [[new_strain.strip()]]}
-        ).execute()
-        st.toast(f"✅ Saved '{new_strain}' to Strain Registry!", icon="✨")
-    except Exception as e:
-        st.error(f"Could not save strain to database ({e})")
-
-
-def delete_strain_from_db(sheets_service, strain_to_remove):
-    """Delete a strain row from 'Master_Strains' or soft-delete from local registry."""
-    if "removed_strains_list" not in st.session_state:
-        st.session_state["removed_strains_list"] = set()
-    st.session_state["removed_strains_list"].add(strain_to_remove)
-
-    try:
-        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-        sheets = spreadsheet.get('sheets', [])
-        sheet_id = None
-        for s in sheets:
-            if s['properties']['title'] == 'Master_Strains':
-                sheet_id = s['properties']['sheetId']
-                break
-
-        if sheet_id is not None:
-            res = sheets_service.spreadsheets().values().get(
-                spreadsheetId=SPREADSHEET_ID,
-                range='Master_Strains!A1:A'
-            ).execute()
-            rows = res.get('values', [])
-            
-            delete_requests = []
-            for idx, r in enumerate(rows):
-                if r and r[0].strip().lower() == strain_to_remove.strip().lower():
-                    delete_requests.append({
-                        "deleteDimension": {
-                            "range": {
-                                "sheetId": sheet_id,
-                                "dimension": "ROWS",
-                                "startIndex": idx,
-                                "endIndex": idx + 1
-                            }
-                        }
-                    })
-
-            if delete_requests:
-                delete_requests.reverse()
-                sheets_service.spreadsheets().batchUpdate(
-                    spreadsheetId=SPREADSHEET_ID,
-                    body={'requests': delete_requests}
-                ).execute()
-
-        st.toast(f"🗑️ Removed '{strain_to_remove}' from Strain Registry!", icon="✨")
-    except Exception:
-        st.toast(f"Removed '{strain_to_remove}' from UI view.", icon="ℹ️")
-
-
-def get_available_tanks(sheets_service):
-    """Fetch tanks from Tanks sheet matching tank_view criteria (empty/idle or no occupant)."""
-    available_statuses = ["empty / idle", "empty", "idle", "available", "ready", "clean"]
-    try:
-        res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Tanks!A2:H'
-        ).execute()
-        rows = res.get('values', [])
-        tanks = []
-        
-        for r in rows:
-            if len(r) >= 1:
-                tank_id = r[0].strip()
-                container_type = r[1].strip() if len(r) > 1 else "Standard Container"
-                location_code = r[2].strip() if len(r) > 2 and r[2].strip() else tank_id
-                status = r[5].strip() if len(r) > 5 else "Empty / Idle"
-                occupant = r[6].strip() if len(r) > 6 else ""
-
-                status_clean = status.lower()
-                occupant_clean = occupant.lower()
-
-                is_avail = (status_clean in available_statuses) or (not occupant_clean or occupant_clean in ["empty", "none", "n/a"])
-
-                if is_avail and tank_id:
-                    tanks.append({
-                        "id": tank_id,
-                        "location": location_code,
-                        "type": container_type,
-                        "status": status,
-                        "occupant": occupant
-                    })
-        return tanks
-    except Exception:
-        return [
-            {"id": "TANK-001", "location": "JAR-M-01", "type": "Empi Glass / Jar", "status": "Empty / Idle", "occupant": ""},
-            {"id": "TANK-002", "location": "BOT-6L-01", "type": "6-Liter Water Bottle", "status": "Empty / Idle", "occupant": ""},
-        ]
-
-
-def update_tank_occupancy(sheets_service, tank_id: str, occupant_id: str, status: str = "Active"):
-    """Updates Tank status and occupant columns in the Tanks sheet to maintain parity with tank_view."""
-    if not tank_id or tank_id == "Unassigned":
-        return
-
-    try:
-        res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Tanks!A2:G'
-        ).execute()
-        rows = res.get('values', [])
-        
-        for idx, r in enumerate(rows, start=2):
-            if r and (r[0].strip().lower() == tank_id.strip().lower() or (len(r) > 2 and r[2].strip().lower() == tank_id.strip().lower())):
-                # Update Status (Column F / Index 6) and Occupant (Column G / Index 7)
-                sheets_service.spreadsheets().values().update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f'Tanks!F{idx}:G{idx}',
-                    valueInputOption='USER_ENTERED',
-                    body={'values': [[status, occupant_id]]}
-                ).execute()
-                break
-    except Exception as e:
-        st.warning(f"Note: Could not update tank '{tank_id}' occupancy: {e}")
-
-
-def transfer_or_assign_tank(sheets_service, fish_id: str, old_tank_id: str, new_tank_id: str) -> bool:
-    """Updates tank assignment in Fish_Master and toggles tank status/occupant in Tanks sheet."""
-    try:
-        # 1. Update Fish_Master sheet with new Tank ID
-        res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Fish_Master!A2:E'
-        ).execute()
-        rows = res.get('values', [])
-
-        for idx, r in enumerate(rows, start=2):
-            if r and r[0].strip().lower() == fish_id.strip().lower():
-                sheets_service.spreadsheets().values().update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f'Fish_Master!E{idx}',
-                    valueInputOption='USER_ENTERED',
-                    body={'values': [[new_tank_id]]}
-                ).execute()
-                break
-
-        # 2. Release old tank if applicable
-        if old_tank_id and old_tank_id != "Unassigned":
-            update_tank_occupancy(sheets_service, old_tank_id, occupant_id="", status="Empty / Idle")
-
-        # 3. Assign new tank to fish
-        if new_tank_id and new_tank_id != "Unassigned":
-            update_tank_occupancy(sheets_service, new_tank_id, occupant_id=fish_id, status="Active")
-
-        st.cache_data.clear()
-        return True
-    except Exception as e:
-        st.error(f"Failed to transfer tank: {e}")
-        return False
-
-
-def get_all_fish_records(sheets_service):
-    """Fetch all registered fish from 'Fish_Master' sheet (Range A1:J)."""
-    try:
-        res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Fish_Master!A1:J'
-        ).execute()
-        rows = res.get('values', [])
-        
-        if not rows or len(rows) < 2:
-            return pd.DataFrame(columns=[
-                "Fish ID", "Variety / Strain", "Gender", "Grade", 
-                "Tank ID", "Seller", "Purchase Date", "Purchase Cost", 
-                "Image URL", "Notes"
-            ])
-        
-        headers = [h.strip() for h in rows[0]]
-        data = rows[1:]
-        
-        padded_data = [r + [""] * (len(headers) - len(r)) for r in data]
-        df = pd.DataFrame(padded_data, columns=headers)
-        df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
-        
-        return df
-    except Exception as e:
-        st.error(f"Error reading Fish Master database: {e}")
-        return pd.DataFrame()
-
-
-def process_and_compress_image(raw_bytes, max_dimension=1280, quality=85) -> bytes:
-    """Processes, resizes, and compresses uploaded image bytes for mobile network optimization."""
-    try:
-        image = Image.open(io.BytesIO(raw_bytes))
-        
-        # Convert non-RGB modes (RGBA, P, etc.)
-        if image.mode in ("RGBA", "P"):
-            image = image.convert("RGB")
-            
-        # Downscale photo if it exceeds max dimensions
-        image.thumbnail((max_dimension, max_dimension))
-        
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=quality)
-        return buffer.getvalue()
-    except Exception as e:
-        st.warning(f"Note: Could not compress photo, using original file ({e})")
-        return raw_bytes
-
-
-def upload_image_to_drive(drive_service, image_bytes, filename_prefix="fish_"):
-    """Upload photo bytes to Google Drive and return public direct view URL."""
-    from googleapiclient.http import MediaIoBaseUpload
-    
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"{filename_prefix}{timestamp}.jpg"
-    
-    # Process and compress high-res mobile photo before uploading
-    compressed_bytes = process_and_compress_image(image_bytes)
-    
-    file_stream = io.BytesIO(compressed_bytes)
-    metadata = {'name': file_name}
-    if DRIVE_FOLDER_ID:
-        metadata['parents'] = [DRIVE_FOLDER_ID.strip()]
-
-    media = MediaIoBaseUpload(file_stream, mimetype='image/jpeg', resumable=False)
-    uploaded = drive_service.files().create(
-        body=metadata,
-        media_body=media,
-        fields='id'
-    ).execute()
-    
-    file_id = uploaded.get('id')
-    return file_id, f"https://lh3.googleusercontent.com/d/{file_id}"
-
+# ============================================================
+# FORM EVALUATION
+# ============================================================
 
 def calculate_form_grade(checks: dict, body_shape: str) -> tuple[str, int]:
-    """Calculates grade and total score based on fin criteria checkboxes and body shape."""
-    total_score = sum(15 for matched in checks.values() if matched)
-    
-    shape_scores = {
-        "Bullet Head": 10,
-        "Regular": 8,
-        "Spoonhead": 5
-    }
+    """Score = 15 per passed fin check + body shape bonus. Max 100."""
+    total_score = sum(15 for passed in checks.values() if passed)
+
+    shape_scores = {"Bullet Head": 10, "Regular": 8, "Spoonhead": 5}
     total_score += shape_scores.get(body_shape, 8)
-    
+
     if total_score >= 95:
         grade = "Show Grade"
     elif total_score >= 80:
@@ -367,343 +81,473 @@ def calculate_form_grade(checks: dict, body_shape: str) -> tuple[str, int]:
         grade = "Breeder Grade"
     else:
         grade = "Pet Grade"
-        
+
     return grade, total_score
 
 
-# ------------------------------------------------------------------------------
-# Main Page Render Function
-# ------------------------------------------------------------------------------
+def _normalize_image_bytes(raw: bytes) -> bytes:
+    """Ensure image is RGB JPEG-compatible. Returns original on failure."""
+    try:
+        img = Image.open(io.BytesIO(raw))
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+    except Exception:
+        return raw
+
+
+# ============================================================
+# STRAIN HELPERS
+# ============================================================
+
+def _get_strain_names() -> list[str]:
+    """Merged list of DB strains + defaults, deduped, sorted."""
+    db_strains = [s.get("name") for s in get_all_strains() if s.get("name")]
+    merged = set(DEFAULT_STRAINS) | set(db_strains)
+    return sorted(merged)
+
+
+def _strain_name_to_id(name: str) -> Optional[str]:
+    for s in get_all_strains():
+        if s.get("name") == name:
+            return s["id"]
+    return None
+
+
+def _add_strain(name: str) -> bool:
+    """Create a strain in DB (idempotent-ish: skip if exists by name)."""
+    name = name.strip()
+    if not name:
+        return False
+    existing = [s.get("name") for s in get_all_strains()]
+    if name in existing:
+        st.toast(f"'{name}' already exists.", icon="ℹ️")
+        return False
+    create_strain(name=name)
+    return True
+
+
+def _delete_strain(name: str) -> bool:
+    """Delete a strain by name if it exists in DB. Defaults can't be deleted."""
+    sid = _strain_name_to_id(name)
+    if not sid:
+        st.toast(f"'{name}' is a built-in default and cannot be deleted.", icon="⚠️")
+        return False
+    return delete_strain(sid)
+
+
+# ============================================================
+# TANK HELPERS
+# ============================================================
+
+def _tank_label(t: dict) -> str:
+    loc = t.get("location_code") or "?"
+    sysid = t.get("system_id") or t["id"]
+    ttype = t.get("tank_type") or ""
+    return f"{loc} ({sysid} | {ttype})"
+
+
+def _get_available_tank_options() -> list[dict]:
+    """Returns list of {'id': uuid, 'label': str}."""
+    return [
+        {"id": t["id"], "label": _tank_label(t)}
+        for t in list_available_tanks()
+    ]
+
+
+# ============================================================
+# REGISTER TAB
+# ============================================================
+
+def render_register_tab():
+    st.subheader("🛒 Purchased / Imported Fish Details")
+
+    # Preview next system_id
+    next_id = generate_fish_id()
+    st.info(f"📌 Next Assigned Fish ID: **#{next_id}**")
+
+    # --- Strain selector + manager ---
+    strains_list = _get_strain_names()
+
+    strain_col_select, strain_col_btn = st.columns([4, 1])
+    with strain_col_btn:
+        st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+        with st.popover("⚙️ Manage Strains"):
+            pop_add, pop_remove = st.tabs(["➕ Add", "🗑️ Remove"])
+
+            with pop_add:
+                st.markdown("##### Add New Strain")
+                new_strain_val = st.text_input(
+                    "Strain Name",
+                    placeholder="e.g. Copper Blue Star",
+                    key="new_strain_input",
+                ).strip()
+                if st.button("Save Strain", use_container_width=True, type="primary", key="btn_add_strain"):
+                    if new_strain_val:
+                        if _add_strain(new_strain_val):
+                            st.session_state["selected_strain"] = new_strain_val
+                            st.rerun()
+                    else:
+                        st.warning("Please enter a strain name.")
+
+            with pop_remove:
+                st.markdown("##### Remove Existing Strain")
+                if strains_list:
+                    strain_to_delete = st.selectbox(
+                        "Select Strain to Delete",
+                        options=strains_list,
+                        key="select_strain_to_delete",
+                    )
+                    if st.button("Delete Strain", use_container_width=True, type="primary", key="btn_delete_strain"):
+                        _delete_strain(strain_to_delete)
+                        if st.session_state.get("selected_strain") == strain_to_delete:
+                            st.session_state.pop("selected_strain", None)
+                        st.rerun()
+                else:
+                    st.info("No strains available to remove.")
+
+    default_index = 0
+    if "selected_strain" in st.session_state and st.session_state["selected_strain"] in strains_list:
+        default_index = strains_list.index(st.session_state["selected_strain"])
+
+    with strain_col_select:
+        selected_strain = st.selectbox(
+            "Select Strain",
+            options=strains_list if strains_list else ["No Strains Available"],
+            index=default_index if strains_list else 0,
+            key="select_strain_dropdown",
+        )
+
+    # --- Photo capture (outside form so it survives reruns) ---
+    st.markdown("##### 📷 Fish Photo Capture / Upload")
+    img_col1, img_col2 = st.columns(2)
+    with img_col1:
+        camera_photo = st.camera_input("Take a Live Photo of Fish")
+    with img_col2:
+        uploaded_photo = st.file_uploader(
+            "Or Upload Photo File",
+            type=["jpg", "jpeg", "png", "heic", "heif"],
+            help="Supports iPhone HEIC and standard JPEG/PNG.",
+        )
+
+    if camera_photo is not None:
+        st.session_state["fish_photo_bytes"] = camera_photo.getvalue()
+    elif uploaded_photo is not None:
+        st.session_state["fish_photo_bytes"] = uploaded_photo.getvalue()
+
+    if st.session_state.get("fish_photo_bytes"):
+        try:
+            preview_img = Image.open(io.BytesIO(st.session_state["fish_photo_bytes"]))
+            st.image(preview_img, caption="Photo Preview", width=250)
+        except Exception:
+            pass
+
+    # --- Main registration form ---
+    with st.form("register_fish_form", clear_on_submit=False):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("##### 🧬 Variety & Details")
+            form_type = st.text_input("Form / Type", value="HMPK", help="e.g. HMPK, HM, PK, CT")
+            gender = st.selectbox("Gender", VALID_GENDERS)
+            seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder")
+            purchase_date = st.date_input("Purchase Date", datetime.date.today())
+            purchase_cost = st.number_input("Purchase Cost (₱)", min_value=0.0, value=0.0, step=50.0)
+
+        with col2:
+            st.markdown("##### 🪣 Tank & Container Assignment")
+            tank_opts = _get_available_tank_options()
+            tank_types = sorted({t["label"].split(" | ")[-1].rstrip(")") for t in tank_opts})
+            type_filter_options = ["All Types"] + tank_types
+
+            selected_type_filter = st.selectbox("Filter Tank Type", options=type_filter_options)
+
+            if selected_type_filter != "All Types":
+                filtered = [t for t in tank_opts if selected_type_filter in t["label"]]
+            else:
+                filtered = tank_opts
+
+            tank_dropdown = [{"id": None, "label": "Leave Unassigned"}] + filtered
+            selected_tank_idx = st.selectbox(
+                "Select Available Tank / Jar Location",
+                options=range(len(tank_dropdown)),
+                format_func=lambda i: tank_dropdown[i]["label"],
+            )
+            selected_tank_id = tank_dropdown[selected_tank_idx]["id"]
+
+        st.divider()
+        st.markdown("### 🏆 Form Evaluation Criteria")
+
+        chk_col, shape_col = st.columns([3, 2])
+        with chk_col:
+            caudal_spread = st.checkbox("Caudal Fin Spread 180°", value=True)
+            caudal_prop   = st.checkbox("Caudal Fin Proportion (Good branching, no damage)", value=True)
+            dorsal_struct = st.checkbox("Dorsal Fin Structure (Broad base & clean overlapping)", value=True)
+            anal_struct   = st.checkbox("Anal Fin Structure (Parallel & proper length)", value=True)
+            ventral_fins  = st.checkbox("Ventral Fins (Straight, broad, no curl)", value=True)
+            pectoral_fins = st.checkbox("Pectoral Fins (Full & undamaged)", value=True)
+
+        with shape_col:
+            body_shape = st.selectbox(
+                "Body Shape",
+                options=["Bullet Head", "Regular", "Spoonhead"],
+                index=0,
+                help="Select the head profile/body shape structure.",
+            )
+
+        evaluation_checks = {
+            "caudal_spread": caudal_spread,
+            "caudal_prop":   caudal_prop,
+            "dorsal_struct": dorsal_struct,
+            "anal_struct":   anal_struct,
+            "ventral_fins":  ventral_fins,
+            "pectoral_fins": pectoral_fins,
+        }
+
+        computed_grade, total_points = calculate_form_grade(evaluation_checks, body_shape)
+        st.info(f"🏆 Calculated Grade: **{computed_grade}** (Score: **{total_points}/100**)")
+
+        st.divider()
+        manual_image_id = st.text_input(
+            "Or Paste Existing Drive ID",
+            placeholder="Paste raw Drive file ID (not a URL)",
+        )
+        notes = st.text_area(
+            "Notes / Characteristics",
+            placeholder="e.g. Strong dorsal, solid iridescence, aggressive disposition",
+        )
+
+        submit = st.form_submit_button("💾 Register Fish", use_container_width=True)
+
+    if not submit:
+        return
+
+    # --- Photo upload ---
+    photo_id: Optional[str] = None
+    photo_bytes = st.session_state.get("fish_photo_bytes")
+    if photo_bytes:
+        with st.spinner("Uploading & optimizing photo for Google Drive..."):
+            normalized = _normalize_image_bytes(photo_bytes)
+            photo_id = upload_photo(normalized, entity_type="fish", entity_id=next_id)
+            if photo_id:
+                st.success(f"Photo uploaded (Drive ID: {photo_id})")
+            else:
+                st.error("Photo upload failed. Continuing without photo.")
+
+    if not photo_id and manual_image_id:
+        photo_id = manual_image_id.strip() or None
+
+    # --- Register ---
+    if not selected_strain or selected_strain == "No Strains Available":
+        st.error("Please select a valid strain.")
+        return
+
+    result = register_new_fish(
+        origin="Purchased",
+        gender=gender,
+        variety=selected_strain,
+        form_type=form_type,
+        grade=computed_grade,
+        body_shape=body_shape,
+        form_score=total_points,
+        fin_checks=evaluation_checks,
+        seller=seller,
+        purchase_date=str(purchase_date),
+        purchase_cost=purchase_cost,
+        notes=notes,
+        photo_file=None,           # already uploaded above
+        location=None,
+        line_code="UNK",
+        generation="P1",
+        status="Active",
+    )
+
+    if not result:
+        st.error("Fish registration failed. Check logs.")
+        return
+
+    # Patch photo_id in (register_new_fish takes photo_file, not photo_id)
+    if photo_id:
+        edit_fish(result["id"], {"photo_id": photo_id})
+
+    # Tank assignment
+    if selected_tank_id:
+        assign_fish_to_tank(selected_tank_id, result["id"])
+
+    st.session_state.pop("fish_photo_bytes", None)
+    st.balloons()
+    st.success(
+        f"🎉 Fish **#{result.get('system_id')}** ({selected_strain}) registered!"
+    )
+    st.rerun()
+
+
+# ============================================================
+# CARD RENDERING
+# ============================================================
+
+CARD_PAGE_SIZE = 20
+
+
+def _render_fish_card(fish: dict):
+    with st.container(border=True):
+        if fish.get("photo_id"):
+            st.image(photo_url(fish["photo_id"]), use_container_width=True)
+        else:
+            st.caption("📷 *No Photo*")
+
+        system_id = fish.get("system_id") or "?"
+        st.markdown(f"### {system_id}")
+        st.caption(
+            f"**{fish.get('gender') or '?'}** | "
+            f"`{fish.get('status') or 'Active'}` | "
+            f"{fish.get('grade') or '—'}"
+        )
+        st.write(f"🧬 **Variety:** {fish.get('variety') or '—'}")
+        if fish.get("form_type"):
+            st.write(f"📐 **Form:** {fish['form_type']}")
+        if fish.get("line_code") and fish["line_code"] != "UNK":
+            st.write(f"🏷️ **Line:** {fish['line_code']} ({fish.get('generation') or 'P1'})")
+        if fish.get("location"):
+            st.write(f"🪣 **Location:** `{fish['location']}`")
+
+        with st.expander("⚙️ Manage"):
+            _render_card_actions(fish)
+
+
+def _render_card_actions(fish: dict):
+    fish_uuid = fish["id"]
+    system_id = fish.get("system_id") or "?"
+
+    # Promote to breeder
+    if not fish.get("is_breeder") and fish.get("status") not in ("Sold", "Deceased", "Retired"):
+        if st.button("⭐ Promote to Breeder", key=f"promote_{fish_uuid}", use_container_width=True):
+            if promote_to_breeder(fish_uuid):
+                st.success(f"{system_id} promoted to breeder.")
+                st.rerun()
+
+    # Move tank
+    tank_opts = _get_available_tank_options()
+    if tank_opts:
+        dd = [{"id": None, "label": "— Leave / Clear Tank —"}] + tank_opts
+        selected_idx = st.selectbox(
+            "Move to Tank",
+            options=range(len(dd)),
+            format_func=lambda i: dd[i]["label"],
+            key=f"move_tank_{fish_uuid}",
+        )
+        new_tank_id = dd[selected_idx]["id"]
+
+        if st.button("📦 Apply Move", key=f"apply_move_{fish_uuid}", use_container_width=True):
+            # Free old tank
+            if fish.get("tank_id"):
+                unassign_tank(fish["tank_id"])
+            # Assign new
+            if new_tank_id:
+                assign_fish_to_tank(new_tank_id, fish_uuid)
+            st.success("Location updated.")
+            st.rerun()
+
+    # Delete (with confirm)
+    st.divider()
+    confirm = st.checkbox(
+        "Confirm delete (removes fish + Drive photo)",
+        key=f"del_confirm_{fish_uuid}",
+    )
+    if st.button(
+        "🔥 Delete Fish",
+        key=f"del_btn_{fish_uuid}",
+        disabled=not confirm,
+        use_container_width=True,
+    ):
+        if delete_fish_and_photos(fish_uuid):
+            st.success(f"{system_id} deleted.")
+            st.rerun()
+
+
+# ============================================================
+# LIST TAB
+# ============================================================
+
+def render_list_tab():
+    st.subheader("📋 Registered Fish Database")
+
+    all_fish = get_all_fish()
+    if not all_fish:
+        st.info("No fish registered yet. Use the Register tab to add your first fish.")
+        return
+
+    # Metrics
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Fish", len(all_fish))
+    m2.metric("Males", sum(1 for f in all_fish if (f.get("gender") or "").lower() == "male"))
+    m3.metric("Females", sum(1 for f in all_fish if (f.get("gender") or "").lower() == "female"))
+    m4.metric(
+        "Show/High Grade",
+        sum(1 for f in all_fish if f.get("grade") in ("Show Grade", "High Grade")),
+    )
+
+    st.divider()
+
+    # ---- Filters ----
+    st.markdown("##### 🔍 Filter Database")
+    f_col1, f_col2, f_col3 = st.columns(3)
+    with f_col1:
+        gender_filter = st.multiselect("Gender", options=sorted({f.get("gender") for f in all_fish if f.get("gender")}))
+    with f_col2:
+        grade_filter = st.multiselect("Grade", options=sorted({f.get("grade") for f in all_fish if f.get("grade")}))
+    with f_col3:
+        variety_filter = st.multiselect("Variety", options=sorted({f.get("variety") for f in all_fish if f.get("variety")}))
+
+    filtered = all_fish
+    if gender_filter:
+        filtered = [f for f in filtered if f.get("gender") in gender_filter]
+    if grade_filter:
+        filtered = [f for f in filtered if f.get("grade") in grade_filter]
+    if variety_filter:
+        filtered = [f for f in filtered if f.get("variety") in variety_filter]
+
+    st.caption(f"Showing {len(filtered)} of {len(all_fish)} fish.")
+    st.markdown("---")
+
+    if not filtered:
+        st.warning("No fish match the current filters.")
+        return
+
+    # ---- Pagination ----
+    total_pages = max(1, (len(filtered) + CARD_PAGE_SIZE - 1) // CARD_PAGE_SIZE)
+    if total_pages > 1:
+        page = st.number_input(
+            f"Page (1–{total_pages})",
+            min_value=1, max_value=total_pages, value=1, step=1,
+            key="fish_page_number",
+        )
+    else:
+        page = 1
+
+    start = (page - 1) * CARD_PAGE_SIZE
+    page_items = filtered[start : start + CARD_PAGE_SIZE]
+
+    cols = st.columns(2)
+    for idx, fish in enumerate(page_items):
+        with cols[idx % 2]:
+            _render_fish_card(fish)
+
+
+# ============================================================
+# PAGE
+# ============================================================
 
 def render_fish_registry_page():
     st.header("🐠 Fish Master Registry")
     st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
 
-    # Initialize Google Services
-    try:
-        drive_service, sheets_service = get_google_services()
-    except Exception as e:
-        st.error(f"Failed to connect to Google Services: {e}")
-        return
-
     tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
 
-    # ==========================================================================
-    # TAB 1: REGISTER NEW FISH
-    # ==========================================================================
     with tab_register:
-        st.subheader("🛒 Purchased / Imported Fish Details")
+        render_register_tab()
 
-        ensure_fish_master_sheet_exists(sheets_service)
-        next_fish_num = generate_next_fish_id(sheets_service)
-        assigned_fish_id = f"FISH-{str(next_fish_num).zfill(4)}"
-        
-        st.info(f"📌 Next Assigned Fish ID: **#{assigned_fish_id}**")
-
-        strains_list = get_registered_strains(sheets_service)
-
-        strain_col_select, strain_col_btn = st.columns([4, 1])
-        
-        with strain_col_btn:
-            st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
-            with st.popover("⚙️ Manage Strains"):
-                pop_tab_add, pop_tab_remove = st.tabs(["➕ Add", "🗑️ Remove"])
-                
-                with pop_tab_add:
-                    st.markdown("##### Add New Strain")
-                    new_strain_val = st.text_input("Strain Name", placeholder="e.g. Copper Blue Star").strip()
-                    if st.button("Save Strain", use_container_width=True, type="primary", key="btn_add_strain"):
-                        if new_strain_val:
-                            add_new_strain_to_db(sheets_service, new_strain_val)
-                            st.session_state["selected_strain"] = new_strain_val
-                            st.rerun()
-                        else:
-                            st.warning("Please enter a strain name.")
-
-                with pop_tab_remove:
-                    st.markdown("##### Remove Existing Strain")
-                    if strains_list:
-                        strain_to_delete = st.selectbox(
-                            "Select Strain to Delete", 
-                            options=strains_list, 
-                            key="select_strain_to_delete"
-                        )
-                        if st.button("Delete Strain", use_container_width=True, type="primary", key="btn_delete_strain"):
-                            delete_strain_from_db(sheets_service, strain_to_delete)
-                            if st.session_state.get("selected_strain") == strain_to_delete:
-                                st.session_state.pop("selected_strain", None)
-                            st.rerun()
-                    else:
-                        st.info("No strains available to remove.")
-
-        default_index = 0
-        if "selected_strain" in st.session_state and st.session_state["selected_strain"] in strains_list:
-            default_index = strains_list.index(st.session_state["selected_strain"])
-
-        with strain_col_select:
-            selected_strain = st.selectbox(
-                "Select Strain",
-                options=strains_list if strains_list else ["No Strains Available"],
-                index=default_index if strains_list else 0,
-                key="select_strain_dropdown"
-            )
-
-        # Standalone Photo Upload Input (Outside form to prevent losing file on form reruns)
-        st.markdown("##### 📷 Fish Photo Capture / Upload")
-        img_col1, img_col2 = st.columns(2)
-        
-        with img_col1:
-            camera_photo = st.camera_input("Take a Live Photo of Fish")
-        with img_col2:
-            uploaded_photo = st.file_uploader(
-                "Or Upload Photo File", 
-                type=["jpg", "jpeg", "png", "heic", "heif"],
-                help="Supports iPhone HEIC and standard JPEG/PNG images."
-            )
-
-        # Cache photo bytes immediately into session state
-        if camera_photo is not None:
-            st.session_state["fish_photo_bytes"] = camera_photo.getvalue()
-        elif uploaded_photo is not None:
-            st.session_state["fish_photo_bytes"] = uploaded_photo.getvalue()
-
-        # Show preview if cached photo bytes exist
-        if "fish_photo_bytes" in st.session_state and st.session_state["fish_photo_bytes"]:
-            try:
-                preview_img = Image.open(io.BytesIO(st.session_state["fish_photo_bytes"]))
-                st.image(preview_img, caption="Photo Preview", width=250)
-            except Exception:
-                pass
-
-        with st.form("register_fish_form", clear_on_submit=False):
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.markdown("##### 🧬 Variety & Details")
-                form_type = st.text_input("Form / Type", value="HMPK", help="Default is HMPK (Halfmoon Plakat)")
-                gender = st.selectbox("Gender", ["Male", "Female"])
-                seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder")
-                purchase_date = st.date_input("Purchase Date", datetime.date.today())
-                purchase_cost = st.number_input("Purchase Cost (₱)", min_value=0.0, value=0.0, step=50.0)
-
-            with col2:
-                st.markdown("##### 🪣 Tank & Container Assignment")
-                all_available_tanks = get_available_tanks(sheets_service)
-                container_types = ["All Types"] + sorted(list(set(t["type"] for t in all_available_tanks)))
-                
-                selected_type_filter = st.selectbox("Filter Tank Type", options=container_types)
-                
-                if selected_type_filter != "All Types":
-                    filtered_tanks = [t for t in all_available_tanks if t["type"] == selected_type_filter]
-                else:
-                    filtered_tanks = all_available_tanks
-
-                tank_options = ["Leave Unassigned"] + [f"{t['location']} ({t['id']} | {t['type']})" for t in filtered_tanks]
-                selected_tank_str = st.selectbox("Select Available Tank / Jar Location", options=tank_options)
-
-            st.divider()
-
-            st.markdown("### 🏆 Form Evaluation Criteria")
-            
-            chk_col, shape_col = st.columns([3, 2])
-            
-            with chk_col:
-                caudal_spread = st.checkbox("Caudal Fin Spread 180°", value=True)
-                caudal_prop = st.checkbox("Caudal Fin Proportion (Good branching, no damage)", value=True)
-                dorsal_struct = st.checkbox("Dorsal Fin Structure (Broad base & clean overlapping)", value=True)
-                anal_struct = st.checkbox("Anal Fin Structure (Parallel & proper length)", value=True)
-                ventral_fins = st.checkbox("Ventral Fins (Straight, broad, no curl)", value=True)
-                pectoral_fins = st.checkbox("Pectoral Fins (Full & undamaged)", value=True)
-
-            with shape_col:
-                body_shape = st.selectbox(
-                    "Body Shape",
-                    options=["Bullet Head", "Regular", "Spoonhead"],
-                    index=0,
-                    help="Select the head profile/body shape structure."
-                )
-
-            evaluation_checks = {
-                "caudal_spread": caudal_spread,
-                "caudal_prop": caudal_prop,
-                "dorsal_struct": dorsal_struct,
-                "anal_struct": anal_struct,
-                "ventral_fins": ventral_fins,
-                "pectoral_fins": pectoral_fins,
-            }
-
-            computed_grade, total_points = calculate_form_grade(evaluation_checks, body_shape)
-            st.info(f"🏆 Calculated Grade: **{computed_grade}** (Score: **{total_points}/100**)")
-
-            st.divider()
-
-            manual_image_url = st.text_input("Or Paste Existing Drive ID / Image URL", placeholder="Paste direct link or Drive ID")
-
-            notes = st.text_area("Notes / Characteristics", placeholder="e.g. Strong dorsal, solid iridescence, aggressive disposition")
-
-            submit = st.form_submit_button("💾 Register Fish", use_container_width=True)
-
-        if submit:
-            final_image_val = manual_image_url
-            
-            # Retrieve photo bytes from session state cache
-            photo_bytes = st.session_state.get("fish_photo_bytes")
-
-            if photo_bytes:
-                with st.spinner("Uploading & optimizing photo for Google Drive..."):
-                    try:
-                        file_id, img_url = upload_image_to_drive(drive_service, photo_bytes)
-                        final_image_val = img_url
-                        st.success(f"Image uploaded successfully! (Drive ID: {file_id})")
-                    except Exception as err:
-                        st.error(f"Image upload failed: {err}")
-
-            selected_tank_id = ""
-            if selected_tank_str != "Leave Unassigned":
-                # Parse system tank ID inside parentheses: Location (TANK-ID | Type)
-                parsed_id = selected_tank_str.split(" (")[1].split(" | ")[0]
-                selected_tank_id = parsed_id
-
-            new_fish_record = [
-                assigned_fish_id,
-                f"{form_type} - {selected_strain}",
-                gender,
-                computed_grade,
-                selected_tank_id if selected_tank_id else "Unassigned",
-                seller,
-                str(purchase_date),
-                purchase_cost,
-                final_image_val,
-                f"Body Shape: {body_shape}. {notes}".strip()
-            ]
-
-            try:
-                sheets_service.spreadsheets().values().append(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range='Fish_Master!A:J',
-                    valueInputOption='USER_ENTERED',
-                    body={'values': [new_fish_record]}
-                ).execute()
-
-                if selected_tank_id:
-                    update_tank_occupancy(sheets_service, selected_tank_id, occupant_id=assigned_fish_id, status="Active")
-
-                # Clear cached photo from session state on successful save
-                st.session_state.pop("fish_photo_bytes", None)
-
-                st.cache_data.clear()
-                st.balloons()
-                st.success(f"🎉 Fish **#{assigned_fish_id}** ({selected_strain}) successfully registered!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error saving fish record: {e}")
-
-    # ==========================================================================
-    # TAB 2: FISH LIST & DATABASE
-    # ==========================================================================
     with tab_view:
-        st.subheader("📋 Registered Fish Database")
-        
-        df = get_all_fish_records(sheets_service)
-
-        if df.empty:
-            st.info("No fish records found in `Fish_Master`. Register your first fish above!")
-        else:
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total Registered", len(df))
-            m2.metric("Males", len(df[df["Gender"] == "Male"])) if "Gender" in df else None
-            m3.metric("Females", len(df[df["Gender"] == "Female"])) if "Gender" in df else None
-            m4.metric("Show/High Grade", len(df[df["Grade"].isin(["Show Grade", "High Grade"])])) if "Grade" in df else None
-
-            st.divider()
-
-            st.markdown("### 🔄 Tank Location Management")
-            
-            with st.expander("🛠️ Assign or Transfer Fish Tank Location", expanded=False):
-                col_f, col_t, col_act = st.columns([2, 2, 1])
-
-                fish_options = {
-                    f"{row['Fish ID']} - {row['Variety / Strain']} (Current Tank: {row['Tank ID'] if row['Tank ID'] else 'Unassigned'})": (row['Fish ID'], row['Tank ID'])
-                    for _, row in df.iterrows()
-                }
-
-                with col_f:
-                    selected_fish_label = st.selectbox("Select Fish to Move", options=list(fish_options.keys()))
-                    target_fish_id, current_tank_id = fish_options[selected_fish_label]
-
-                with col_t:
-                    available_tanks = get_available_tanks(sheets_service)
-                    avail_tank_opts = [f"{t['location']} ({t['id']} | {t['type']})" for t in available_tanks]
-                    
-                    if not avail_tank_opts:
-                        st.warning("No vacant tanks available!")
-                        selected_new_tank = None
-                    else:
-                        selected_new_tank = st.selectbox("Select New Vacant Tank", options=avail_tank_opts)
-
-                with col_act:
-                    st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
-                    action_btn_label = "📥 Assign Tank" if not current_tank_id or current_tank_id == "Unassigned" else "🔄 Transfer Tank"
-                    
-                    if st.button(action_btn_label, type="primary", use_container_width=True, disabled=not selected_new_tank):
-                        parsed_new_tank_id = selected_new_tank.split(" (")[1].split(" | ")[0]
-                        
-                        with st.spinner("Updating tank assignments in database..."):
-                            success = transfer_or_assign_tank(
-                                sheets_service, 
-                                target_fish_id, 
-                                current_tank_id, 
-                                parsed_new_tank_id
-                            )
-                            if success:
-                                st.toast(f"✅ {target_fish_id} moved to '{parsed_new_tank_id}'!", icon="🎉")
-                                st.rerun()
-
-            st.divider()
-
-            st.markdown("##### 🔍 Filter Database")
-            f_col1, f_col2, f_col3 = st.columns(3)
-
-            with f_col1:
-                gender_filter = st.multiselect(
-                    "Filter Gender",
-                    options=list(df["Gender"].unique()) if "Gender" in df else [],
-                    default=[]
-                )
-
-            with f_col2:
-                grade_filter = st.multiselect(
-                    "Filter Grade",
-                    options=list(df["Grade"].unique()) if "Grade" in df else [],
-                    default=[]
-                )
-
-            with f_col3:
-                strain_filter = st.multiselect(
-                    "Filter Strain / Variety",
-                    options=list(df["Variety / Strain"].unique()) if "Variety / Strain" in df else [],
-                    default=[]
-                )
-
-            filtered_df = df.copy()
-            if gender_filter:
-                filtered_df = filtered_df[filtered_df["Gender"].isin(gender_filter)]
-            if grade_filter:
-                filtered_df = filtered_df[filtered_df["Grade"].isin(grade_filter)]
-            if strain_filter:
-                filtered_df = filtered_df[filtered_df["Variety / Strain"].isin(strain_filter)]
-
-            st.dataframe(
-                filtered_df,
-                column_config={
-                    "Fish ID": st.column_config.TextColumn("Fish ID"),
-                    "Tank ID": st.column_config.TextColumn("Tank ID"),
-                    "Image URL": st.column_config.ImageColumn("Photo Preview"),
-                    "Purchase Cost": st.column_config.NumberColumn("Cost (₱)", format="₱%.2f"),
-                    "Notes": st.column_config.TextColumn("Notes", width="large"),
-                },
-                use_container_width=True,
-                hide_index=True
-            )
-
-            st.caption(f"Showing {len(filtered_df)} of {len(df)} records.")
+        render_list_tab()
