@@ -7,3 +7,4 @@ pandas
 gspread
 supabase
 python-dateutil
+graphviz
