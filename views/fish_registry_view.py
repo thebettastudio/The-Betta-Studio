@@ -2,6 +2,14 @@ import io
 import datetime
 import pandas as pd
 import streamlit as st
+from PIL import Image
+
+# Register HEIC opener for iPhone support
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass  # Fallback if pillow_heif is not installed
 
 # Import Drive & Sheets services
 from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
@@ -294,6 +302,26 @@ def get_all_fish_records(sheets_service):
         return pd.DataFrame()
 
 
+def process_and_compress_image(raw_bytes, max_dimension=1280, quality=85) -> bytes:
+    """Processes, resizes, and compresses uploaded image bytes for mobile network optimization."""
+    try:
+        image = Image.open(io.BytesIO(raw_bytes))
+        
+        # Convert non-RGB modes (RGBA, P, etc.)
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+            
+        # Downscale photo if it exceeds max dimensions
+        image.thumbnail((max_dimension, max_dimension))
+        
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=quality)
+        return buffer.getvalue()
+    except Exception as e:
+        st.warning(f"Note: Could not compress photo, using original file ({e})")
+        return raw_bytes
+
+
 def upload_image_to_drive(drive_service, image_bytes, filename_prefix="fish_"):
     """Upload photo bytes to Google Drive and return public direct view URL."""
     from googleapiclient.http import MediaIoBaseUpload
@@ -301,7 +329,10 @@ def upload_image_to_drive(drive_service, image_bytes, filename_prefix="fish_"):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     file_name = f"{filename_prefix}{timestamp}.jpg"
     
-    file_stream = io.BytesIO(image_bytes)
+    # Process and compress high-res mobile photo before uploading
+    compressed_bytes = process_and_compress_image(image_bytes)
+    
+    file_stream = io.BytesIO(compressed_bytes)
     metadata = {'name': file_name}
     if DRIVE_FOLDER_ID:
         metadata['parents'] = [DRIVE_FOLDER_ID.strip()]
@@ -417,6 +448,33 @@ def render_fish_registry_page():
                 key="select_strain_dropdown"
             )
 
+        # Standalone Photo Upload Input (Outside form to prevent losing file on form reruns)
+        st.markdown("##### 📷 Fish Photo Capture / Upload")
+        img_col1, img_col2 = st.columns(2)
+        
+        with img_col1:
+            camera_photo = st.camera_input("Take a Live Photo of Fish")
+        with img_col2:
+            uploaded_photo = st.file_uploader(
+                "Or Upload Photo File", 
+                type=["jpg", "jpeg", "png", "heic", "heif"],
+                help="Supports iPhone HEIC and standard JPEG/PNG images."
+            )
+
+        # Cache photo bytes immediately into session state
+        if camera_photo is not None:
+            st.session_state["fish_photo_bytes"] = camera_photo.getvalue()
+        elif uploaded_photo is not None:
+            st.session_state["fish_photo_bytes"] = uploaded_photo.getvalue()
+
+        # Show preview if cached photo bytes exist
+        if "fish_photo_bytes" in st.session_state and st.session_state["fish_photo_bytes"]:
+            try:
+                preview_img = Image.open(io.BytesIO(st.session_state["fish_photo_bytes"]))
+                st.image(preview_img, caption="Photo Preview", width=250)
+            except Exception:
+                pass
+
         with st.form("register_fish_form", clear_on_submit=False):
             col1, col2 = st.columns(2)
 
@@ -479,14 +537,7 @@ def render_fish_registry_page():
 
             st.divider()
 
-            st.markdown("##### 📷 Fish Photo Capture / Upload")
-            
-            img_col1, img_col2 = st.columns(2)
-            with img_col1:
-                camera_photo = st.camera_input("Take a Live Photo of Fish")
-            with img_col2:
-                uploaded_photo = st.file_uploader("Or Upload Photo File", type=["jpg", "jpeg", "png"])
-                manual_image_url = st.text_input("Or Paste Existing Drive ID / Image URL", placeholder="Paste direct link or Drive ID")
+            manual_image_url = st.text_input("Or Paste Existing Drive ID / Image URL", placeholder="Paste direct link or Drive ID")
 
             notes = st.text_area("Notes / Characteristics", placeholder="e.g. Strong dorsal, solid iridescence, aggressive disposition")
 
@@ -494,14 +545,12 @@ def render_fish_registry_page():
 
         if submit:
             final_image_val = manual_image_url
-            photo_bytes = None
-            if camera_photo is not None:
-                photo_bytes = camera_photo.getvalue()
-            elif uploaded_photo is not None:
-                photo_bytes = uploaded_photo.getvalue()
+            
+            # Retrieve photo bytes from session state cache
+            photo_bytes = st.session_state.get("fish_photo_bytes")
 
             if photo_bytes:
-                with st.spinner("Uploading photo to Google Drive..."):
+                with st.spinner("Uploading & optimizing photo for Google Drive..."):
                     try:
                         file_id, img_url = upload_image_to_drive(drive_service, photo_bytes)
                         final_image_val = img_url
@@ -538,6 +587,9 @@ def render_fish_registry_page():
 
                 if selected_tank_id:
                     update_tank_occupancy(sheets_service, selected_tank_id, occupant_id=assigned_fish_id, status="Active")
+
+                # Clear cached photo from session state on successful save
+                st.session_state.pop("fish_photo_bytes", None)
 
                 st.cache_data.clear()
                 st.balloons()
