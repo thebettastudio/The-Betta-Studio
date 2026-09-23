@@ -2,6 +2,7 @@
 # Betta Farm Management System
 # Session 11 — Ported to Supabase via fish_manager, tank_registry,
 # database, photo_service, id_generator.
+# Session 16 — Added "View Lineage" button on each fish card.
 
 import io
 import datetime
@@ -164,11 +165,9 @@ def _get_available_tank_options() -> list[dict]:
 def render_register_tab():
     st.subheader("🛒 Purchased / Imported Fish Details")
 
-    # Preview next system_id
     next_id = generate_fish_id()
     st.info(f"📌 Next Assigned Fish ID: **#{next_id}**")
 
-    # --- Strain selector + manager ---
     strains_list = _get_strain_names()
 
     strain_col_select, strain_col_btn = st.columns([4, 1])
@@ -220,7 +219,6 @@ def render_register_tab():
             key="select_strain_dropdown",
         )
 
-    # --- Photo capture (outside form so it survives reruns) ---
     st.markdown("##### 📷 Fish Photo Capture / Upload")
     img_col1, img_col2 = st.columns(2)
     with img_col1:
@@ -244,7 +242,6 @@ def render_register_tab():
         except Exception:
             pass
 
-    # --- Main registration form ---
     with st.form("register_fish_form", clear_on_submit=False):
         col1, col2 = st.columns(2)
 
@@ -324,7 +321,6 @@ def render_register_tab():
     if not submit:
         return
 
-    # --- Photo upload ---
     photo_id: Optional[str] = None
     photo_bytes = st.session_state.get("fish_photo_bytes")
     if photo_bytes:
@@ -339,7 +335,6 @@ def render_register_tab():
     if not photo_id and manual_image_id:
         photo_id = manual_image_id.strip() or None
 
-    # --- Register ---
     if not selected_strain or selected_strain == "No Strains Available":
         st.error("Please select a valid strain.")
         return
@@ -357,7 +352,7 @@ def render_register_tab():
         purchase_date=str(purchase_date),
         purchase_cost=purchase_cost,
         notes=notes,
-        photo_file=None,           # already uploaded above
+        photo_file=None,
         location=None,
         line_code="UNK",
         generation="P1",
@@ -368,11 +363,9 @@ def render_register_tab():
         st.error("Fish registration failed. Check logs.")
         return
 
-    # Patch photo_id in (register_new_fish takes photo_file, not photo_id)
     if photo_id:
         edit_fish(result["id"], {"photo_id": photo_id})
 
-    # Tank assignment
     if selected_tank_id:
         assign_fish_to_tank(selected_tank_id, result["id"])
 
@@ -421,6 +414,11 @@ def _render_card_actions(fish: dict):
     fish_uuid = fish["id"]
     system_id = fish.get("system_id") or "?"
 
+    # Lineage shortcut
+    if st.button("🌳 View Lineage", key=f"lineage_{fish_uuid}", use_container_width=True):
+        st.session_state["lineage_fish_id"] = fish_uuid
+        st.toast(f"Selected {system_id}. Open the Lineage page to view the tree.")
+
     # Promote to breeder
     if not fish.get("is_breeder") and fish.get("status") not in ("Sold", "Deceased", "Retired"):
         if st.button("⭐ Promote to Breeder", key=f"promote_{fish_uuid}", use_container_width=True):
@@ -441,16 +439,14 @@ def _render_card_actions(fish: dict):
         new_tank_id = dd[selected_idx]["id"]
 
         if st.button("📦 Apply Move", key=f"apply_move_{fish_uuid}", use_container_width=True):
-            # Free old tank
             if fish.get("tank_id"):
                 unassign_tank(fish["tank_id"])
-            # Assign new
             if new_tank_id:
                 assign_fish_to_tank(new_tank_id, fish_uuid)
             st.success("Location updated.")
             st.rerun()
 
-    # Delete (with confirm)
+    # Delete
     st.divider()
     confirm = st.checkbox(
         "Confirm delete (removes fish + Drive photo)",
@@ -479,7 +475,6 @@ def render_list_tab():
         st.info("No fish registered yet. Use the Register tab to add your first fish.")
         return
 
-    # Metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Fish", len(all_fish))
     m2.metric("Males", sum(1 for f in all_fish if (f.get("gender") or "").lower() == "male"))
@@ -491,7 +486,6 @@ def render_list_tab():
 
     st.divider()
 
-    # ---- Filters ----
     st.markdown("##### 🔍 Filter Database")
     f_col1, f_col2, f_col3 = st.columns(3)
     with f_col1:
@@ -516,7 +510,6 @@ def render_list_tab():
         st.warning("No fish match the current filters.")
         return
 
-    # ---- Pagination ----
     total_pages = max(1, (len(filtered) + CARD_PAGE_SIZE - 1) // CARD_PAGE_SIZE)
     if total_pages > 1:
         page = st.number_input(
