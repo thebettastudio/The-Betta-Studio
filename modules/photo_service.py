@@ -1,6 +1,7 @@
 # modules/photo_service.py
 # Betta Farm Management System
 # Session 4 — unified Google Drive photo upload + URL builder.
+# Session 18 — photo_url() now uses lh3.googleusercontent.com for faster loads.
 
 from __future__ import annotations
 
@@ -99,7 +100,7 @@ def _upload_bytes(
 
 
 # ============================================================
-# PUBLIC API — what modules should call
+# PUBLIC API
 # ============================================================
 
 def upload_photo(
@@ -175,6 +176,11 @@ def delete_drive_file(file_id: Optional[str]) -> bool:
 def photo_url(file_id: Optional[str], size: int = 800) -> Optional[str]:
     """
     Build a Google Drive thumbnail URL from a raw file ID.
+
+    Uses lh3.googleusercontent.com — the same format the legacy Sheets
+    code used. It renders faster than drive.google.com/thumbnail for
+    freshly-uploaded files.
+
     Returns None if `file_id` is empty.
     """
     if not file_id:
@@ -185,7 +191,7 @@ def photo_url(file_id: Optional[str], size: int = 800) -> Optional[str]:
     # If caller passed a full URL, return it unchanged
     if fid.startswith("http://") or fid.startswith("https://"):
         return fid
-    return f"https://drive.google.com/thumbnail?id={fid}&sz=w{size}"
+    return f"https://lh3.googleusercontent.com/d/{fid}=w{size}"
 
 
 def qr_url(file_id: Optional[str], size: int = 800) -> Optional[str]:
