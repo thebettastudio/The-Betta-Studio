@@ -1,26 +1,39 @@
-import io
+# app.py
+# Betta Farm Management System
+# Session 17 — Navigation cleanup, Supabase diagnostic, new pages added.
+
 import datetime
+
 import streamlit as st
-from views.breeder_view import render_breeder_page
-from views.fish_registry_view import render_fish_registry_page  # Fish Master Registry View
-from views.spawn_view import render_spawn_page
-from views.activity_log_view import render_activity_log_page
-from views.tank_view import render_tank_page       # Tank Registry View
-from views.search_view import render_search_page   # Global Search View
-from modules.dashboard import render_dashboard      # Main Studio Dashboard View
-from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
-from modules.spawn_manager import format_spawns_sheet
+
+# ---- Views ----
+from views.breeder_view         import render_breeder_page
+from views.fish_registry_view   import render_fish_registry_page
+from views.spawn_view           import render_spawn_page
+from views.activity_log_view    import render_activity_log_page
+from views.tank_view            import render_tank_page
+from views.search_view          import render_search_page
+from views.fry_batch_view       import render_fry_batch_page
+from views.lineage_view         import render_lineage_page
+from modules.dashboard          import render_dashboard
+
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
 
 st.set_page_config(
-    page_title="The Betta Studio", 
-    page_icon="🐟", 
+    page_title="The Betta Studio",
+    page_icon="🐟",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# ==============================================================================
-# GLOBAL STYLING: Applies Clean Light Theme
-# ==============================================================================
+
+# ============================================================
+# GLOBAL STYLING
+# ============================================================
+
 st.markdown("""
 <style>
   /* 1. Base App Light Background & Dark Text */
@@ -28,8 +41,7 @@ st.markdown("""
     background-color: #FFFFFF;
     color: #1E2022;
   }
-  
-  /* Force global text elements to remain dark */
+
   .stApp p, .stApp span, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6 {
     color: #1E2022 !important;
   }
@@ -90,79 +102,51 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def run_google_diagnostic():
-    """Runs a live health check on Google Drive & Sheets connections and provides formatting utilities."""
-    with st.sidebar.expander("🛠️ System Diagnostics"):
-        if st.button("Test Google Connection", use_container_width=True):
-            with st.status("Testing APIs...", expanded=True) as status:
-                # 1. Test OAuth Credentials
+# ============================================================
+# SUPABASE DIAGNOSTIC (sidebar)
+# ============================================================
+
+def run_supabase_diagnostic():
+    """Live health check for Supabase connection + Google Drive."""
+    with st.sidebar.expander("🩺 System Diagnostics"):
+        if st.button("Test Supabase Connection", use_container_width=True):
+            with st.status("Testing services...", expanded=True) as status:
+                # 1. Supabase
                 try:
-                    st.write("🔐 Refreshing OAuth tokens...")
-                    drive_service, sheets_service = get_google_services()
-                    st.write("✅ Credentials Valid")
+                    st.write("🗄️ Connecting to Supabase...")
+                    from database import get_all_fish
+                    fish = get_all_fish()
+                    st.write(f"✅ Supabase OK — {len(fish)} fish rows")
                 except Exception as e:
-                    status.update(label="OAuth Failure", state="error")
-                    st.error(f"Authentication failed: {e}")
+                    status.update(label="Supabase Failure", state="error")
+                    st.error(f"Supabase error: {e}")
                     return
 
-                # 2. Test Google Sheets
+                # 2. Google Drive
                 try:
-                    st.write("📊 Checking Google Sheets...")
-                    result = sheets_service.spreadsheets().values().get(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range='Breeders!A1:J1'
-                    ).execute()
-                    headers = result.get('values', [])
-                    st.write(f"✅ Sheets Accessible ({len(headers[0]) if headers else 0} cols)")
+                    st.write("📁 Testing Google Drive auth...")
+                    from modules.drive_service import get_google_services
+                    drive_service, _ = get_google_services()
+                    st.write("✅ Google Drive credentials valid")
                 except Exception as e:
-                    status.update(label="Sheets Read Failure", state="error")
-                    st.error(f"Spreadsheet error: {e}")
-                    return
-
-                # 3. Test Google Drive
-                try:
-                    st.write("📁 Testing Drive Upload...")
-                    from googleapiclient.http import MediaIoBaseUpload
-                    test_bytes = f"Test stream {datetime.datetime.now()}".encode('utf-8')
-                    file_stream = io.BytesIO(test_bytes)
-                    
-                    metadata = {'name': 'temp_diagnostic.txt'}
-                    if DRIVE_FOLDER_ID:
-                        metadata['parents'] = [DRIVE_FOLDER_ID.strip()]
-
-                    media = MediaIoBaseUpload(file_stream, mimetype='text/plain', resumable=False)
-                    uploaded = drive_service.files().create(
-                        body=metadata,
-                        media_body=media,
-                        fields='id'
-                    ).execute()
-
-                    file_id = uploaded.get('id')
-                    st.write("✅ Drive Upload Successful")
-
-                    # Cleanup test file
-                    drive_service.files().delete(fileId=file_id).execute()
-                    st.write("🧹 Test file cleaned up")
-                except Exception as e:
-                    status.update(label="Drive Upload Failure", state="error")
+                    status.update(label="Google Drive Failure", state="error")
                     st.error(f"Drive error: {e}")
                     return
 
-                status.update(label="All Services Operational!", state="complete")
+                status.update(label="All services operational!", state="complete")
 
         st.divider()
+        st.caption(
+            f"Session: 17 · Build: {datetime.date.today().isoformat()}"
+        )
 
-        # One-click sheet formatter button
-        if st.button("✨ Format Google Sheet", use_container_width=True):
-            with st.spinner("Applying theme, headers, and colors to Spawns sheet..."):
-                try:
-                    format_spawns_sheet()
-                    st.success("Google Sheet styled & formatted successfully!")
-                except Exception as e:
-                    st.error(f"Failed to format sheet: {e}")
 
-# --- Sidebar Navigation ---
+# ============================================================
+# SIDEBAR NAV
+# ============================================================
+
 st.sidebar.title("🐟 The Betta Studio")
+
 page = st.sidebar.radio("Navigation", [
     "📊 Studio Dashboard",
     "🔍 Global Search Studio",
@@ -170,13 +154,19 @@ page = st.sidebar.radio("Navigation", [
     "🐟 Breeder Registry",
     "🪣 Tank & Container Registry",
     "❤️ Pair & Spawn Tracker",
-    "📝 Activity Log"
+    "🐣 Fry Batch Tracking",
+    "🌳 Lineage Tree",
+    "📝 Activity Log",
 ])
 
 st.sidebar.markdown("---")
-run_google_diagnostic()
+run_supabase_diagnostic()
 
-# --- View Routing ---
+
+# ============================================================
+# ROUTING
+# ============================================================
+
 if page == "📊 Studio Dashboard":
     render_dashboard()
 elif page == "🔍 Global Search Studio":
@@ -189,5 +179,9 @@ elif page == "🪣 Tank & Container Registry":
     render_tank_page()
 elif page == "❤️ Pair & Spawn Tracker":
     render_spawn_page()
+elif page == "🐣 Fry Batch Tracking":
+    render_fry_batch_page()
+elif page == "🌳 Lineage Tree":
+    render_lineage_page()
 elif page == "📝 Activity Log":
     render_activity_log_page()
