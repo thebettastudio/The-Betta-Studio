@@ -3,6 +3,8 @@ import re
 import datetime
 import streamlit as st
 import pandas as pd
+from modules.drive_service import get_google_services, SPREADSHEET_ID
+from modules.fish_manager import get_all_fish, register_jarred_fry_from_spawn
 from modules.spawn_manager import (
     get_available_breeders,
     get_available_spawning_tanks,
@@ -18,6 +20,51 @@ from modules.spawn_manager import (
     calculate_child_generation,
     get_breeder_details_map
 )
+
+SPAWN_SHEET_HEADERS = [
+    "batch_id", "line_code", "generation", "sire_id", "dam_id", 
+    "variety", "pair_date", "spawn_date", "hatch_date", "free_swimming_date", 
+    "jarring_date", "estimated_fry_count", "status", "notes"
+]
+
+
+def fetch_spawns_from_sheets():
+    """Fetches spawns directly from Google Sheets with fallbacks."""
+    try:
+        _, sheets_service = get_google_services()
+        res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Spawns!A2:N'
+        ).execute()
+        rows = res.get('values', [])
+        
+        spawns = []
+        for r in rows:
+            if r:
+                spawns.append({
+                    "batch_id": r[0] if len(r) > 0 else "",
+                    "line_code": r[1] if len(r) > 1 else "UNK",
+                    "generation": r[2] if len(r) > 2 else "F1",
+                    "sire_id": r[3] if len(r) > 3 else "N/A",
+                    "dam_id": r[4] if len(r) > 4 else "N/A",
+                    "variety": r[5] if len(r) > 5 else "",
+                    "pair_date": r[6] if len(r) > 6 else "",
+                    "spawn_date": r[7] if len(r) > 7 else "",
+                    "hatch_date": r[8] if len(r) > 8 else "",
+                    "free_swimming_date": r[9] if len(r) > 9 else "",
+                    "jarring_date": r[10] if len(r) > 10 else "",
+                    "estimated_fry_count": r[11] if len(r) > 11 else "0",
+                    "status": r[12] if len(r) > 12 else "Active Pairing",
+                    "notes": r[13] if len(r) > 13 else ""
+                })
+        return spawns
+    except Exception:
+        # Fallback to spawn manager module if sheets fetch fails directly
+        try:
+            return get_all_spawns()
+        except Exception:
+            return st.session_state.get("spawns_list", [])
+
 
 def display_breeder_image(image_url: str, gender_label: str = "Breeder"):
     """
@@ -105,6 +152,7 @@ def render_spawn_page():
         col_ref, col_fmt = st.columns([1, 1])
         with col_ref:
             if st.button("🔄 Refresh Active Pairs", key="btn_refresh_spawns", use_container_width=True):
+                st.cache_data.clear()
                 st.rerun()
         with col_fmt:
             if st.button("🎨 Format Spawns Sheet", key="btn_format_spawns", use_container_width=True):
@@ -214,10 +262,8 @@ def render_spawn_page():
 
                     with col_b:
                         with st.popover("🏊 Mark Free Swimming", use_container_width=True):
-                            # Ensure clean, short batch naming for jar indexing
                             clean_line = line_code.strip() if line_code and line_code != "N/A" else ""
                             
-                            # Fallback to spawn_id if line_code contains long descriptions/brackets
                             if len(clean_line) > 12 or "[" in clean_line or "]" in clean_line:
                                 batch_prefix = f"SP{spawn_id}"
                             else:
@@ -262,6 +308,14 @@ def render_spawn_page():
         males, females = get_available_breeders()
         available_tanks = get_available_spawning_tanks()
         breeders_map = get_breeder_details_map()
+
+        # Fallback to fish manager if breeders list is empty
+        if not males or not females:
+            all_fish = get_all_fish()
+            if not males:
+                males = [{"id": f.get("fish_id"), "label": f"{f.get('fish_id')} ({f.get('variety', 'N/A')})"} for f in all_fish if f.get("gender") == "Male"]
+            if not females:
+                females = [{"id": f.get("fish_id"), "label": f"{f.get('fish_id')} ({f.get('variety', 'N/A')})"} for f in all_fish if f.get("gender") == "Female"]
 
         if not males or not females:
             st.warning("⚠️ You need at least one Available/Conditioning Male AND Female breeder to create a pair.")
@@ -309,7 +363,7 @@ def render_spawn_page():
 
             notes = st.text_area("Pairing Notes", placeholder="e.g. Both pre-conditioned for 7 days on bloodworms")
             
-            submit_pair = st.button("💞 Initiate Pairing", disabled=not available_tanks, type="primary")
+            submit_pair = st.button("💞 Initiate Pairing", disabled=not available_tanks, type="primary", use_container_width=True)
 
             if submit_pair:
                 if not tank_location:
@@ -319,6 +373,7 @@ def render_spawn_page():
                         spawn_id, line_code, child_gen = create_new_spawn(
                             male_id, female_id, tank_location, line_goal, notes
                         )
+                    st.cache_data.clear()
                     st.success(
                         f"Pairing initiated! Spawn ID: **{spawn_id}** | Line: **{line_code}** ({child_gen}) assigned to Tank **{tank_location}**"
                     )
@@ -329,7 +384,7 @@ def render_spawn_page():
     # ==========================================
     with tab3:
         st.subheader("All Spawn Records")
-        spawns = get_all_spawns()
+        spawns = fetch_spawns_from_sheets()
         if spawns:
             df = pd.DataFrame(spawns)
             
@@ -342,3 +397,8 @@ def render_spawn_page():
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.info("No spawn history recorded yet.")
+
+
+def render_spawn_tracker():
+    """Alias entrypoint for rendering the spawn page."""
+    render_spawn_page()
