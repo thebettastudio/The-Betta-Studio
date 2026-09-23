@@ -619,3 +619,91 @@ def get_dashboard_counts() -> dict:
     except Exception as e:
         st.error(f"get_dashboard_counts failed: {e}")
         return {}
+
+
+
+# ============================================================
+# FISH MILESTONES (Session 20)
+# ============================================================
+
+MILESTONE_FIELDS = [
+    "fish_id", "milestone_date", "photo_id",
+    "form_score", "body_shape", "fin_checks",
+    "notes",
+]
+
+
+def get_milestones_for_fish(fish_id: str) -> list[dict]:
+    """All milestones for a fish, newest first."""
+    try:
+        res = (_sb().table("fish_milestones")
+               .select("*")
+               .eq("fish_id", fish_id)
+               .order("milestone_date", desc=True)
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_milestones_for_fish failed: {e}")
+        return []
+
+
+def get_milestone_by_id(milestone_id: str) -> Optional[dict]:
+    """Fetch one milestone by uuid."""
+    try:
+        res = _sb().table("fish_milestones").select("*").eq("id", milestone_id).limit(1).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"get_milestone_by_id failed: {e}")
+        return None
+
+
+def create_milestone(data: dict) -> Optional[dict]:
+    """Insert a milestone. `data` keys must match MILESTONE_FIELDS."""
+    payload = {k: data.get(k) for k in MILESTONE_FIELDS if k in data}
+    try:
+        res = _sb().table("fish_milestones").insert(payload).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_milestone failed: {e}")
+        return None
+
+
+def update_milestone(milestone_id: str, updates: dict) -> bool:
+    """Update a milestone. Only MILESTONE_FIELDS keys are accepted."""
+    payload = {k: v for k, v in updates.items() if k in MILESTONE_FIELDS}
+    if not payload:
+        return False
+    try:
+        _sb().table("fish_milestones").update(payload).eq("id", milestone_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"update_milestone failed: {e}")
+        return False
+
+
+def delete_milestone(milestone_id: str) -> bool:
+    """Delete a milestone by uuid."""
+    try:
+        _sb().table("fish_milestones").delete().eq("id", milestone_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_milestone failed: {e}")
+        return False
+
+
+def get_milestone_counts_by_fish() -> dict:
+    """
+    Returns { fish_id: count } for all fish that have milestones.
+    Single round-trip for the list view.
+    """
+    try:
+        res = _sb().table("fish_milestones").select("fish_id").execute()
+        counts: dict[str, int] = {}
+        for row in (res.data or []):
+            fid = row.get("fish_id")
+            if fid:
+                counts[fid] = counts.get(fid, 0) + 1
+        return counts
+    except Exception as e:
+        st.error(f"get_milestone_counts_by_fish failed: {e}")
+        return {}
