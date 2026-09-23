@@ -1,6 +1,7 @@
-config/credentials.json
-config/token.json
-credentials.json
-token.json
-__pycache__/
+﻿.streamlit/
+.streamlit/secrets.toml
 *.pyc
+__pycache__/
+.env
+.DS_Store
+
