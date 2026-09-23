@@ -2,6 +2,7 @@
 # Betta Farm Management System — Supabase wrapper
 # Session 3 deliverable — replaces all Google Sheets access.
 # Session 11 — added delete_strain().
+# Session 15 — added get_fry_batch_by_id, get_fry_batches_for_spawn, delete_fry_batch.
 
 from __future__ import annotations
 
@@ -136,7 +137,6 @@ def retire_fish(fish_id: str, reason: str = "", extra_notes: str = "") -> bool:
         "tank_id": None,
     })
 
-    # Free any tank holding this fish
     if fish.get("tank_id"):
         update_tank(fish["tank_id"], {"occupant_fish_id": None, "occupant_label": None, "status": "Empty / Idle"})
     return ok
@@ -400,7 +400,6 @@ def log_activity(
         }).execute()
         return True
     except Exception as e:
-        # Logging should never break the app
         print(f"log_activity failed: {e}")
         return False
 
@@ -456,6 +455,40 @@ def update_fry_batch(batch_id: str, updates: dict) -> bool:
         return True
     except Exception as e:
         st.error(f"update_fry_batch failed: {e}")
+        return False
+
+
+def get_fry_batch_by_id(batch_id: str) -> Optional[dict]:
+    """Fetch one fry batch by uuid."""
+    try:
+        res = _sb().table("fry_batches").select("*").eq("id", batch_id).limit(1).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"get_fry_batch_by_id failed: {e}")
+        return None
+
+
+def get_fry_batches_for_spawn(spawn_id: str) -> list[dict]:
+    """All batches linked to a specific spawn."""
+    try:
+        res = (_sb().table("fry_batches")
+               .select("*")
+               .eq("spawn_id", spawn_id)
+               .order("created_at", desc=True)
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_fry_batches_for_spawn failed: {e}")
+        return []
+
+
+def delete_fry_batch(batch_id: str) -> bool:
+    """Delete a fry batch by uuid."""
+    try:
+        _sb().table("fry_batches").delete().eq("id", batch_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_fry_batch failed: {e}")
         return False
 
 
