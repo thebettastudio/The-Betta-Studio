@@ -1,305 +1,456 @@
-import io
-import re
-import datetime
-import pandas as pd
+# modules/fish_manager.py
+# Betta Farm Management System
+# Session 6 — Fish + Breeder unified. Uses Supabase via database.py.
+# breeder_registry.py is retired; all breeder logic lives here.
+
+from __future__ import annotations
+
+from typing import Optional
+
 import streamlit as st
-from PIL import Image
-from typing import List, Dict, Tuple, Optional
 
-# Register HEIC opener for iPhone camera photos
-try:
-    from pillow_heif import register_heif_opener
-    register_heif_opener()
-except ImportError:
-    pass
+from database import (
+    get_all_fish,
+    get_fish_by_id,
+    get_fish_by_system_id,
+    create_fish,
+    update_fish,
+    delete_fish,
+    promote_fish_to_breeder,
+    retire_fish,
+    get_available_breeders,
+    get_all_tanks,
+    get_all_spawns,
+    get_fish_by_id as _get_fish_by_id,  # alias for readability below
+    log_activity,
+)
+from modules.id_generator import generate_fish_id, generate_batch_fish_id
+from modules.photo_service import upload_photo, delete_drive_file, photo_url
 
-# Import Drive & Sheets services
-from modules.drive_service import get_google_services, SPREADSHEET_ID, DRIVE_FOLDER_ID
 
-# Standard headers for the Fish Registry sheet
-FISH_REGISTRY_HEADERS = [
-    "fish_id",
-    "origin",            # "Purchased" or "Batch Spawn"
-    "batch_id",          # e.g., "SP01" or empty if purchased
-    "line_code",         # e.g., "DRG" or "UNK"
-    "generation",        # e.g., "F1" or "P1"
-    "sire_id",           # Male Parent Fish ID or "N/A"
-    "dam_id",            # Female Parent Fish ID or "N/A"
-    "gender",            # "Male", "Female", or "Unsexed"
-    "variety",           # e.g., "Red Dragon HMPK"
-    "grade",             # "Show Grade", "High Grade", "Pet Grade"
-    "image_url",         # Drive link / Photo ID
-    "location",          # Tank / Jar location
-    "purchase_date",     # ISO date string or empty
-    "seller",            # Seller / Import source or empty
-    "purchase_cost",     # Numeric cost or 0
-    "is_breeder",        # True / False
-    "status",            # "Jarred", "Active", "For Sale", "Sold", "Deceased", "Retired"
-    "notes",
-    "created_at"
+# ============================================================
+# VALID VALUES (used by UI dropdowns and validation)
+# ============================================================
+
+VALID_GENDERS = ["Male", "Female", "Unsexed"]
+
+VALID_GRADES = [
+    "Show Grade",
+    "High Grade",
+    "Breeder Grade",
+    "Material Grade",
+    "Pet Grade",
 ]
 
+VALID_STAGES = [
+    "egg", "fry", "free_swimming", "jarred",
+    "juvenile", "sub_adult", "adult", "breeder", "retired",
+]
 
-def process_and_compress_image(raw_bytes: bytes, max_dimension: int = 1280, quality: int = 85) -> bytes:
-    """Processes, resizes, and compresses uploaded image bytes for mobile network optimization."""
-    try:
-        image = Image.open(io.BytesIO(raw_bytes))
-        
-        # Convert non-RGB modes (RGBA, P, HEIC) to standard RGB
-        if image.mode in ("RGBA", "P"):
-            image = image.convert("RGB")
-            
-        # Downscale photo if it exceeds max dimensions
-        image.thumbnail((max_dimension, max_dimension))
-        
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=quality)
-        return buffer.getvalue()
-    except Exception as e:
-        st.warning(f"Note: Could not compress photo, using original file bytes ({e})")
-        return raw_bytes
+VALID_STATUSES = [
+    "Active", "Jarred", "For Sale", "Sold",
+    "Deceased", "Retired", "Conditioning",
+]
+
+VALID_BREEDER_STATUSES = [
+    "Available", "Conditioning", "Ready",
+    "In Pairing", "Retired", "Inactive",
+]
+
+VALID_ORIGINS = ["Purchased", "Batch Spawn"]
 
 
-def upload_fish_photo_to_drive(image_bytes: bytes, filename_prefix: str = "fish_") -> Tuple[str, str]:
-    """Compresses photo bytes, uploads to Google Drive, and returns (file_id, direct_view_url)."""
-    from googleapiclient.http import MediaIoBaseUpload
+# ============================================================
+# READ
+# ============================================================
 
-    drive_service, _ = get_google_services()
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"{filename_prefix}{timestamp}.jpg"
-
-    compressed_bytes = process_and_compress_image(image_bytes)
-    file_stream = io.BytesIO(compressed_bytes)
-
-    metadata = {'name': file_name}
-    if DRIVE_FOLDER_ID:
-        metadata['parents'] = [DRIVE_FOLDER_ID.strip()]
-
-    media = MediaIoBaseUpload(file_stream, mimetype='image/jpeg', resumable=False)
-    uploaded = drive_service.files().create(
-        body=metadata,
-        media_body=media,
-        fields='id'
-    ).execute()
-
-    file_id = uploaded.get('id')
-    return file_id, f"https://lh3.googleusercontent.com/d/{file_id}"
+def list_all_fish() -> list[dict]:
+    """All fish, newest first."""
+    return get_all_fish()
 
 
-# ------------------------------------------------------------------------------
-# SPAWN & FAMILY TREE INTEGRATION
-# ------------------------------------------------------------------------------
-
-def get_all_spawns() -> List[Dict]:
-    """Retrieves active spawn records from Google Sheets or Session State."""
-    try:
-        _, sheets_service = get_google_services()
-        res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Spawns!A2:K'
-        ).execute()
-        rows = res.get('values', [])
-        
-        spawns = []
-        for r in rows:
-            if r and len(r) >= 1:
-                spawns.append({
-                    "batch_id": r[0].strip(),
-                    "line_code": r[1].strip() if len(r) > 1 else "UNK",
-                    "generation": r[2].strip() if len(r) > 2 else "F1",
-                    "sire_id": r[3].strip() if len(r) > 3 else "N/A",
-                    "dam_id": r[4].strip() if len(r) > 4 else "N/A",
-                    "variety": r[5].strip() if len(r) > 5 else "",
-                    "spawn_date": r[6].strip() if len(r) > 6 else "",
-                    "status": r[7].strip() if len(r) > 7 else "Active"
-                })
-        return spawns
-    except Exception:
-        return st.session_state.get("spawns_registry", [])
+def list_fish_by_status(status: str) -> list[dict]:
+    return [f for f in get_all_fish() if (f.get("status") or "") == status]
 
 
-def generate_batch_fish_id(batch_code: str, existing_ids: List[str]) -> str:
+def list_fish_by_location(location_code: str) -> list[dict]:
+    return [f for f in get_all_fish() if (f.get("location") or "") == location_code]
+
+
+def find_fish(identifier: str) -> Optional[dict]:
     """
-    Generates a unique ID for jarred fry from a batch.
-    Format: [BATCH_CODE]-[INDEX]
-    Example: DRG-F1-01, SP01-F1-05
+    Look up a fish by uuid (id) OR human-readable system_id.
     """
-    clean_batch = batch_code.strip() if batch_code else "BATCH"
-    prefix = f"{clean_batch}-"
-    
-    matches = [i for i in existing_ids if i.startswith(prefix)]
-    next_idx = len(matches) + 1
-    return f"{prefix}{next_idx:02d}"
+    if not identifier:
+        return None
+    # Try system_id first (more common from UI)
+    fish = get_fish_by_system_id(identifier)
+    if fish:
+        return fish
+    # Fall back to uuid
+    return get_fish_by_id(identifier)
 
 
-def generate_purchased_fish_id(variety: str, gender: str, existing_ids: List[str]) -> str:
+def get_fish_dropdown_items() -> list[dict]:
     """
-    Generates a unique ID for purchased fish.
-    Format: PUR-[VARIETY_CODE]-[M/F/U][INDEX]
-    Example: PUR-HMPK-M01
+    Lightweight list for dropdowns. Returns id + label.
+    Excludes Deceased / Sold / Retired by default.
     """
-    words = re.findall(r'\b\w', variety.upper()) if variety else []
-    var_code = "".join(words)[:4] if words else "BET"
-    
-    g_str = (gender or "U").strip().lower()
-    if g_str.startswith("m"):
-        g_code = "M"
-    elif g_str.startswith("f"):
-        g_code = "F"
-    else:
-        g_code = "U"
-        
-    prefix = f"PUR-{var_code}-{g_code}"
-    
-    matches = [i for i in existing_ids if i.startswith(prefix)]
-    next_idx = len(matches) + 1
-    return f"{prefix}{next_idx:02d}"
+    out = []
+    for f in get_all_fish():
+        status = (f.get("status") or "").lower()
+        if status in ("deceased", "sold", "retired"):
+            continue
+        out.append({
+            "id": f["id"],
+            "system_id": f.get("system_id"),
+            "label": _fish_label(f),
+        })
+    return out
 
 
-def get_all_fish() -> List[Dict]:
-    """
-    Retrieves all registered fish from session state or storage backend.
-    """
-    if "fish_registry" not in st.session_state:
-        st.session_state["fish_registry"] = []
-    return st.session_state["fish_registry"]
+def _fish_label(f: dict) -> str:
+    """Format: 'FISH-0042 | Male | Avatar | High Grade'"""
+    parts = [f.get("system_id") or "?"]
+    if f.get("gender"):    parts.append(f["gender"])
+    if f.get("variety"):   parts.append(f["variety"])
+    if f.get("grade"):     parts.append(f["grade"])
+    return " | ".join(str(p) for p in parts)
 
 
-def register_jarred_fry_from_spawn(
-    spawn_batch_id: str,
-    gender: str,
-    grade: str,
-    location: str,
-    image_bytes: Optional[bytes] = None,
-    notes: str = ""
-) -> str:
-    """
-    Registers a jarred fry into the Fish Registry by carrying over 
-    Sire ID, Dam ID, Line Code, Generation, and Variety from the Spawn record.
-    """
-    spawns = get_all_spawns()
-    selected_spawn = next((s for s in spawns if s["batch_id"] == spawn_batch_id), None)
-    
-    existing_ids = get_existing_fish_ids()
-    new_fish_id = generate_batch_fish_id(spawn_batch_id, existing_ids)
+# ============================================================
+# CREATE
+# ============================================================
 
-    lineage_data = {
-        "fish_id": new_fish_id,
-        "origin": "Batch Spawn",
-        "batch_id": spawn_batch_id,
-        "line_code": selected_spawn.get("line_code", "UNK") if selected_spawn else "UNK",
-        "generation": selected_spawn.get("generation", "F1") if selected_spawn else "F1",
-        "sire_id": selected_spawn.get("sire_id", "N/A") if selected_spawn else "N/A",
-        "dam_id": selected_spawn.get("dam_id", "N/A") if selected_spawn else "N/A",
+def register_new_fish(
+    *,
+    origin: str = "Purchased",
+    gender: str = "Unsexed",
+    variety: str = "",
+    strain: str = "",
+    form_type: str = "",
+    grade: str = "Pet Grade",
+    body_shape: str = "",
+    form_score: Optional[int] = None,
+    fin_checks: Optional[dict] = None,
+    seller: str = "",
+    purchase_date: Optional[str] = None,
+    purchase_cost: float = 0.0,
+    location: str = "",
+    notes: str = "",
+    photo_file=None,
+    sire_id: Optional[str] = None,
+    dam_id: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    line_code: str = "UNK",
+    generation: str = "P1",
+    status: str = "Active",
+) -> Optional[dict]:
+    """
+    Register a manually-acquired fish (purchased or unknown origin).
+    Generates FISH-NNNN system_id.
+
+    For batch-born fish use `register_fish_from_spawn()` instead.
+    """
+    system_id = generate_fish_id()
+
+    photo_id = None
+    if photo_file is not None:
+        photo_id = upload_photo(photo_file, entity_type="fish", entity_id=system_id)
+
+    record = {
+        "system_id": system_id,
+        "origin": origin,
         "gender": gender,
-        "variety": selected_spawn.get("variety", "") if selected_spawn else "",
+        "variety": variety,
+        "strain": strain,
+        "form_type": form_type,
+        "grade": grade,
+        "body_shape": body_shape,
+        "form_score": form_score,
+        "fin_checks": fin_checks or {},
+        "seller": seller,
+        "purchase_date": purchase_date,
+        "purchase_cost": purchase_cost or 0,
+        "location": location,
+        "notes": notes,
+        "photo_id": photo_id,
+        "sire_id": sire_id,
+        "dam_id": dam_id,
+        "batch_id": batch_id,
+        "line_code": line_code or "UNK",
+        "generation": generation or "P1",
+        "status": status,
+        "is_breeder": False,
+        "breeder_status": None,
+    }
+
+    saved = create_fish(record)
+    if saved:
+        log_activity(
+            action_type="fish_registered",
+            description=f"Registered {system_id} ({gender}, {variety or 'no variety'})",
+            entity_type="fish",
+            entity_id=saved["id"],
+        )
+    return saved
+
+
+def register_fish_from_spawn(
+    *,
+    spawn_id: str,                 # spawn uuid
+    gender: str,
+    grade: str = "Pet Grade",
+    location: str = "",
+    notes: str = "",
+    photo_file=None,
+) -> Optional[dict]:
+    """
+    Register a jarred fry from a spawn. Inherits lineage:
+      - sire_id, dam_id from spawn
+      - line_code, generation from spawn
+      - batch_id = spawn.id
+      - system_id = {spawn.system_id}-NN
+    """
+    spawn = next((s for s in get_all_spawns() if s["id"] == spawn_id), None)
+    if not spawn:
+        st.error(f"Spawn {spawn_id} not found.")
+        return None
+
+    spawn_sys = spawn.get("system_id") or "SPN-UNK-P1-01"
+    system_id = generate_batch_fish_id(spawn_sys)
+
+    photo_id = None
+    if photo_file is not None:
+        photo_id = upload_photo(photo_file, entity_type="fish", entity_id=system_id)
+
+    # Inherit variety from sire's variety if available
+    variety = ""
+    sire = get_fish_by_id(spawn.get("male_id"))
+    if sire:
+        variety = sire.get("variety") or ""
+
+    record = {
+        "system_id": system_id,
+        "origin": "Batch Spawn",
+        "gender": gender,
+        "variety": variety,
         "grade": grade,
         "location": location,
+        "notes": f"Jarred from {spawn_sys}. {notes}".strip(),
+        "photo_id": photo_id,
+        "sire_id": spawn.get("male_id"),
+        "dam_id": spawn.get("female_id"),
+        "batch_id": spawn["id"],
+        "line_code": spawn.get("line_code") or "UNK",
+        "generation": spawn.get("generation") or "F1",
         "status": "Jarred",
-        "notes": f"Jarred from Spawn #{spawn_batch_id}. {notes}".strip()
-    }
-
-    return register_new_fish(lineage_data, image_bytes)
-
-
-def register_new_fish(fish_data: Dict, image_bytes: Optional[bytes] = None) -> str:
-    """
-    Registers a new individual fish into the Master Fish Registry, uploading 
-    the photo to Drive if photo bytes are provided.
-    """
-    if "fish_registry" not in st.session_state:
-        st.session_state["fish_registry"] = []
-
-    # Handle photo upload if bytes are passed
-    final_image_url = fish_data.get("image_url", "")
-    if image_bytes:
-        try:
-            file_id, drive_url = upload_fish_photo_to_drive(image_bytes)
-            final_image_url = drive_url
-        except Exception as e:
-            st.error(f"Failed to upload fish photo to Drive: {e}")
-
-    fish_record = {
-        "fish_id": fish_data["fish_id"],
-        "origin": fish_data.get("origin", "Purchased"),
-        "batch_id": fish_data.get("batch_id", "N/A"),
-        "line_code": fish_data.get("line_code", "UNK"),
-        "generation": fish_data.get("generation", "P1"),
-        "sire_id": fish_data.get("sire_id", "N/A"),
-        "dam_id": fish_data.get("dam_id", "N/A"),
-        "gender": fish_data.get("gender", "Unsexed"),
-        "variety": fish_data.get("variety", ""),
-        "grade": fish_data.get("grade", "High Grade"),
-        "image_url": final_image_url,
-        "location": fish_data.get("location", "Unassigned"),
-        "purchase_date": fish_data.get("purchase_date", ""),
-        "seller": fish_data.get("seller", ""),
-        "purchase_cost": fish_data.get("purchase_cost", 0.0),
         "is_breeder": False,
-        "status": fish_data.get("status", "Active"),
-        "notes": fish_data.get("notes", ""),
-        "created_at": datetime.date.today().isoformat()
+        "breeder_status": None,
     }
-    
-    st.session_state["fish_registry"].append(fish_record)
 
-    # Sync to Google Sheets backend if connected
-    try:
-        _, sheets_service = get_google_services()
-        sheet_row = [fish_record[h] for h in FISH_REGISTRY_HEADERS]
-        sheets_service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Fish_Master!A:S',
-            valueInputOption='USER_ENTERED',
-            body={'values': [sheet_row]}
-        ).execute()
-        st.cache_data.clear()
-    except Exception as e:
-        st.warning(f"Note: Saved locally, but couldn't write to Google Sheets ({e})")
-
-    return fish_record["fish_id"]
+    saved = create_fish(record)
+    if saved:
+        log_activity(
+            action_type="fish_registered",
+            description=f"Jarred {system_id} from {spawn_sys}",
+            entity_type="fish",
+            entity_id=saved["id"],
+        )
+    return saved
 
 
-def promote_fish_to_breeder(fish_id: str) -> bool:
+# ============================================================
+# UPDATE
+# ============================================================
+
+def edit_fish(fish_id: str, updates: dict) -> bool:
     """
-    Promotes a registered fish to active breeder status while preserving its exact fish_id and lineage.
+    Update any allowed fields. If a `photo_file` is passed in updates,
+    uploads it and replaces photo_id (deletes old Drive file).
     """
-    fish_list = get_all_fish()
-    for fish in fish_list:
-        if fish["fish_id"] == fish_id:
-            fish["is_breeder"] = True
-            fish["status"] = "Conditioning"
-            
-            # Synchronize with Breeders Registry session state if present
-            if "breeders" not in st.session_state:
-                st.session_state["breeders"] = []
-                
-            # Check if breeder entry already exists
-            existing_breeder = next((b for b in st.session_state["breeders"] if b.get("id") == fish_id), None)
-            if not existing_breeder:
-                breeder_record = {
-                    "id": fish["fish_id"],
-                    "gender": fish["gender"],
-                    "variety": fish["variety"],
-                    "line_code": fish["line_code"],
-                    "generation": fish["generation"],
-                    "grade": fish["grade"],
-                    "status": "Available",
-                    "tank_location": fish["location"],
-                    "photo_id": fish["image_url"],
-                    "sire_id": fish["sire_id"],
-                    "dam_id": fish["dam_id"],
-                    "batch_id": fish["batch_id"],
-                    "notes": fish["notes"]
-                }
-                st.session_state["breeders"].append(breeder_record)
-            return True
-            
-    return False
+    photo_file = updates.pop("photo_file", None)
+    if photo_file is not None:
+        fish = get_fish_by_id(fish_id)
+        old_id = fish.get("photo_id") if fish else None
+        new_id = upload_photo(photo_file, entity_type="fish", entity_id=fish_id)
+        if new_id:
+            updates["photo_id"] = new_id
+            if old_id:
+                delete_drive_file(old_id)
+
+    ok = update_fish(fish_id, updates)
+    if ok:
+        log_activity(
+            action_type="fish_updated",
+            description=f"Updated fields: {', '.join(updates.keys())}",
+            entity_type="fish",
+            entity_id=fish_id,
+        )
+    return ok
 
 
-def get_existing_fish_ids() -> List[str]:
+def change_location(fish_id: str, new_location: str) -> bool:
+    """Move a fish to a new tank/jar (tape code). Updates both fish and old tank."""
+    fish = get_fish_by_id(fish_id)
+    if not fish:
+        return False
+
+    # Free old tank if it was pointing at this fish
+    old_loc = fish.get("location")
+    if old_loc:
+        for t in get_all_tanks():
+            if t.get("location_code") == old_loc and t.get("occupant_fish_id") == fish_id:
+                from database import clear_occupant
+                clear_occupant(t["id"])
+                break
+
+    # Assign new tank if exists
+    if new_location:
+        for t in get_all_tanks():
+            if t.get("location_code") == new_location:
+                from database import assign_occupant
+                assign_occupant(t["id"], fish_id, _fish_label(fish))
+                break
+
+    return update_fish(fish_id, {"location": new_location})
+
+
+def delete_fish_and_photos(fish_id: str) -> bool:
+    """Delete a fish and its Drive photo."""
+    fish = get_fish_by_id(fish_id)
+    if not fish:
+        return False
+
+    # Free any tank holding this fish
+    for t in get_all_tanks():
+        if t.get("occupant_fish_id") == fish_id:
+            from database import clear_occupant
+            clear_occupant(t["id"])
+
+    for f_id in (fish.get("photo_id"), fish.get("qr_id")):
+        if f_id:
+            delete_drive_file(f_id)
+
+    ok = delete_fish(fish_id)
+    if ok:
+        log_activity(
+            action_type="fish_deleted",
+            description=f"Deleted {fish.get('system_id')}",
+            entity_type="fish",
+        )
+    return ok
+
+
+# ============================================================
+# BREEDER BEHAVIOR
+# ============================================================
+
+def promote_to_breeder(fish_id: str, breeder_status: str = "Available") -> bool:
     """
-    Utility function to retrieve all existing fish IDs for uniqueness checking.
+    Promote a fish to breeder. Fish keeps its system_id.
+    Fish status becomes 'Conditioning'.
     """
-    return [f["fish_id"] for f in get_all_fish()]
+    ok = promote_fish_to_breeder(fish_id, breeder_status)
+    if ok:
+        fish = get_fish_by_id(fish_id)
+        log_activity(
+            action_type="fish_promoted",
+            description=f"Promoted {fish.get('system_id')} to breeder ({breeder_status})",
+            entity_type="fish",
+            entity_id=fish_id,
+        )
+    return ok
+
+
+def retire_breeder(fish_id: str, reason: str = "", notes: str = "") -> bool:
+    """Retire a breeder. Frees tank, sets status=Retired, is_breeder=false."""
+    fish = get_fish_by_id(fish_id)
+    if not fish:
+        return False
+    ok = retire_fish(fish_id, reason, notes)
+    if ok:
+        log_activity(
+            action_type="breeder_retired",
+            description=f"Retired {fish.get('system_id')} — {reason or 'no reason given'}",
+            entity_type="fish",
+            entity_id=fish_id,
+        )
+    return ok
+
+
+def list_available_breeders(gender: Optional[str] = None) -> list[dict]:
+    """
+    Available breeders, optionally filtered by gender.
+    Returns fish rows.
+    """
+    breeders = get_available_breeders()
+    if gender:
+        g = gender.strip().lower()
+        breeders = [b for b in breeders if (b.get("gender") or "").lower() == g]
+    return breeders
+
+
+def get_breeder_pairs_data() -> tuple[list[dict], list[dict]]:
+    """
+    Returns (males, females) as dropdown items for pairing UI.
+    Each item: {'id': uuid, 'system_id': 'FISH-0042', 'label': '...'}
+    """
+    males, females = [], []
+    for b in get_available_breeders():
+        item = {
+            "id": b["id"],
+            "system_id": b.get("system_id"),
+            "label": _fish_label(b),
+        }
+        g = (b.get("gender") or "").lower()
+        if g == "male":
+            males.append(item)
+        elif g == "female":
+            females.append(item)
+    return males, females
+
+
+def get_breeder_stats() -> dict:
+    """Counts for dashboard."""
+    all_fish = get_all_fish()
+    breeders = [f for f in all_fish if f.get("is_breeder")]
+    return {
+        "total_fish": len(all_fish),
+        "total_breeders": len(breeders),
+        "males": sum(1 for b in breeders if (b.get("gender") or "").lower() == "male"),
+        "females": sum(1 for b in breeders if (b.get("gender") or "").lower() == "female"),
+        "available": sum(1 for b in breeders if b.get("breeder_status") == "Available"),
+        "in_pairing": sum(1 for b in breeders if b.get("breeder_status") == "In Pairing"),
+        "conditioning": sum(1 for b in breeders if b.get("breeder_status") == "Conditioning"),
+    }
+
+
+def sync_breeder_status(fish_id: str, new_status: str) -> bool:
+    """
+    Called by spawn_manager when a pairing starts/ends.
+    Updates only breeder_status (not overall fish status).
+    """
+    return update_fish(fish_id, {"breeder_status": new_status})
+
+
+# ============================================================
+# LINEAGE HELPERS (used by Session 17 lineage tree)
+# ============================================================
+
+def get_parents(fish_id: str) -> tuple[Optional[dict], Optional[dict]]:
+    """Return (sire, dam) for a fish."""
+    fish = get_fish_by_id(fish_id)
+    if not fish:
+        return None, None
+    sire = get_fish_by_id(fish["sire_id"]) if fish.get("sire_id") else None
+    dam  = get_fish_by_id(fish["dam_id"])  if fish.get("dam_id")  else None
+    return sire, dam
+
+
+def get_spawn_for_fish(fish_id: str) -> Optional[dict]:
+    """Return the spawn this fish was born from, if any."""
+    fish = get_fish_by_id(fish_id)
+    if not fish or not fish.get("batch_id"):
+        return None
+    return next((s for s in get_all_spawns() if s["id"] == fish["batch_id"]), None)
