@@ -1,6 +1,7 @@
 # modules/spawn_manager.py
 # Betta Farm Management System
 # Session 8 — Spawn lifecycle ported to Supabase.
+# Session 12 — list_active_pairings_with_details() enriched with tank + days_paired.
 
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from database import (
     delete_spawn,
     get_fish_by_id,
     get_all_fish,
+    get_all_tanks,
     log_activity,
 )
 from modules.id_generator import (
@@ -37,7 +39,7 @@ from modules.tank_registry import (
 
 
 # ============================================================
-# VALID STATUSES (used by UI)
+# VALID STATUSES
 # ============================================================
 
 VALID_SPAWN_STATUSES = [
@@ -67,22 +69,51 @@ def list_active_spawns() -> list[dict]:
 def list_spawns_with_details() -> list[dict]:
     """
     Returns all spawns, each enriched with:
-      male: fish row of sire (or None)
-      female: fish row of dam (or None)
-      tank: tank row (or None)
+      spawn       : raw spawn row
+      male        : fish row of sire (or None)
+      female      : fish row of dam (or None)
+      tank        : tank row (or None)
+      tank_location : tape code (or 'Unassigned')
+      days_paired : int (days since pairing_date)
     """
     fish_by_id = {f["id"]: f for f in get_all_fish()}
+    tank_by_id = {t["id"]: t for t in get_all_tanks()}
+
     out = []
     for s in get_all_spawns():
+        tank = tank_by_id.get(s.get("tank_id"))
+        tank_loc = tank.get("location_code") if tank else None
+
+        # Fallback: parse old "Tank: XXX" from notes if tank_id is null
+        if not tank_loc:
+            notes_text = s.get("notes") or ""
+            if "Tank:" in notes_text:
+                try:
+                    tank_loc = notes_text.split("Tank:")[1].split("|")[0].strip()
+                except Exception:
+                    tank_loc = None
+
+        pairing_date = s.get("pairing_date")
+        days_paired = 0
+        if pairing_date:
+            try:
+                days_paired = (_dt.date.today() - _dt.date.fromisoformat(str(pairing_date))).days
+            except Exception:
+                days_paired = 0
+
         out.append({
             "spawn": s,
             "male": fish_by_id.get(s.get("male_id")),
             "female": fish_by_id.get(s.get("female_id")),
+            "tank": tank,
+            "tank_location": tank_loc or "Unassigned",
+            "days_paired": days_paired,
         })
     return out
 
 
 def list_active_pairings_with_details() -> list[dict]:
+    """Same shape as list_spawns_with_details, filtered to active statuses."""
     return [d for d in list_spawns_with_details() if d["spawn"].get("status") in ACTIVE_STATUSES]
 
 
@@ -96,18 +127,16 @@ def get_pairing_dropdown_data() -> tuple[list[dict], list[dict]]:
 # ============================================================
 
 def create_new_spawn(
-    male_id: str,               # fish uuid
-    female_id: str,             # fish uuid
-    tank_id: Optional[str] = None,   # tank uuid
+    male_id: str,
+    female_id: str,
+    tank_id: Optional[str] = None,
     line_goal: str = "",
     notes: str = "",
 ) -> Optional[dict]:
     """
     Create a new spawn record.
-    - Calculates child line_code + generation from parents
-    - Generates system_id (SPN-{LINE}-{GEN}-NN) and spawn_code (SPN-YY-NN)
-    - Sets both parents to breeder_status 'In Pairing'
-    - Assigns tank to the spawn (marks 'Occupied')
+    Returns the created spawn row (dict) or None on failure.
+    Caller can read saved["system_id"], saved["spawn_code"], etc.
     """
     sire = get_fish_by_id(male_id)
     dam  = get_fish_by_id(female_id)
@@ -115,7 +144,6 @@ def create_new_spawn(
         st.error("Both parents must be valid fish.")
         return None
 
-    # Lineage calculation
     line_code, generation = calculate_child_lineage(
         male_line=sire.get("line_code") or "UNK",
         male_gen=sire.get("generation") or "P1",
@@ -123,7 +151,7 @@ def create_new_spawn(
         female_gen=dam.get("generation") or "P1",
     )
 
-    system_id  = generate_spawn_system_id(
+    system_id = generate_spawn_system_id(
         male_line=sire.get("line_code") or "UNK",
         male_gen=sire.get("generation") or "P1",
         female_line=dam.get("line_code") or "UNK",
@@ -156,11 +184,8 @@ def create_new_spawn(
 
     # Assign tank
     if tank_id:
-        tank = find_tank(tank_id)
-        if tank:
-            from database import assign_occupant
-            assign_occupant(tank_id, None, f"Spawn {system_id}")
-            # We still track the spawn-tank link on the spawn row via tank_id
+        from database import assign_occupant
+        assign_occupant(tank_id, None, f"Spawn {system_id}")
 
     log_activity(
         action_type="spawn_created",
@@ -213,11 +238,9 @@ def mark_free_swimming(
     if not ok:
         return False
 
-    # Release parents
     sync_breeder_status(spawn.get("male_id"), "Available")
     sync_breeder_status(spawn.get("female_id"), "Available")
 
-    # Free tank
     if spawn.get("tank_id"):
         unassign_tank(spawn["tank_id"])
 
@@ -259,10 +282,7 @@ def mark_pairing_failed(spawn_id: str, failure_reason: str) -> bool:
 
 
 def mark_completed(spawn_id: str, fry_count: Optional[int] = None) -> bool:
-    """
-    Final close-out. Sets status='Completed' and optionally the final fry count.
-    Parents/tank should already be released by Free Swimming transition.
-    """
+    """Final close-out."""
     updates = {"status": "Completed"}
     if fry_count is not None:
         updates["fry_count"] = int(fry_count)
@@ -291,7 +311,7 @@ def update_spawn_details(
     line_goal: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> bool:
-    """Edit arbitrary fields on a spawn. Only non-None args are applied."""
+    """Edit arbitrary fields on a spawn. Only non-None args applied."""
     updates = {}
     if batch_name is not None: updates["batch_name"] = batch_name
     if fry_count is not None:  updates["fry_count"] = int(fry_count)
