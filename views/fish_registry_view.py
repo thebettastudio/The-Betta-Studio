@@ -1,7 +1,7 @@
 # views/fish_registry_view.py
 # Betta Farm Management System
 # Session 11 — Ported to Supabase.
-# Session 16 — Added "View Lineage" button.
+# Session 16 — View Lineage button.
 # Session 18 — Strains DB-managed.
 # Session 20 — Milestone tracking.
 # Session 22 — Cull Fish button.
@@ -9,7 +9,7 @@
 # Session 23b — Uniform 4:3 rounded images.
 # Session 24A — Photo cropper + form reset.
 # Session 26A — Multi-shot color capture (photo-based).
-# Session 26B — WebRTC + snapshot + tap-to-select color capture.
+# Session 26B — WebRTC + snapshot + tap-to-select + back camera.
 
 import io
 import datetime
@@ -19,28 +19,24 @@ from typing import Optional
 import streamlit as st
 from PIL import Image
 
-# HEIC support
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
 except ImportError:
     pass
 
-# Cropper
 try:
     from streamlit_cropper import st_cropper
     _CROPPER_AVAILABLE = True
 except ImportError:
     _CROPPER_AVAILABLE = False
 
-# WebRTC
 try:
     from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
     _WEBRTC_AVAILABLE = True
 except ImportError:
     _WEBRTC_AVAILABLE = False
 
-# Tap coordinates on image
 try:
     from streamlit_image_coordinates import streamlit_image_coordinates
     _TAP_AVAILABLE = True
@@ -107,7 +103,7 @@ CROP_ASPECT = (4, 3)
 MAX_SAMPLES = 10
 MIN_SAMPLES_FOR_CONSENSUS = 3
 TAP_REGION_SIZE = 150
-DISPLAY_WIDTH = 480   # we render frozen frame at this width
+DISPLAY_WIDTH = 480
 
 
 # ============================================================
@@ -174,7 +170,6 @@ def _image_to_jpeg_bytes(pil_img: Image.Image) -> bytes:
 
 
 def _resize_for_display(pil_img: Image.Image, target_w: int = DISPLAY_WIDTH) -> Image.Image:
-    """Resize a PIL image to target width, preserving aspect ratio."""
     w, h = pil_img.size
     if w <= target_w:
         return pil_img
@@ -237,7 +232,6 @@ def _get_available_tank_options() -> list[dict]:
 # ============================================================
 
 class FrameGrabber(VideoProcessorBase):
-    """Keeps only the latest frame — no sampling needed since we snapshot on demand."""
     def __init__(self):
         self.latest_frame = None
         self.frame_count = 0
@@ -250,7 +244,6 @@ class FrameGrabber(VideoProcessorBase):
         except Exception as e:
             print(f"recv error: {e}")
         return frame
-
 
 # ============================================================
 # COLOR CAPTURE — WEBRTC + TAP
@@ -281,11 +274,10 @@ def _render_color_capture_ui(version_key: str):
 
     session_prefix = f"color_session_{version_key}"
 
-    # Init session state
     defaults = {
-        f"{session_prefix}_samples": [],       # list of analysis dicts
-        f"{session_prefix}_snapshots": [],     # list of raw bytes (frozen frames)
-        f"{session_prefix}_frozen": None,      # currently frozen frame bytes
+        f"{session_prefix}_samples": [],
+        f"{session_prefix}_snapshots": [],
+        f"{session_prefix}_frozen": None,
         f"{session_prefix}_done": False,
         f"{session_prefix}_consensus": None,
         f"{session_prefix}_accepted": False,
@@ -305,23 +297,28 @@ def _render_color_capture_ui(version_key: str):
         f"Take {MIN_SAMPLES_FOR_CONSENSUS}–{MAX_SAMPLES} samples."
     )
 
-    # ---- Show done state ----
     if st.session_state[f"{session_prefix}_done"]:
         _render_color_result(version_key)
         return
 
-    # ---- Show accepted indicator ----
     if st.session_state[f"{session_prefix}_accepted"]:
         st.success("✓ Color analysis accepted. Save it with the fish registration below.")
 
-    # ---- Live stream (only if no frozen frame) ----
+    # Live stream
     if frozen is None:
         st.markdown("**📹 Live camera** — point at your fish")
         ctx = webrtc_streamer(
             key=f"color_stream_{version_key}",
             mode=WebRtcMode.SENDRECV,
             video_processor_factory=FrameGrabber,
-            media_stream_constraints={"video": True, "audio": False},
+            media_stream_constraints={
+                "video": {
+                    "facingMode": {"ideal": "environment"},
+                    "width": {"ideal": 1280},
+                    "height": {"ideal": 720},
+                },
+                "audio": False,
+            },
             async_processing=False,
         )
 
@@ -353,35 +350,30 @@ def _render_color_capture_ui(version_key: str):
             st.session_state[f"{session_prefix}_frozen"] = buf.getvalue()
             st.rerun()
 
-    # ---- Frozen frame → tap to select ----
+    # Frozen frame → tap
     else:
         st.markdown("**🎯 Tap the fish body on the image below**")
-        st.caption("Tap once to analyze that region. You can re-crop or tap elsewhere to try again.")
+        st.caption("Tap once to analyze that region. You can discard and re-snapshot anytime.")
 
-        # Load frozen frame, resize for display
         frozen_pil = Image.open(io.BytesIO(frozen))
         if frozen_pil.mode in ("RGBA", "P", "LA"):
             frozen_pil = frozen_pil.convert("RGB")
         display_img = _resize_for_display(frozen_pil, target_w=DISPLAY_WIDTH)
-
-        # Save display dimensions for coordinate scaling
         display_w, display_h = display_img.size
 
-        # Show tap widget
         coords = streamlit_image_coordinates(
             display_img,
             key=f"tap_{version_key}_{len(samples)}",
         )
 
-        col_cancel, col_accept = st.columns(2)
+        col_cancel, col_info = st.columns(2)
         with col_cancel:
             if st.button("🔄 Discard snapshot", use_container_width=True, key=f"discard_{version_key}"):
                 st.session_state[f"{session_prefix}_frozen"] = None
                 st.rerun()
-        with col_accept:
+        with col_info:
             st.caption(f"Samples taken: **{len(samples)} / {MAX_SAMPLES}**")
 
-        # If user tapped
         if coords is not None:
             tap_x = coords["x"]
             tap_y = coords["y"]
@@ -397,14 +389,12 @@ def _render_color_capture_ui(version_key: str):
                 )
 
             if analysis and analysis.get("ok"):
-                # Add to session
                 samples.append(analysis)
                 snapshots.append(frozen)
                 st.session_state[f"{session_prefix}_samples"] = samples
                 st.session_state[f"{session_prefix}_snapshots"] = snapshots
                 st.session_state[f"{session_prefix}_frozen"] = None
 
-                # If we hit max, auto-finish
                 if len(samples) >= MAX_SAMPLES:
                     st.session_state[f"{session_prefix}_done"] = True
                     st.session_state[f"{session_prefix}_consensus"] = merge_analyses(samples)
@@ -413,7 +403,7 @@ def _render_color_capture_ui(version_key: str):
                 err = (analysis or {}).get("error", "unknown error")
                 st.warning(f"Tap analysis failed: {err}")
 
-    # ---- Live sample list ----
+    # Live sample list
     if samples:
         st.markdown("---")
         st.markdown(f"**📊 Samples ({len(samples)})**")
@@ -433,7 +423,6 @@ def _render_color_capture_ui(version_key: str):
 
 
 def _render_color_result(version_key: str):
-    """Show final consensus with accept/retake."""
     session_prefix = f"color_session_{version_key}"
     consensus = st.session_state[f"{session_prefix}_consensus"] or {}
 
@@ -491,13 +480,11 @@ def _get_accepted_color_data(version_key: str) -> Optional[dict]:
 
 
 def _get_best_snapshot_bytes(version_key: str) -> Optional[bytes]:
-    """Return the highest-quality snapshot's raw bytes if any."""
     session_prefix = f"color_session_{version_key}"
     snapshots = st.session_state.get(f"{session_prefix}_snapshots") or []
     samples = st.session_state.get(f"{session_prefix}_samples") or []
     if not snapshots or not samples:
         return None
-    # Find index of highest quality
     best_idx = max(
         range(len(samples)),
         key=lambda i: (samples[i].get("quality", {}) or {}).get("score", 0),
@@ -549,7 +536,6 @@ def _render_cropper_ui(raw_bytes: bytes, key_prefix: str) -> Optional[bytes]:
         st.warning(f"Cropper unavailable, using auto-crop ({e})")
         return _auto_crop_to_aspect(raw_bytes)
 
-
 # ============================================================
 # REGISTER TAB
 # ============================================================
@@ -564,7 +550,7 @@ def render_register_tab():
 
     strains_list = _get_strain_names()
 
-    # ---- Strain selector ----
+    # Strain selector
     strain_col_select, strain_col_btn = st.columns([4, 1])
     with strain_col_btn:
         st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
@@ -607,11 +593,11 @@ def render_register_tab():
             key=f"select_strain_dropdown_{form_version}",
         )
 
-    # ---- Color analysis section (WebRTC + tap) ----
+    # Color analysis section
     st.markdown("---")
     _render_color_capture_ui(version_key=form_version)
 
-    # ---- Photo upload + crop (for the profile photo) ----
+    # Photo upload + crop
     st.markdown("---")
     st.markdown("##### 📷 Fish Profile Photo (4:3)")
     st.caption("This is the photo shown on fish tiles. Separate from color analysis above.")
@@ -650,7 +636,7 @@ def render_register_tab():
         except Exception:
             pass
 
-    # ---- Main registration form ----
+    # Main registration form
     with st.form(f"register_fish_form_{form_version}", clear_on_submit=False):
         col1, col2 = st.columns(2)
 
@@ -733,11 +719,10 @@ def render_register_tab():
     if not submit:
         return
 
-    # ---- Photo upload ----
+    # Photo upload
     photo_id: Optional[str] = None
     photo_bytes = st.session_state.get("fish_photo_bytes")
 
-    # Fallback: best snapshot from color session
     if not photo_bytes:
         best_snap = _get_best_snapshot_bytes(form_version)
         if best_snap:
@@ -760,7 +745,6 @@ def render_register_tab():
         st.error("Please select a valid strain.")
         return
 
-    # ---- Get accepted color data ----
     color_data = _get_accepted_color_data(form_version) or {}
     color_palette = color_data.get("palette") or {}
     color_primary = color_data.get("primary")
@@ -768,7 +752,6 @@ def render_register_tab():
     pattern_hint = color_data.get("pattern_hint")
     iridescence_level = color_data.get("iridescence_level")
 
-    # ---- Register ----
     result = register_new_fish(
         origin="Purchased",
         gender=gender,
@@ -813,7 +796,6 @@ def render_register_tab():
     if selected_tank_id:
         assign_fish_to_tank(selected_tank_id, result["id"])
 
-    # ---- Cleanup ----
     st.session_state.pop("fish_photo_bytes", None)
     st.session_state.pop("fish_photo_raw", None)
     _reset_color_session(form_version)
@@ -825,7 +807,7 @@ def render_register_tab():
 
 
 # ============================================================
-# MILESTONE UI (unchanged)
+# MILESTONE UI
 # ============================================================
 
 def _render_milestone_add_form(fish: dict):
