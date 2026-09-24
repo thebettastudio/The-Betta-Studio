@@ -8,7 +8,8 @@
 # Session 22 — Added "Cull Fish" button with reason picker.
 # Session 23 — Rewrote fish list: Visual Grid + Table toggle + Highlight strip.
 # Session 23b — Uniform 4:3 rounded images in grid tiles.
-# Session 24A — Added photo cropper UI (4:3) at upload time for fish + milestones.
+# Session 24A — Added photo cropper UI (4:3) at upload time.
+# Session 24A fix — Auto-save crop on every render (removed Save button + rerun loop).
 
 import io
 import datetime
@@ -81,7 +82,7 @@ from modules.fish_milestones import (
 FISH_TABLE_ICON = "🐠"
 HIDE_STATUSES_DEFAULT = ["Culled", "Deceased"]
 
-CROP_ASPECT = (4, 3)   # width, height
+CROP_ASPECT = (4, 3)
 
 
 # ============================================================
@@ -121,10 +122,7 @@ def _normalize_image_bytes(raw: bytes) -> bytes:
 
 
 def _auto_crop_to_aspect(raw_bytes: bytes, aspect: tuple[int, int] = CROP_ASPECT) -> bytes:
-    """
-    Center-crop an image to the given aspect ratio.
-    Used when user skips manual cropping.
-    """
+    """Center-crop an image to the given aspect ratio."""
     try:
         img = Image.open(io.BytesIO(raw_bytes))
         if img.mode in ("RGBA", "P", "LA"):
@@ -136,12 +134,10 @@ def _auto_crop_to_aspect(raw_bytes: bytes, aspect: tuple[int, int] = CROP_ASPECT
         current_ratio = w / h
 
         if current_ratio > target_ratio:
-            # Image is wider than target — crop the sides
             new_w = int(h * target_ratio)
             left = (w - new_w) // 2
             img = img.crop((left, 0, left + new_w, h))
         elif current_ratio < target_ratio:
-            # Image is taller than target — crop the top/bottom
             new_h = int(w / target_ratio)
             top = (h - new_h) // 2
             img = img.crop((0, top, w, top + new_h))
@@ -155,7 +151,7 @@ def _auto_crop_to_aspect(raw_bytes: bytes, aspect: tuple[int, int] = CROP_ASPECT
 
 
 def _image_to_jpeg_bytes(pil_img: Image.Image) -> bytes:
-    """Convert a PIL image (returned by st_cropper) to JPEG bytes."""
+    """Convert a PIL image (from st_cropper) to JPEG bytes."""
     if pil_img.mode in ("RGBA", "P", "LA"):
         pil_img = pil_img.convert("RGB")
     buf = io.BytesIO()
@@ -165,19 +161,20 @@ def _image_to_jpeg_bytes(pil_img: Image.Image) -> bytes:
 
 def _render_cropper_ui(raw_bytes: bytes, key_prefix: str) -> Optional[bytes]:
     """
-    Renders the crop UI for a photo. Returns the cropped bytes,
-    or None if user hasn't confirmed yet.
+    Renders the crop UI. Returns the current cropped bytes on every render
+    (auto-saves on every rerun). Returns None if cropper unavailable.
 
-    If cropper library isn't available, returns None (caller falls back to auto-crop).
-    If user clicks "Skip crop", returns raw_bytes.
+    The "Skip (auto center-crop)" button returns an auto-cropped version.
     """
     if not _CROPPER_AVAILABLE:
         return None
 
     try:
         st.markdown("##### ✂️ Adjust the photo")
-        st.caption("Drag the corners to resize. Drag the image to reposition. "
-                   "The grid view will crop to **4:3** — position your fish to look good in that frame.")
+        st.caption(
+            "Drag the blue corners to resize. Drag inside the box to move the image. "
+            "The grid view uses **4:3** — position your fish to look great in that frame."
+        )
 
         source_img = Image.open(io.BytesIO(raw_bytes))
         if source_img.mode in ("RGBA", "P", "LA"):
@@ -196,28 +193,22 @@ def _render_cropper_ui(raw_bytes: bytes, key_prefix: str) -> Optional[bytes]:
             )
 
         with col_controls:
-            st.markdown("**Controls**")
-            st.caption("1. Drag the boxes to change size")
-            st.caption("2. Drag inside to move the image")
-            st.caption("3. Click 'Save Crop' when happy")
+            st.markdown("**How to crop**")
+            st.caption("1. Drag the blue corners")
+            st.caption("2. Drag inside to move")
+            st.caption("3. Your crop is saved automatically")
 
-            save_clicked = st.button(
-                "✅ Save Crop",
-                type="primary",
-                use_container_width=True,
-                key=f"save_crop_{key_prefix}",
-            )
             skip_clicked = st.button(
                 "⏭️ Skip (auto center-crop)",
                 use_container_width=True,
                 key=f"skip_crop_{key_prefix}",
             )
 
-        if save_clicked and cropped is not None:
-            return _image_to_jpeg_bytes(cropped)
-
         if skip_clicked:
             return _auto_crop_to_aspect(raw_bytes)
+
+        if cropped is not None:
+            return _image_to_jpeg_bytes(cropped)
 
         return None
 
@@ -360,7 +351,6 @@ def render_register_tab():
 
     if camera_photo is not None:
         st.session_state["fish_photo_raw"] = camera_photo.getvalue()
-        # Reset any prior crop when a new photo comes in
         st.session_state.pop("fish_photo_bytes", None)
     elif uploaded_photo is not None:
         st.session_state["fish_photo_raw"] = uploaded_photo.getvalue()
@@ -368,13 +358,11 @@ def render_register_tab():
 
     raw_bytes = st.session_state.get("fish_photo_raw")
 
-    # If user hasn't cropped yet, show cropper
+    # Crop step — auto-save on every render
     if raw_bytes and not st.session_state.get("fish_photo_bytes"):
         cropped_bytes = _render_cropper_ui(raw_bytes, key_prefix="fish_reg")
         if cropped_bytes:
             st.session_state["fish_photo_bytes"] = cropped_bytes
-            st.success("✅ Crop saved. Preview below.")
-            st.rerun()
 
     # Preview the final (cropped) photo
     if st.session_state.get("fish_photo_bytes"):
@@ -518,7 +506,6 @@ def render_register_tab():
     if selected_tank_id:
         assign_fish_to_tank(selected_tank_id, result["id"])
 
-    # Clean up photo state
     st.session_state.pop("fish_photo_bytes", None)
     st.session_state.pop("fish_photo_raw", None)
 
@@ -534,14 +521,13 @@ def render_register_tab():
 # ============================================================
 
 def _render_milestone_add_form(fish: dict):
-    """Inline form to add a milestone. Now includes a cropper for the photo."""
+    """Inline form to add a milestone."""
     fish_uuid = fish["id"]
     crop_key = f"ms_{fish_uuid}"
 
     st.markdown("**➕ Add Milestone**")
 
-    # Photo upload + crop (outside the form so the cropper can rerun independently)
-    st.caption("**Photo (optional)** — 4:3 crop")
+    st.caption("**Photo (optional)** — cropped to 4:3")
     ms_photo_file = st.file_uploader(
         "Upload milestone photo",
         type=["jpg", "jpeg", "png", "heic", "heif"],
@@ -554,15 +540,12 @@ def _render_milestone_add_form(fish: dict):
 
     raw = st.session_state.get(f"{crop_key}_raw")
 
-    # Crop step
+    # Crop step — auto-save on every render
     if raw and not st.session_state.get(f"{crop_key}_cropped"):
         cropped = _render_cropper_ui(raw, key_prefix=crop_key)
         if cropped:
             st.session_state[f"{crop_key}_cropped"] = cropped
-            st.success("✅ Crop saved.")
-            st.rerun()
 
-    # Preview cropped
     if st.session_state.get(f"{crop_key}_cropped"):
         try:
             preview = Image.open(io.BytesIO(st.session_state[f"{crop_key}_cropped"]))
@@ -573,7 +556,6 @@ def _render_milestone_add_form(fish: dict):
         except Exception:
             pass
 
-    # Main form (no photo field here — photo handled above)
     with st.form(f"add_milestone_{fish_uuid}", clear_on_submit=False):
         col_a, col_b = st.columns(2)
         with col_a:
@@ -624,7 +606,6 @@ def _render_milestone_add_form(fish: dict):
     if any_check or m_shape:
         _, score = calculate_form_grade(checks, m_shape or "Regular")
 
-    # Use cropped bytes if available; else raw bytes; else no photo
     photo_bytes = (
         st.session_state.get(f"{crop_key}_cropped")
         or st.session_state.get(f"{crop_key}_raw")
@@ -640,7 +621,6 @@ def _render_milestone_add_form(fish: dict):
         notes=notes,
     )
 
-    # Cleanup
     st.session_state.pop(f"{crop_key}_cropped", None)
     st.session_state.pop(f"{crop_key}_raw", None)
 
@@ -800,7 +780,7 @@ def _render_card_actions(fish: dict):
 
 
 # ============================================================
-# UNIFORM PHOTO HTML (Session 23b)
+# UNIFORM PHOTO HTML
 # ============================================================
 
 def _uniform_photo_html(file_id: Optional[str], aspect: str = "4 / 3"):
