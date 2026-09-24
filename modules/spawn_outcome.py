@@ -1,21 +1,18 @@
 # modules/spawn_outcome.py
 # Betta Farm Management System
 # Session 24B — Computed batch outcome per spawn.
+# Session 24B fix — Cull rate = culled ÷ (jarred + culled) [caps at 100%].
 #
 # Aggregates jarred fish grades + cull rate + female count into a
 # batch verdict. No manual input — everything is derived.
 #
-# Reads:
-#   - fish (jarred offspring with batch_id = spawn.id)
-#   - fry_batches (culled_count, female_count, initial_count, current_count)
-#
-# Verdict logic (per spec):
+# Verdict logic:
 #   🌟 Excellent : >=50% High+ grade AND cull rate < 20%
 #   ✅ Solid     : 25-50% High+ grade AND cull rate 20-40%
 #   ⚠️ Mixed     : 10-25% High+ grade OR cull rate 40-60%
 #   ❌ Weak      : <10% High+ grade OR cull rate > 60%
-#   🚫 Failed    : no jarred fish AND cull rate >= 100%
-#   (blank)      : not enough data (no jarred fish, no culls)
+#   🚫 Failed    : no jarred fish AND culls happened
+#   ⏳ Pending   : no jarring yet, no culls yet
 
 from __future__ import annotations
 
@@ -34,7 +31,6 @@ from database import (
 
 HIGH_GRADES = {"Show Grade", "High Grade"}
 
-# Grade rank for "best" pick
 _GRADE_RANK = {
     "Show Grade": 5,
     "High Grade": 4,
@@ -73,7 +69,6 @@ def _avg(values: list) -> Optional[float]:
 
 
 def _grade_breakdown(jarred: list[dict]) -> dict:
-    """Return {grade: count} over jarred fish."""
     out: dict = {}
     for f in jarred:
         g = f.get("grade") or "Unspecified"
@@ -86,7 +81,6 @@ def _high_plus_count(jarred: list[dict]) -> int:
 
 
 def _best_fish(jarred: list[dict]) -> Optional[dict]:
-    """Return the jarred fish with the highest grade rank, then form_score."""
     if not jarred:
         return None
     def _key(f):
@@ -103,26 +97,22 @@ def _compute_verdict(
 ) -> tuple[str, str]:
     """
     Returns (verdict_key, reason_short).
-
-    verdict_key ∈ {excellent, solid, mixed, weak, failed, pending, unknown}
+    Cull rate = culled ÷ (jarred + culled). Always in [0, 1].
     """
-    # Failed: no jarred fish, but culls happened
+    total = jarred_count + culled_count
+
     if jarred_count == 0 and culled_count > 0:
         return ("failed", f"All {culled_count} culled, none jarred")
 
-    # Pending: nothing jarred yet and nothing culled yet
     if jarred_count == 0 and culled_count == 0:
         return ("pending", "No jarring or culling recorded yet")
 
-    # If jarred_count == 0 but we got here, treat as unknown
     if jarred_count == 0:
         return ("unknown", "No jarred fish to grade")
 
-    # Percentages
     high_pct = high_plus_count / jarred_count
-    cull_rate = culled_count / jarred_count if jarred_count else 0.0
+    cull_rate = culled_count / total if total > 0 else 0.0
 
-    # Verdict logic (grades first, cull rate as fallback/threshold)
     if high_pct >= 0.50 and cull_rate < 0.20:
         return ("excellent", f"{high_pct*100:.0f}% High+ · {cull_rate*100:.0f}% culled")
     if high_pct >= 0.25 and cull_rate <= 0.40:
@@ -137,14 +127,9 @@ def _compute_verdict(
 # ============================================================
 
 def compute_spawn_outcome(spawn_id: str) -> dict:
-    """
-    Compute the outcome for one spawn.
-    Returns a dict with all fields the UI needs.
-    """
-    # Fetch all data once (caller for batch use should prefer the bulk function)
+    """Compute the outcome for one spawn."""
     all_fish = get_all_fish()
     all_batches = get_all_fry_batches()
-
     return _compute_from_data(spawn_id, all_fish, all_batches)
 
 
@@ -154,55 +139,42 @@ def _compute_from_data(
     all_batches: list[dict],
 ) -> dict:
     """Internal: compute using pre-fetched data."""
-    # Jarred fish = fish with batch_id == spawn_id
-    jarred = [f for f in all_fish if f.get("batch_id") == spawn_id]
+    all_from_spawn = [f for f in all_fish if f.get("batch_id") == spawn_id]
 
-    # Also include fish marked "Culled" that came from this spawn
-    jarred_and_culled = [
-        f for f in all_fish
-        if f.get("batch_id") == spawn_id
-    ]
     culled_fish = [
-        f for f in jarred_and_culled
-        if (f.get("status") or "").lower() == "culled"
+        f for f in all_from_spawn
+        if (f.get("status") or "").lower() in ("culled", "deceased")
     ]
     alive_jarred = [
-        f for f in jarred
+        f for f in all_from_spawn
         if (f.get("status") or "").lower() not in ("culled", "deceased")
     ]
 
-    # Batch info (first matching batch for this spawn)
     batch = next((b for b in all_batches if b.get("spawn_id") == spawn_id), None)
     culled_count_batch = _safe_int(batch.get("culled_count")) if batch else 0
     female_count = _safe_int(batch.get("female_count")) if batch else 0
     initial_count = _safe_int(batch.get("initial_count")) if batch else 0
     current_count = _safe_int(batch.get("current_count")) if batch else 0
 
-    # Combine culls: fish marked Culled + batch's manual culled_count
     total_culled = len(culled_fish) + culled_count_batch
 
-    # Grade breakdown (over alive jarred — culled aren't graded quality)
     breakdown = _grade_breakdown(alive_jarred)
     high_plus = _high_plus_count(alive_jarred)
     jarred_count = len(alive_jarred)
 
-    # Form score avg
     scores = [_safe_int(f.get("form_score")) for f in alive_jarred if f.get("form_score") is not None]
     avg_score = _avg(scores)
 
-    # Survival (batch level, if tracked)
     survival = None
     if initial_count > 0:
         survival = current_count / initial_count
 
-    # Verdict
     verdict_key, verdict_reason = _compute_verdict(
         jarred_count=jarred_count,
         high_plus_count=high_plus,
         culled_count=total_culled,
     )
 
-    # Best fish
     best = _best_fish(alive_jarred)
 
     return {
@@ -225,11 +197,7 @@ def _compute_from_data(
 
 
 def compute_all_spawn_outcomes() -> dict[str, dict]:
-    """
-    Compute outcomes for all spawns in one pass.
-    Returns { spawn_id: outcome_dict }.
-    Use this for the History tab to avoid N queries.
-    """
+    """Compute outcomes for all spawns in one pass."""
     all_spawns = get_all_spawns()
     all_fish = get_all_fish()
     all_batches = get_all_fry_batches()
@@ -282,14 +250,12 @@ def grade_breakdown_short(outcome: dict) -> str:
     breakdown = outcome.get("grade_breakdown") or {}
     if not breakdown:
         return "—"
-    # Order: Show, High, Breeder, Material, Pet, then others
     order = ["Show Grade", "High Grade", "Breeder Grade", "Material Grade", "Pet Grade"]
     parts = []
     for g in order:
         if g in breakdown:
             short = g.replace(" Grade", "")
             parts.append(f"{breakdown[g]} {short}")
-    # Any others
     for g, count in breakdown.items():
         if g not in order:
             parts.append(f"{count} {g}")
