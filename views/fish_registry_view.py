@@ -9,13 +9,10 @@
 # Session 23b — Uniform 4:3 rounded images.
 # Session 24A — Photo cropper + form reset.
 # Session 26A — Multi-shot color capture (photo-based).
-# Session 26B — WebRTC + snapshot + tap-to-select + STUN config.
-# Session 26B fix — Removed profile camera (conflict with WebRTC stream).
-#                 Best snapshot is now used as profile photo.
+# Session 26B — Multi-photo upload + tap-to-select region analysis.
 
 import io
 import datetime
-import time
 from typing import Optional
 
 import streamlit as st
@@ -32,12 +29,6 @@ try:
     _CROPPER_AVAILABLE = True
 except ImportError:
     _CROPPER_AVAILABLE = False
-
-try:
-    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
-    _WEBRTC_AVAILABLE = True
-except ImportError:
-    _WEBRTC_AVAILABLE = False
 
 try:
     from streamlit_image_coordinates import streamlit_image_coordinates
@@ -106,12 +97,6 @@ MAX_SAMPLES = 10
 MIN_SAMPLES_FOR_CONSENSUS = 3
 TAP_REGION_SIZE = 150
 DISPLAY_WIDTH = 480
-
-RTC_CONFIG = {
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-    ]
-}
 
 
 # ============================================================
@@ -236,26 +221,7 @@ def _get_available_tank_options() -> list[dict]:
 
 
 # ============================================================
-# WEBRTC FRAME GRABBER
-# ============================================================
-
-class FrameGrabber(VideoProcessorBase):
-    def __init__(self):
-        self.latest_frame = None
-        self.frame_count = 0
-
-    def recv(self, frame):
-        try:
-            img = frame.to_ndarray(format="rgb24")
-            self.latest_frame = img
-            self.frame_count += 1
-        except Exception as e:
-            print(f"recv error: {e}")
-        return frame
-
-
-# ============================================================
-# COLOR CAPTURE — WEBRTC + TAP
+# COLOR CAPTURE — MULTI-PHOTO UPLOAD + TAP-TO-SELECT
 # ============================================================
 
 def _reset_color_session(version_key: str):
@@ -270,10 +236,10 @@ def _session_key(version_key: str, suffix: str) -> str:
 
 
 def _render_color_capture_ui(version_key: str):
-    """WebRTC live stream → snapshot → tap the fish → analyze region."""
-    if not _WEBRTC_AVAILABLE:
-        st.error("WebRTC not installed. Run: `py -m pip install streamlit-webrtc av`")
-        return
+    """
+    Multi-photo upload → tap the fish on each photo → analyze region.
+    No camera access needed. Works with photos from phone's native camera.
+    """
     if not _TAP_AVAILABLE:
         st.error("Tap coordinate widget missing. Run: `py -m pip install streamlit-image-coordinates`")
         return
@@ -281,9 +247,10 @@ def _render_color_capture_ui(version_key: str):
     session_prefix = f"color_session_{version_key}"
 
     defaults = {
-        f"{session_prefix}_samples": [],
-        f"{session_prefix}_snapshots": [],
-        f"{session_prefix}_frozen": None,
+        f"{session_prefix}_samples": [],      # analysis dicts
+        f"{session_prefix}_snapshots": [],    # raw bytes of each analyzed photo
+        f"{session_prefix}_pending": [],      # uploaded photos not yet analyzed
+        f"{session_prefix}_tap_idx": 0,
         f"{session_prefix}_done": False,
         f"{session_prefix}_consensus": None,
         f"{session_prefix}_accepted": False,
@@ -294,13 +261,13 @@ def _render_color_capture_ui(version_key: str):
 
     samples = st.session_state[f"{session_prefix}_samples"]
     snapshots = st.session_state[f"{session_prefix}_snapshots"]
-    frozen = st.session_state[f"{session_prefix}_frozen"]
+    pending = st.session_state[f"{session_prefix}_pending"]
+    tap_idx = st.session_state[f"{session_prefix}_tap_idx"]
 
-    st.markdown("##### 🎨 Live Camera Color Capture")
+    st.markdown("##### 🎨 Color Analysis")
     st.caption(
-        f"Point camera at the fish, then **📸 Snapshot**. "
-        f"Tap the fish on the frozen image to analyze. "
-        f"Take {MIN_SAMPLES_FOR_CONSENSUS}–{MAX_SAMPLES} samples."
+        f"Upload {MIN_SAMPLES_FOR_CONSENSUS}–{MAX_SAMPLES} clear photos of the same fish from different angles. "
+        "Tap the fish on each photo to analyze. Take photos with your phone's camera app for best quality."
     )
 
     if st.session_state[f"{session_prefix}_done"]:
@@ -310,110 +277,98 @@ def _render_color_capture_ui(version_key: str):
     if st.session_state[f"{session_prefix}_accepted"]:
         st.success("✓ Color analysis accepted. Save it with the fish registration below.")
 
-    # Live stream
-    if frozen is None:
-        st.markdown("**📹 Live camera** — point at your fish")
-        ctx = webrtc_streamer(
-            key=f"color_stream_{version_key}",
-            mode=WebRtcMode.SENDRECV,
-            video_processor_factory=FrameGrabber,
-            media_stream_constraints={
-                "video": {"width": {"ideal": 1280}, "height": {"ideal": 720}},
-                "audio": False,
-            },
-            rtc_configuration=RTC_CONFIG,
-            async_processing=False,
-        )
+    # ---- Upload section ----
+    uploaded_files = st.file_uploader(
+        "📁 Choose photos (multi-select works on most devices)",
+        type=["jpg", "jpeg", "png", "heic", "heif"],
+        accept_multiple_files=True,
+        key=f"color_uploads_{version_key}_{len(samples)}",
+    )
 
-        col_a, col_b = st.columns([1, 1])
-        with col_a:
-            snapshot_clicked = st.button(
-                "📸 Snapshot current frame",
-                type="primary",
-                use_container_width=True,
-                disabled=not ctx.state.playing,
-                key=f"snap_{version_key}",
-            )
-        with col_b:
-            if len(samples) >= MIN_SAMPLES_FOR_CONSENSUS:
-                if st.button(
-                    "✅ Done — use these results",
-                    use_container_width=True,
-                    key=f"done_{version_key}",
-                ):
-                    st.session_state[f"{session_prefix}_done"] = True
-                    st.session_state[f"{session_prefix}_consensus"] = merge_analyses(samples)
+    if uploaded_files:
+        # Load any new files into pending queue
+        existing_hashes = {
+            hash(p) for p in pending
+        }
+        for f in uploaded_files:
+            data = f.getvalue()
+            h = hash(data)
+            # Skip if we already have this photo (pending or analyzed)
+            if h in existing_hashes:
+                continue
+            if len(samples) >= MAX_SAMPLES:
+                break
+            pending.append(data)
+            existing_hashes.add(h)
+        st.session_state[f"{session_prefix}_pending"] = pending
+
+    # ---- Tap-to-select on pending photos ----
+    if pending and tap_idx < len(pending):
+        photo = pending[tap_idx]
+        st.markdown(f"**🎯 Tap the fish on photo {len(samples) + 1} of {MAX_SAMPLES}**")
+
+        try:
+            pil = Image.open(io.BytesIO(photo))
+            if pil.mode in ("RGBA", "P", "LA"):
+                pil = pil.convert("RGB")
+            display = _resize_for_display(pil, target_w=DISPLAY_WIDTH)
+            dw, dh = display.size
+
+            coords = streamlit_image_coordinates(display, key=f"tap_{version_key}_{len(samples)}_{tap_idx}")
+
+            col_skip, col_discard = st.columns(2)
+            with col_skip:
+                if st.button("⏭️ Skip this photo", use_container_width=True, key=f"skip_{version_key}_{tap_idx}"):
+                    pending.pop(tap_idx)
+                    st.session_state[f"{session_prefix}_pending"] = pending
+                    st.session_state[f"{session_prefix}_tap_idx"] = max(0, tap_idx - 1)
+                    st.rerun()
+            with col_discard:
+                if st.button("🗑️ Discard all", use_container_width=True, key=f"discard_all_{version_key}"):
+                    _reset_color_session(version_key)
                     st.rerun()
 
-        if snapshot_clicked and ctx.video_processor and ctx.video_processor.latest_frame is not None:
-            frame_rgb = ctx.video_processor.latest_frame
-            pil_img = Image.fromarray(frame_rgb)
-            buf = io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=90)
-            st.session_state[f"{session_prefix}_frozen"] = buf.getvalue()
+            if coords is not None:
+                with st.spinner("Analyzing tapped region..."):
+                    analysis = analyze_region(
+                        raw_bytes=photo,
+                        tap_x=coords["x"],
+                        tap_y=coords["y"],
+                        display_w=dw,
+                        display_h=dh,
+                        region_size=TAP_REGION_SIZE,
+                    )
+                if analysis and analysis.get("ok"):
+                    samples.append(analysis)
+                    snapshots.append(photo)
+                    pending.pop(tap_idx)
+                    st.session_state[f"{session_prefix}_samples"] = samples
+                    st.session_state[f"{session_prefix}_snapshots"] = snapshots
+                    st.session_state[f"{session_prefix}_pending"] = pending
+                    st.session_state[f"{session_prefix}_tap_idx"] = max(0, tap_idx - 1)
+
+                    if len(samples) >= MAX_SAMPLES:
+                        st.session_state[f"{session_prefix}_done"] = True
+                        st.session_state[f"{session_prefix}_consensus"] = merge_analyses(samples)
+                    st.rerun()
+                else:
+                    err = (analysis or {}).get("error", "unknown")
+                    st.warning(f"Tap analysis failed: {err}")
+        except Exception as e:
+            st.warning(f"Could not process photo: {e}")
+            pending.pop(tap_idx)
+            st.session_state[f"{session_prefix}_pending"] = pending
             st.rerun()
 
-    # Frozen frame → tap
-    else:
-        st.markdown("**🎯 Tap the fish body on the image below**")
-        st.caption("Tap once to analyze that region. You can discard and re-snapshot anytime.")
-
-        frozen_pil = Image.open(io.BytesIO(frozen))
-        if frozen_pil.mode in ("RGBA", "P", "LA"):
-            frozen_pil = frozen_pil.convert("RGB")
-        display_img = _resize_for_display(frozen_pil, target_w=DISPLAY_WIDTH)
-        display_w, display_h = display_img.size
-
-        coords = streamlit_image_coordinates(
-            display_img,
-            key=f"tap_{version_key}_{len(samples)}",
-        )
-
-        col_cancel, col_info = st.columns(2)
-        with col_cancel:
-            if st.button("🔄 Discard snapshot", use_container_width=True, key=f"discard_{version_key}"):
-                st.session_state[f"{session_prefix}_frozen"] = None
-                st.rerun()
-        with col_info:
-            st.caption(f"Samples taken: **{len(samples)} / {MAX_SAMPLES}**")
-
-        if coords is not None:
-            tap_x = coords["x"]
-            tap_y = coords["y"]
-
-            with st.spinner("Analyzing region..."):
-                analysis = analyze_region(
-                    raw_bytes=frozen,
-                    tap_x=tap_x,
-                    tap_y=tap_y,
-                    display_w=display_w,
-                    display_h=display_h,
-                    region_size=TAP_REGION_SIZE,
-                )
-
-            if analysis and analysis.get("ok"):
-                samples.append(analysis)
-                snapshots.append(frozen)
-                st.session_state[f"{session_prefix}_samples"] = samples
-                st.session_state[f"{session_prefix}_snapshots"] = snapshots
-                st.session_state[f"{session_prefix}_frozen"] = None
-
-                if len(samples) >= MAX_SAMPLES:
-                    st.session_state[f"{session_prefix}_done"] = True
-                    st.session_state[f"{session_prefix}_consensus"] = merge_analyses(samples)
-                st.rerun()
-            else:
-                err = (analysis or {}).get("error", "unknown error")
-                st.warning(f"Tap analysis failed: {err}")
-
-    # Live sample list
+    # ---- Samples taken so far ----
     if samples:
         st.markdown("---")
-        st.markdown(f"**📊 Samples ({len(samples)})**")
+        st.markdown(f"**📊 Samples taken: {len(samples)} / {MAX_SAMPLES}**")
         for i, a in enumerate(samples):
-            palette = a.get("palette", {})
-            palette_str = ", ".join(f"{k} {v:.0f}%" for k, v in palette.items())
-            st.caption(f"Sample {i+1}: {palette_str or 'no palette'}")
+            pal = a.get("palette", {})
+            pal_str = ", ".join(f"{k} {v:.0f}%" for k, v in pal.items())
+            q = a.get("quality", {}).get("score", 0)
+            st.caption(f"Sample {i+1}: quality {q}/100 — {pal_str or 'no palette'}")
 
         if len(samples) >= MIN_SAMPLES_FOR_CONSENSUS:
             consensus_preview = merge_analyses(samples)
@@ -423,6 +378,13 @@ def _render_color_capture_ui(version_key: str):
                 f"Pattern: `{consensus_preview.get('pattern_hint')}` · "
                 f"Iridescence: `{consensus_preview.get('iridescence_level')}`"
             )
+            if st.button("✅ Done — use these results", type="primary", use_container_width=True, key=f"done_{version_key}"):
+                st.session_state[f"{session_prefix}_done"] = True
+                st.session_state[f"{session_prefix}_consensus"] = consensus_preview
+                st.rerun()
+
+    if not samples and not pending:
+        st.info("👆 Upload photos above to start.")
 
 
 def _render_color_result(version_key: str):
@@ -461,7 +423,6 @@ def _render_color_result(version_key: str):
         f"(score {consensus.get('iridescence_score') or 0})"
     )
 
-    # Show best snapshot as suggested profile photo
     best_snap = _get_best_snapshot_bytes(version_key)
     if best_snap:
         st.markdown("---")
@@ -607,14 +568,12 @@ def render_register_tab():
             key=f"select_strain_dropdown_{form_version}",
         )
 
-    # ---- Color analysis (WebRTC) ----
     st.markdown("---")
     _render_color_capture_ui(version_key=form_version)
 
-    # ---- Optional custom profile photo upload ----
     st.markdown("---")
     st.markdown("##### 📷 Profile Photo")
-    st.caption("Optional — takes the best color-analysis snapshot by default. Upload only if you want a different one.")
+    st.caption("Optional — takes the best color-analysis photo by default. Upload only if you want a different one.")
 
     uploaded_photo = st.file_uploader(
         "Upload a different photo (optional)",
@@ -643,7 +602,6 @@ def render_register_tab():
         except Exception:
             pass
 
-    # ---- Main form ----
     with st.form(f"register_fish_form_{form_version}", clear_on_submit=False):
         col1, col2 = st.columns(2)
 
@@ -726,7 +684,6 @@ def render_register_tab():
     if not submit:
         return
 
-    # ---- Determine profile photo: custom upload > best snapshot ----
     photo_id: Optional[str] = None
     photo_bytes = st.session_state.get("fish_photo_bytes")
 
@@ -734,7 +691,7 @@ def render_register_tab():
         best_snap = _get_best_snapshot_bytes(form_version)
         if best_snap:
             photo_bytes = best_snap
-            st.info("Using best color-analysis snapshot as profile photo.")
+            st.info("Using best color-analysis photo as profile photo.")
 
     if photo_bytes:
         with st.spinner("Uploading & optimizing photo for Google Drive..."):
@@ -752,7 +709,6 @@ def render_register_tab():
         st.error("Please select a valid strain.")
         return
 
-    # ---- Color data (if accepted) ----
     color_data = _get_accepted_color_data(form_version) or {}
     color_palette = color_data.get("palette") or {}
     color_primary = color_data.get("primary")
@@ -760,7 +716,6 @@ def render_register_tab():
     pattern_hint = color_data.get("pattern_hint")
     iridescence_level = color_data.get("iridescence_level")
 
-    # ---- Register ----
     result = register_new_fish(
         origin="Purchased",
         gender=gender,
@@ -816,7 +771,7 @@ def render_register_tab():
 
 
 # ============================================================
-# MILESTONE UI (unchanged)
+# MILESTONE UI
 # ============================================================
 
 def _render_milestone_add_form(fish: dict):
