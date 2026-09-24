@@ -1,6 +1,7 @@
 # views/webrtc_test.py
 # Session 26B — Minimal WebRTC test page.
 # Session 26B fix 2 — Loosened constraints, async off, better error surfacing.
+# Session 26B fix 3 — Defensive getattr for error_log.
 
 import time
 import streamlit as st
@@ -88,18 +89,22 @@ def render_webrtc_test():
         vp = ctx.video_processor
         st.metric("Frames received", vp.frame_count)
 
-        if vp.error_log:
+        # Defensive: error_log might not exist depending on streamlit-webrtc version
+        error_log = getattr(vp, "error_log", None) or []
+        if error_log:
             st.error("recv() errors:")
-            for e in vp.error_log[-5:]:
+            for e in error_log[-5:]:
                 st.code(e)
 
-        if vp.last_frame is not None:
+        # Defensive: last_frame attribute
+        last_frame = getattr(vp, "last_frame", None)
+        if last_frame is not None:
             st.markdown("**Last captured frame:**")
-            st.image(vp.last_frame, width=320)
+            st.image(last_frame, width=320)
 
             from modules.color_detector import analyze_photo
             import io
-            pil_img = Image.fromarray(vp.last_frame)
+            pil_img = Image.fromarray(last_frame)
             buf = io.BytesIO()
             pil_img.save(buf, format="JPEG", quality=85)
             raw_bytes = buf.getvalue()
@@ -116,9 +121,9 @@ def render_webrtc_test():
                 else:
                     st.warning(f"Analysis failed: {(analysis or {}).get('error', 'unknown')}")
         else:
-            st.caption("No frame captured yet.")
+            st.caption("No frame captured yet — click Refresh after stream is running.")
     else:
-        st.caption("video_processor not created yet.")
+        st.caption("video_processor not created yet — click START first.")
 
 
 def render_webrtc_test_page():
