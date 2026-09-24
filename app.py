@@ -3,7 +3,7 @@
 # Session 17 — Navigation cleanup, Supabase diagnostic, new pages added.
 # Session 21 — Added Lines & Varieties page.
 # Session 25 — Added Inheritance Analysis page.
-# Session 26B — Added temporary WebRTC test page.
+# Session 26B — WebRTC test page removed from production (kept local for dev).
 
 import datetime
 
@@ -20,7 +20,6 @@ from views.fry_batch_view       import render_fry_batch_page
 from views.lineage_view         import render_lineage_page
 from views.lines_view           import render_lines_page
 from views.inheritance_view     import render_inheritance_page
-from views.webrtc_test          import render_webrtc_test_page
 from modules.dashboard          import render_dashboard
 
 
@@ -164,7 +163,6 @@ page = st.sidebar.radio("Navigation", [
     "🌳 Lineage Tree",
     "🧬 Lines & Varieties",
     "🧬 Inheritance",
-    "🎥 WebRTC Test",
     "📝 Activity Log",
 ])
 
@@ -196,7 +194,5 @@ elif page == "🧬 Lines & Varieties":
     render_lines_page()
 elif page == "🧬 Inheritance":
     render_inheritance_page()
-elif page == "🎥 WebRTC Test":
-    render_webrtc_test_page()
 elif page == "📝 Activity Log":
     render_activity_log_page()
