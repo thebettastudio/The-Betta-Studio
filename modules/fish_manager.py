@@ -1,7 +1,8 @@
 # modules/fish_manager.py
 # Betta Farm Management System
-# Session 6 — Fish + Breeder unified. Uses Supabase via database.py.
-# Session 9 — Added list_breeders() and register_breeder() for breeder_view.
+# Session 6  — Fish + Breeder unified. Uses Supabase via database.py.
+# Session 9  — Added list_breeders() and register_breeder() for breeder_view.
+# Session 22 — Added cull_fish() and restore_fish_from_culled().
 # breeder_registry.py is retired; all breeder logic lives here.
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ VALID_STAGES = [
 
 VALID_STATUSES = [
     "Active", "Jarred", "For Sale", "Sold",
-    "Deceased", "Retired", "Conditioning",
+    "Deceased", "Retired", "Conditioning", "Culled",
 ]
 
 VALID_BREEDER_STATUSES = [
@@ -58,6 +59,17 @@ VALID_BREEDER_STATUSES = [
 ]
 
 VALID_ORIGINS = ["Purchased", "Batch Spawn"]
+
+CULL_REASONS = [
+    "Deformity",
+    "Poor form",
+    "Weak color",
+    "Sickly / Unhealthy",
+    "Aggressive behavior",
+    "Wrong sex (revealed later)",
+    "Stunted growth",
+    "Other",
+]
 
 
 # ============================================================
@@ -91,12 +103,12 @@ def find_fish(identifier: str) -> Optional[dict]:
 
 def get_fish_dropdown_items() -> list[dict]:
     """
-    Lightweight list for dropdowns. Excludes Deceased / Sold / Retired.
+    Lightweight list for dropdowns. Excludes Deceased / Sold / Retired / Culled.
     """
     out = []
     for f in get_all_fish():
         status = (f.get("status") or "").lower()
-        if status in ("deceased", "sold", "retired"):
+        if status in ("deceased", "sold", "retired", "culled"):
             continue
         out.append({
             "id": f["id"],
@@ -336,6 +348,81 @@ def delete_fish_and_photos(fish_id: str) -> bool:
 
 
 # ============================================================
+# CULLING (Session 22)
+# ============================================================
+
+def cull_fish(fish_id: str, reason: str = "", notes: str = "") -> bool:
+    """
+    Mark a fish as culled. Clears tank link, sets status='Culled',
+    appends reason to notes with a [Culled: reason] tag.
+    """
+    fish = get_fish_by_id(fish_id)
+    if not fish:
+        return False
+
+    tag = f"[Culled: {reason}]" if reason else "[Culled]"
+    existing_notes = (fish.get("notes") or "").strip()
+    new_notes = (
+        f"{existing_notes} | {tag} {notes}".strip(" |")
+        if existing_notes
+        else f"{tag} {notes}".strip()
+    )
+
+    # Free any tank holding this fish
+    if fish.get("tank_id"):
+        from database import clear_occupant
+        clear_occupant(fish["tank_id"])
+
+    ok = update_fish(fish_id, {
+        "status": "Culled",
+        "notes": new_notes,
+        "location": None,
+        "tank_id": None,
+    })
+    if ok:
+        log_activity(
+            action_type="fish_culled",
+            description=(
+                f"Culled {fish.get('system_id')}"
+                + (f" — {reason}" if reason else "")
+            ),
+            entity_type="fish",
+            entity_id=fish_id,
+        )
+    return ok
+
+
+def restore_fish_from_culled(fish_id: str, new_status: str = "Active") -> bool:
+    """
+    Undo a cull — useful if you culled by mistake.
+    Sets status back and leaves a note.
+    """
+    fish = get_fish_by_id(fish_id)
+    if not fish:
+        return False
+
+    existing_notes = (fish.get("notes") or "").strip()
+    new_notes = (
+        f"{existing_notes} | [Restored from culled]".strip(" |")
+        if existing_notes
+        else "[Restored from culled]"
+    )
+
+    ok = update_fish(fish_id, {
+        "status": new_status,
+        "notes": new_notes,
+    })
+    if ok:
+        log_activity(
+            action_type="fish_restored",
+            description=f"Restored {fish.get('system_id')} from culled",
+            entity_type="fish",
+            entity_id=fish_id,
+        )
+    return ok
+
+
+# ============================================================
 # BREEDER BEHAVIOR
 # ============================================================
 
@@ -489,7 +576,7 @@ def sync_breeder_status(fish_id: str, new_status: str) -> bool:
 
 
 # ============================================================
-# LINEAGE HELPERS (used by Session 17 lineage tree)
+# LINEAGE HELPERS (used by Session 16 lineage tree)
 # ============================================================
 
 def get_parents(fish_id: str) -> tuple[Optional[dict], Optional[dict]]:
