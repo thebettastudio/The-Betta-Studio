@@ -6,6 +6,8 @@
 # Session 20 — added fish_milestones CRUD.
 # Session 22 — added culled_count + female_count to FRY_BATCH_FIELDS.
 # Session 24C — added died_count to FRY_BATCH_FIELDS.
+# Session 26A — added color_primary, color_secondary, color_palette,
+#               pattern_hint, iridescence_level to FISH_FIELDS.
 
 from __future__ import annotations
 
@@ -47,6 +49,9 @@ FISH_FIELDS = [
     "photo_id", "qr_id", "location", "tank_id",
     "status", "is_breeder", "breeder_status",
     "notes", "stage",
+    # Session 26A — color analysis
+    "color_primary", "color_secondary", "color_palette",
+    "pattern_hint", "iridescence_level",
 ]
 
 
