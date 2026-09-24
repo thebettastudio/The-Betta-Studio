@@ -2,6 +2,7 @@
 # Betta Farm Management System
 # Session 15 — Fry batch tracking UI.
 # Session 24B — Outcome panel + culled/female count editors on batch cards.
+# Session 24C — 4-row outcome layout + reconciliation badge + died count field.
 
 import datetime
 from typing import Optional
@@ -31,6 +32,7 @@ from modules.spawn_outcome import (
     compute_all_spawn_outcomes,
     verdict_badge_html,
     grade_breakdown_short,
+    reconciliation_html,
 )
 
 
@@ -138,36 +140,67 @@ def _render_create_section():
 
 
 # ============================================================
-# OUTCOME PANEL (shared)
+# OUTCOME PANEL (4-row layout — Session 24C)
 # ============================================================
 
 def _render_outcome_panel(outcome: dict):
-    """Compact outcome panel: verdict badge + key metrics + grades."""
-    verdict_icon = outcome.get("verdict_icon", "—")
-    verdict_reason = outcome.get("verdict_reason", "")
-    jarred = outcome.get("jarred_count", 0)
-    culled = outcome.get("culled_count", 0)
-    females = outcome.get("female_count", 0)
-    avg_score = outcome.get("avg_form_score")
-    breakdown = grade_breakdown_short(outcome)
-    best = outcome.get("best_fish")
-
+    """
+    4-row layout:
+      Row 1: Inventory (Current / Jarred / Total Alive)
+      Row 2: Losses (Culled pre / Culled jarred / Died)
+      Row 3: Quality (Survival % / Verdict / Reconciliation)
+      Row 4: Grades + Best fish
+    """
     st.markdown("**📊 Batch Outcome**")
-    st.markdown(
-        f'{verdict_badge_html(outcome)} &nbsp; <span style="color:#6B7280;'
-        f'font-size:13px;">{verdict_reason}</span>',
-        unsafe_allow_html=True,
-    )
 
+    initial   = outcome.get("initial_count", 0)
+    current   = outcome.get("current_count", 0)
+    jarred    = outcome.get("jarred_alive", 0)
+    culled_pre    = outcome.get("culled_pre", 0)
+    culled_jarred = outcome.get("culled_jarred", 0)
+    died      = outcome.get("died", 0)
+    females   = outcome.get("female_count", 0)
+    total_alive = current + jarred
+
+    # Row 1 — Inventory
+    st.caption(f"**📦 Inventory** — Initial: {initial}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Current (unjarred)", current)
+    col2.metric("Jarred alive", jarred)
+    col3.metric("Total alive", total_alive)
+
+    # Row 2 — Losses
+    st.caption("**💀 Losses**")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Jarred", jarred)
-    col2.metric("Culled", culled)
-    col3.metric("Females", females)
-    col4.metric("Avg Form", f"{avg_score:.0f}" if avg_score is not None else "—")
+    col1.metric("Culled (pre-jar)", culled_pre)
+    col2.metric("Culled (jarred)", culled_jarred)
+    col3.metric("Died", died)
+    col4.metric("♀ Females kept", females)
 
+    # Row 3 — Quality
+    st.caption("**📈 Quality**")
+    surv = outcome.get("survival")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Survival %", f"{surv*100:.0f}%" if surv is not None else "—")
+    with col2:
+        st.markdown(
+            f'<div style="margin-top:6px;">{verdict_badge_html(outcome)}</div>',
+            unsafe_allow_html=True,
+        )
+    with col3:
+        st.markdown(
+            f'<div style="margin-top:8px;">{reconciliation_html(outcome)}</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.caption(f"_{outcome.get('verdict_reason', '')}_")
+
+    # Row 4 — Grades + best fish
+    breakdown = grade_breakdown_short(outcome)
     if breakdown and breakdown != "—":
-        st.caption(f"**Grades:** {breakdown}")
+        st.caption(f"**🏅 Grades:** {breakdown}")
 
+    best = outcome.get("best_fish")
     if best:
         st.caption(
             f"🏆 Best: `{best.get('system_id') or '?'}` "
@@ -242,31 +275,39 @@ def _render_jar_popover(batch: dict):
 
 def _render_counts_popover(batch: dict):
     """
-    Popover to edit current_count, culled_count, female_count.
-    These feed the outcome panel.
+    Popover to edit current_count, culled_count, died_count, female_count.
     """
     batch_uuid = batch["id"]
 
     with st.popover("🔢 Update Counts", use_container_width=True):
         st.markdown("**Update batch counts**")
         st.caption(
-            "Culled = fry you culled (never jarred or removed). "
+            "Current = unjarred fry alive. "
+            "Culled = fry culled before jarring. "
+            "Died = natural loss. "
             "Females = fry kept in sorority (not individually tracked)."
         )
 
         new_current = st.number_input(
-            "Current fry count (unjarred)",
+            "Current fry count (unjarred, alive)",
             min_value=0,
             value=int(batch.get("current_count") or 0),
             step=1,
             key=f"count_cur_{batch_uuid}",
         )
-        new_culled = st.number_input(
-            "Culled count",
+        new_culled_pre = st.number_input(
+            "Culled (pre-jar)",
             min_value=0,
             value=int(batch.get("culled_count") or 0),
             step=1,
             key=f"count_culled_{batch_uuid}",
+        )
+        new_died = st.number_input(
+            "Died (natural loss)",
+            min_value=0,
+            value=int(batch.get("died_count") or 0),
+            step=1,
+            key=f"count_died_{batch_uuid}",
         )
         new_female = st.number_input(
             "Female count (kept in sorority)",
@@ -284,8 +325,9 @@ def _render_counts_popover(batch: dict):
         ):
             ok = edit_batch(batch_uuid, {
                 "current_count": int(new_current),
-                "culled_count": int(new_culled),
-                "female_count": int(new_female),
+                "culled_count":  int(new_culled_pre),
+                "died_count":    int(new_died),
+                "female_count":  int(new_female),
             })
             if ok:
                 st.success("Counts updated.")
@@ -336,15 +378,15 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         col3.metric("Survival", _survival_label(survival))
         col4.metric("Stage", f"{icon} {stage}")
 
-        # Dates + tank + culled/female inline
-        culled_n = batch.get("culled_count") or 0
+        # Dates + quick counts
+        culled_pre_n = batch.get("culled_count") or 0
+        died_n = batch.get("died_count") or 0
         female_n = batch.get("female_count") or 0
         st.caption(
             f"🥚 Hatch: {_format_date(batch.get('hatch_date'))} | "
             f"🫙 Jarred: {_format_date(batch.get('jarring_date'))} | "
             f"🪣 Tank: {tank.get('location_code') if tank else 'Unassigned'} | "
-            f"🚫 Culled: {culled_n} | "
-            f"♀ Females: {female_n}"
+            f"🚫 Culled: {culled_pre_n} | 💀 Died: {died_n} | ♀ Females: {female_n}"
         )
 
         if batch.get("notes"):
@@ -451,7 +493,6 @@ def _render_list_section():
     else:
         items = list_all_batches()
 
-    # Apply search
     if query:
         filtered = []
         for it in items:
@@ -472,7 +513,6 @@ def _render_list_section():
         st.info("No batches match the current filter.")
         return
 
-    # Precompute outcomes for all spawns (single pass)
     outcome_map = compute_all_spawn_outcomes()
 
     for it in items:
@@ -490,7 +530,6 @@ def render_fry_batch_page():
     st.title("🐣 Fry Batch Tracking")
     st.caption("Track fry from hatch to jarring. One batch per spawn.")
 
-    # KPIs
     stats = get_batch_stats()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Batches", stats["total_batches"])
