@@ -891,4 +891,53 @@ def render_list_tab():
     if hide_culled:
         filtered = [
             f for f in filtered
-            if (f.get("status") or "").lower() not in
+            if (f.get("status") or "").lower() not in ("culled", "deceased")
+        ]
+
+    st.caption(f"Showing {len(filtered)} of {len(all_fish)} fish.")
+    st.markdown("---")
+
+    if not filtered:
+        st.warning("No fish match the current filters.")
+        return
+
+    # ---- Render view ----
+    if view_mode == "📊 Table":
+        _render_table_view(filtered, milestone_counts)
+        return
+
+    # Grid view with pagination
+    total_pages = max(1, (len(filtered) + CARD_PAGE_SIZE - 1) // CARD_PAGE_SIZE)
+    if total_pages > 1:
+        page = st.number_input(
+            f"Page (1–{total_pages})",
+            min_value=1, max_value=total_pages, value=1, step=1,
+            key="fish_page_number",
+        )
+    else:
+        page = 1
+
+    start = (page - 1) * CARD_PAGE_SIZE
+    page_items = filtered[start : start + CARD_PAGE_SIZE]
+
+    cols = st.columns(3)
+    for idx, fish in enumerate(page_items):
+        with cols[idx % 3]:
+            _render_grid_tile(fish, milestone_count=milestone_counts.get(fish["id"], 0))
+
+
+# ============================================================
+# PAGE
+# ============================================================
+
+def render_fish_registry_page():
+    st.header("🐠 Fish Master Registry")
+    st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
+
+    tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
+
+    with tab_register:
+        render_register_tab()
+
+    with tab_view:
+        render_list_tab()
