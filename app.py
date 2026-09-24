@@ -2,6 +2,7 @@
 # Betta Farm Management System
 # Session 17 — Navigation cleanup, Supabase diagnostic, new pages added.
 # Session 21 — Added Lines & Varieties page.
+# Session 25 — Added Inheritance Analysis page.
 
 import datetime
 
@@ -17,6 +18,7 @@ from views.search_view          import render_search_page
 from views.fry_batch_view       import render_fry_batch_page
 from views.lineage_view         import render_lineage_page
 from views.lines_view           import render_lines_page
+from views.inheritance_view     import render_inheritance_page
 from modules.dashboard          import render_dashboard
 
 
@@ -139,7 +141,7 @@ def run_supabase_diagnostic():
 
         st.divider()
         st.caption(
-            f"Session: 21 · Build: {datetime.date.today().isoformat()}"
+            f"Session: 25 · Build: {datetime.date.today().isoformat()}"
         )
 
 
@@ -159,6 +161,7 @@ page = st.sidebar.radio("Navigation", [
     "🐣 Fry Batch Tracking",
     "🌳 Lineage Tree",
     "🧬 Lines & Varieties",
+    "🧬 Inheritance",
     "📝 Activity Log",
 ])
 
@@ -188,5 +191,7 @@ elif page == "🌳 Lineage Tree":
     render_lineage_page()
 elif page == "🧬 Lines & Varieties":
     render_lines_page()
+elif page == "🧬 Inheritance":
+    render_inheritance_page()
 elif page == "📝 Activity Log":
     render_activity_log_page()
