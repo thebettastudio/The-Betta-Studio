@@ -16,3 +16,4 @@ streamlit-cropper
 scipy
 streamlit-webrtc
 av
+streamlit-image-coordinates
