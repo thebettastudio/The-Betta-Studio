@@ -8,6 +8,7 @@
 # Session 22 — Added "Cull Fish" button with reason picker.
 # Session 23 — Rewrote fish list: Visual Grid + Table toggle + Highlight strip.
 # Session 23b — Uniform 4:3 rounded images in grid tiles.
+# Session 24A — Added photo cropper UI (4:3) at upload time for fish + milestones.
 
 import io
 import datetime
@@ -22,6 +23,13 @@ try:
     register_heif_opener()
 except ImportError:
     pass
+
+# Cropper (Facebook-style crop + zoom + position)
+try:
+    from streamlit_cropper import st_cropper
+    _CROPPER_AVAILABLE = True
+except ImportError:
+    _CROPPER_AVAILABLE = False
 
 from database import (
     get_all_strains,
@@ -73,6 +81,8 @@ from modules.fish_milestones import (
 FISH_TABLE_ICON = "🐠"
 HIDE_STATUSES_DEFAULT = ["Culled", "Deceased"]
 
+CROP_ASPECT = (4, 3)   # width, height
+
 
 # ============================================================
 # FORM EVALUATION
@@ -108,6 +118,112 @@ def _normalize_image_bytes(raw: bytes) -> bytes:
         return buf.getvalue()
     except Exception:
         return raw
+
+
+def _auto_crop_to_aspect(raw_bytes: bytes, aspect: tuple[int, int] = CROP_ASPECT) -> bytes:
+    """
+    Center-crop an image to the given aspect ratio.
+    Used when user skips manual cropping.
+    """
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+
+        w, h = img.size
+        target_w, target_h = aspect
+        target_ratio = target_w / target_h
+        current_ratio = w / h
+
+        if current_ratio > target_ratio:
+            # Image is wider than target — crop the sides
+            new_w = int(h * target_ratio)
+            left = (w - new_w) // 2
+            img = img.crop((left, 0, left + new_w, h))
+        elif current_ratio < target_ratio:
+            # Image is taller than target — crop the top/bottom
+            new_h = int(w / target_ratio)
+            top = (h - new_h) // 2
+            img = img.crop((0, top, w, top + new_h))
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"auto_crop failed: {e}")
+        return raw_bytes
+
+
+def _image_to_jpeg_bytes(pil_img: Image.Image) -> bytes:
+    """Convert a PIL image (returned by st_cropper) to JPEG bytes."""
+    if pil_img.mode in ("RGBA", "P", "LA"):
+        pil_img = pil_img.convert("RGB")
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _render_cropper_ui(raw_bytes: bytes, key_prefix: str) -> Optional[bytes]:
+    """
+    Renders the crop UI for a photo. Returns the cropped bytes,
+    or None if user hasn't confirmed yet.
+
+    If cropper library isn't available, returns None (caller falls back to auto-crop).
+    If user clicks "Skip crop", returns raw_bytes.
+    """
+    if not _CROPPER_AVAILABLE:
+        return None
+
+    try:
+        st.markdown("##### ✂️ Adjust the photo")
+        st.caption("Drag the corners to resize. Drag the image to reposition. "
+                   "The grid view will crop to **4:3** — position your fish to look good in that frame.")
+
+        source_img = Image.open(io.BytesIO(raw_bytes))
+        if source_img.mode in ("RGBA", "P", "LA"):
+            source_img = source_img.convert("RGB")
+
+        col_crop, col_controls = st.columns([3, 1])
+
+        with col_crop:
+            cropped = st_cropper(
+                source_img,
+                realtime_update=True,
+                box_color="#0072FF",
+                aspect_ratio=CROP_ASPECT,
+                return_type="image",
+                key=f"crop_{key_prefix}",
+            )
+
+        with col_controls:
+            st.markdown("**Controls**")
+            st.caption("1. Drag the boxes to change size")
+            st.caption("2. Drag inside to move the image")
+            st.caption("3. Click 'Save Crop' when happy")
+
+            save_clicked = st.button(
+                "✅ Save Crop",
+                type="primary",
+                use_container_width=True,
+                key=f"save_crop_{key_prefix}",
+            )
+            skip_clicked = st.button(
+                "⏭️ Skip (auto center-crop)",
+                use_container_width=True,
+                key=f"skip_crop_{key_prefix}",
+            )
+
+        if save_clicked and cropped is not None:
+            return _image_to_jpeg_bytes(cropped)
+
+        if skip_clicked:
+            return _auto_crop_to_aspect(raw_bytes)
+
+        return None
+
+    except Exception as e:
+        st.warning(f"Cropper unavailable, using auto-crop ({e})")
+        return _auto_crop_to_aspect(raw_bytes)
 
 
 # ============================================================
@@ -228,6 +344,9 @@ def render_register_tab():
             key="select_strain_dropdown",
         )
 
+    # ============================================================
+    # Photo upload + crop
+    # ============================================================
     st.markdown("##### 📷 Fish Photo Capture / Upload")
     img_col1, img_col2 = st.columns(2)
     with img_col1:
@@ -240,17 +359,38 @@ def render_register_tab():
         )
 
     if camera_photo is not None:
-        st.session_state["fish_photo_bytes"] = camera_photo.getvalue()
+        st.session_state["fish_photo_raw"] = camera_photo.getvalue()
+        # Reset any prior crop when a new photo comes in
+        st.session_state.pop("fish_photo_bytes", None)
     elif uploaded_photo is not None:
-        st.session_state["fish_photo_bytes"] = uploaded_photo.getvalue()
+        st.session_state["fish_photo_raw"] = uploaded_photo.getvalue()
+        st.session_state.pop("fish_photo_bytes", None)
 
+    raw_bytes = st.session_state.get("fish_photo_raw")
+
+    # If user hasn't cropped yet, show cropper
+    if raw_bytes and not st.session_state.get("fish_photo_bytes"):
+        cropped_bytes = _render_cropper_ui(raw_bytes, key_prefix="fish_reg")
+        if cropped_bytes:
+            st.session_state["fish_photo_bytes"] = cropped_bytes
+            st.success("✅ Crop saved. Preview below.")
+            st.rerun()
+
+    # Preview the final (cropped) photo
     if st.session_state.get("fish_photo_bytes"):
         try:
             preview_img = Image.open(io.BytesIO(st.session_state["fish_photo_bytes"]))
-            st.image(preview_img, caption="Photo Preview", width=250)
+            st.markdown("**Final photo (as it will appear in grid):**")
+            st.image(preview_img, caption="Cropped to 4:3", width=320)
+            if st.button("🔄 Re-crop photo", key="recrop_fish"):
+                st.session_state.pop("fish_photo_bytes", None)
+                st.rerun()
         except Exception:
             pass
 
+    # ============================================================
+    # Main registration form
+    # ============================================================
     with st.form("register_fish_form", clear_on_submit=False):
         col1, col2 = st.columns(2)
 
@@ -378,7 +518,10 @@ def render_register_tab():
     if selected_tank_id:
         assign_fish_to_tank(selected_tank_id, result["id"])
 
+    # Clean up photo state
     st.session_state.pop("fish_photo_bytes", None)
+    st.session_state.pop("fish_photo_raw", None)
+
     st.balloons()
     st.success(
         f"🎉 Fish **#{result.get('system_id')}** ({selected_strain}) registered!"
@@ -391,12 +534,47 @@ def render_register_tab():
 # ============================================================
 
 def _render_milestone_add_form(fish: dict):
-    """Inline form to add a milestone."""
+    """Inline form to add a milestone. Now includes a cropper for the photo."""
     fish_uuid = fish["id"]
+    crop_key = f"ms_{fish_uuid}"
 
-    with st.form(f"add_milestone_{fish_uuid}", clear_on_submit=True):
-        st.markdown("**➕ Add Milestone**")
+    st.markdown("**➕ Add Milestone**")
 
+    # Photo upload + crop (outside the form so the cropper can rerun independently)
+    st.caption("**Photo (optional)** — 4:3 crop")
+    ms_photo_file = st.file_uploader(
+        "Upload milestone photo",
+        type=["jpg", "jpeg", "png", "heic", "heif"],
+        key=f"{crop_key}_uploader",
+    )
+
+    if ms_photo_file is not None:
+        st.session_state[f"{crop_key}_raw"] = ms_photo_file.getvalue()
+        st.session_state.pop(f"{crop_key}_cropped", None)
+
+    raw = st.session_state.get(f"{crop_key}_raw")
+
+    # Crop step
+    if raw and not st.session_state.get(f"{crop_key}_cropped"):
+        cropped = _render_cropper_ui(raw, key_prefix=crop_key)
+        if cropped:
+            st.session_state[f"{crop_key}_cropped"] = cropped
+            st.success("✅ Crop saved.")
+            st.rerun()
+
+    # Preview cropped
+    if st.session_state.get(f"{crop_key}_cropped"):
+        try:
+            preview = Image.open(io.BytesIO(st.session_state[f"{crop_key}_cropped"]))
+            st.image(preview, caption="Milestone photo (cropped)", width=280)
+            if st.button("🔄 Re-crop photo", key=f"{crop_key}_recrop"):
+                st.session_state.pop(f"{crop_key}_cropped", None)
+                st.rerun()
+        except Exception:
+            pass
+
+    # Main form (no photo field here — photo handled above)
+    with st.form(f"add_milestone_{fish_uuid}", clear_on_submit=False):
         col_a, col_b = st.columns(2)
         with col_a:
             m_date = st.date_input(
@@ -405,14 +583,15 @@ def _render_milestone_add_form(fish: dict):
                 key=f"m_date_{fish_uuid}",
             )
         with col_b:
-            photo_file = st.file_uploader(
-                "Photo",
-                type=["jpg", "jpeg", "png", "heic", "heif"],
-                key=f"m_photo_{fish_uuid}",
+            m_shape = st.selectbox(
+                "Body Shape",
+                options=["", "Bullet Head", "Regular", "Spoonhead"],
+                index=0,
+                key=f"m_shape_{fish_uuid}",
             )
 
         st.caption("Optional re-score (leave blank to skip):")
-        chk_col, shape_col = st.columns([3, 2])
+        chk_col, _ = st.columns([3, 2])
         with chk_col:
             c1 = st.checkbox("Caudal 180°", key=f"m_c1_{fish_uuid}")
             c2 = st.checkbox("Caudal branching", key=f"m_c2_{fish_uuid}")
@@ -420,13 +599,6 @@ def _render_milestone_add_form(fish: dict):
             c4 = st.checkbox("Anal structure", key=f"m_c4_{fish_uuid}")
             c5 = st.checkbox("Ventral fins", key=f"m_c5_{fish_uuid}")
             c6 = st.checkbox("Pectoral fins", key=f"m_c6_{fish_uuid}")
-        with shape_col:
-            m_shape = st.selectbox(
-                "Body Shape",
-                options=["", "Bullet Head", "Regular", "Spoonhead"],
-                index=0,
-                key=f"m_shape_{fish_uuid}",
-            )
 
         notes = st.text_area(
             "Notes",
@@ -452,15 +624,26 @@ def _render_milestone_add_form(fish: dict):
     if any_check or m_shape:
         _, score = calculate_form_grade(checks, m_shape or "Regular")
 
+    # Use cropped bytes if available; else raw bytes; else no photo
+    photo_bytes = (
+        st.session_state.get(f"{crop_key}_cropped")
+        or st.session_state.get(f"{crop_key}_raw")
+    )
+
     add_milestone(
         fish_id=fish_uuid,
         milestone_date=str(m_date),
-        photo_file=photo_file,
+        photo_file=io.BytesIO(photo_bytes) if photo_bytes else None,
         form_score=score,
         body_shape=m_shape,
         fin_checks=checks if any_check else {},
         notes=notes,
     )
+
+    # Cleanup
+    st.session_state.pop(f"{crop_key}_cropped", None)
+    st.session_state.pop(f"{crop_key}_raw", None)
+
     st.success("Milestone added.")
     st.rerun()
 
@@ -520,7 +703,7 @@ def _render_milestones_section(fish: dict, milestones: list[dict]):
 
 
 # ============================================================
-# CARD ACTIONS (shared by grid + table)
+# CARD ACTIONS
 # ============================================================
 
 def _render_card_actions(fish: dict):
@@ -617,15 +800,11 @@ def _render_card_actions(fish: dict):
 
 
 # ============================================================
-# HIGHLIGHT STRIP
+# UNIFORM PHOTO HTML (Session 23b)
 # ============================================================
 
 def _uniform_photo_html(file_id: Optional[str], aspect: str = "4 / 3"):
-    """
-    Render a Drive image inside a fixed aspect-ratio container
-    with rounded corners and object-fit: cover.
-    Ensures every photo displays at identical dimensions.
-    """
+    """Fixed aspect-ratio container with rounded corners + object-fit cover."""
     if not file_id:
         return (
             f'<div style="width:100%;aspect-ratio:{aspect};background:#F3F4F6;'
@@ -644,7 +823,7 @@ def _uniform_photo_html(file_id: Optional[str], aspect: str = "4 / 3"):
 
 
 def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
-    """Top-of-page curated strip: best grade, most milestones, recently added."""
+    """Top-of-page curated strip."""
     active = [
         f for f in all_fish
         if (f.get("status") or "").lower() not in ("culled", "deceased", "sold", "retired")
@@ -705,7 +884,7 @@ def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
 # ============================================================
 
 def _render_grid_tile(fish: dict, milestone_count: int = 0):
-    """Compact visual grid tile for the fish list. Uniform 4:3 rounded photos."""
+    """Compact visual grid tile."""
     system_id = fish.get("system_id") or "?"
     status = (fish.get("status") or "Active").lower()
     is_culled = status in ("culled", "deceased")
@@ -715,209 +894,4 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
     grade_text = fish.get("grade") or "—"
 
     age_days = get_fish_age_days(fish)
-    age_text = format_fish_age(age_days)
-
-    gender = (fish.get("gender") or "?").lower()
-    gender_sym = "♂" if gender == "male" else ("♀" if gender == "female" else "•")
-
-    # Dim container for culled
-    wrapper_open = '<div style="opacity:0.45;">' if is_culled else '<div style="opacity:1.0;">'
-
-    with st.container(border=True):
-        # Uniform photo (4:3, rounded)
-        st.markdown(
-            _uniform_photo_html(fish.get("photo_id"), aspect="4 / 3"),
-            unsafe_allow_html=True,
-        )
-
-        # Grade badge
-        st.markdown(
-            f'<span style="display:inline-block;background:{badge_bg};color:{badge_fg};'
-            f'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;'
-            f'margin-top:6px;">{grade_text}</span>',
-            unsafe_allow_html=True,
-        )
-
-        # ID + gender + variety
-        st.markdown(f"**{system_id}** · {gender_sym} {fish.get('variety') or '—'}")
-
-        # Badges row
-        badges = []
-        if milestone_count:
-            badges.append(f"📸 {milestone_count}")
-        if age_text and age_text != "—":
-            badges.append(f"🗓 {age_text}")
-        if is_culled:
-            badges.append("⛔ Culled")
-        if fish.get("location"):
-            badges.append(f"🪣 {fish['location']}")
-        if badges:
-            st.caption(" · ".join(badges))
-
-        # Quick actions
-        with st.popover("⚙️ Manage", use_container_width=True):
-            _render_card_actions(fish)
-
-        with st.popover("📸 Milestones" + (f" ({milestone_count})" if milestone_count else ""), use_container_width=True):
-            milestones = get_milestones_for_fish(fish["id"])
-            _render_milestones_section(fish, milestones)
-
-
-# ============================================================
-# TABLE VIEW
-# ============================================================
-
-def _render_table_view(filtered: list[dict], milestone_counts: dict):
-    """Dense table view for power users."""
-    rows = []
-    for f in filtered:
-        age_days = get_fish_age_days(f)
-        rows.append({
-            "ID": f.get("system_id") or "?",
-            "Gender": f.get("gender") or "—",
-            "Variety": f.get("variety") or "—",
-            "Grade": f.get("grade") or "—",
-            "Line": f.get("line_code") or "—",
-            "Gen": f.get("generation") or "—",
-            "Location": f.get("location") or "—",
-            "Status": f.get("status") or "—",
-            "Age": format_fish_age(age_days),
-            "Milestones": milestone_counts.get(f["id"], 0),
-        })
-
-    st.dataframe(
-        rows,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Milestones": st.column_config.NumberColumn("📸", width="small"),
-            "Age": st.column_config.TextColumn("Age", width="small"),
-        },
-    )
-    st.caption("💡 Tip: use the Grid view for photo browsing. Table view is best for finding a specific fish fast.")
-
-
-# ============================================================
-# LIST TAB (MAIN)
-# ============================================================
-
-CARD_PAGE_SIZE = 15
-
-
-def render_list_tab():
-    st.subheader("📋 Registered Fish Database")
-
-    all_fish = get_all_fish()
-    if not all_fish:
-        st.info("No fish registered yet. Use the Register tab to add your first fish.")
-        return
-
-    milestone_counts = get_milestone_counts_by_fish()
-
-    # ---- Metrics ----
-    alive = [
-        f for f in all_fish
-        if (f.get("status") or "").lower() not in ("culled", "deceased")
-    ]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Fish", len(all_fish))
-    m2.metric("Alive", len(alive))
-    m3.metric("Males", sum(1 for f in alive if (f.get("gender") or "").lower() == "male"))
-    m4.metric("Females", sum(1 for f in alive if (f.get("gender") or "").lower() == "female"))
-
-    st.divider()
-
-    # ---- Highlight Strip ----
-    _render_highlight_strip(all_fish, milestone_counts)
-
-    # ---- Filters ----
-    st.markdown("##### 🔍 Filter Database")
-    f_col1, f_col2, f_col3, f_col4 = st.columns(4)
-
-    with f_col1:
-        gender_filter = st.multiselect(
-            "Gender",
-            options=sorted({f.get("gender") for f in all_fish if f.get("gender")}),
-        )
-    with f_col2:
-        grade_filter = st.multiselect(
-            "Grade",
-            options=sorted({f.get("grade") for f in all_fish if f.get("grade")}),
-        )
-    with f_col3:
-        variety_filter = st.multiselect(
-            "Variety",
-            options=sorted({f.get("variety") for f in all_fish if f.get("variety")}),
-        )
-    with f_col4:
-        hide_culled = st.checkbox("Hide culled & deceased", value=True)
-
-    # ---- View toggle ----
-    view_mode = st.radio(
-        "View",
-        options=["🎨 Grid", "📊 Table"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
-    # ---- Apply filters ----
-    filtered = all_fish
-    if gender_filter:
-        filtered = [f for f in filtered if f.get("gender") in gender_filter]
-    if grade_filter:
-        filtered = [f for f in filtered if f.get("grade") in grade_filter]
-    if variety_filter:
-        filtered = [f for f in filtered if f.get("variety") in variety_filter]
-    if hide_culled:
-        filtered = [
-            f for f in filtered
-            if (f.get("status") or "").lower() not in ("culled", "deceased")
-        ]
-
-    st.caption(f"Showing {len(filtered)} of {len(all_fish)} fish.")
-    st.markdown("---")
-
-    if not filtered:
-        st.warning("No fish match the current filters.")
-        return
-
-    # ---- Render view ----
-    if view_mode == "📊 Table":
-        _render_table_view(filtered, milestone_counts)
-        return
-
-    # Grid view with pagination
-    total_pages = max(1, (len(filtered) + CARD_PAGE_SIZE - 1) // CARD_PAGE_SIZE)
-    if total_pages > 1:
-        page = st.number_input(
-            f"Page (1–{total_pages})",
-            min_value=1, max_value=total_pages, value=1, step=1,
-            key="fish_page_number",
-        )
-    else:
-        page = 1
-
-    start = (page - 1) * CARD_PAGE_SIZE
-    page_items = filtered[start : start + CARD_PAGE_SIZE]
-
-    cols = st.columns(3)
-    for idx, fish in enumerate(page_items):
-        with cols[idx % 3]:
-            _render_grid_tile(fish, milestone_count=milestone_counts.get(fish["id"], 0))
-
-
-# ============================================================
-# PAGE
-# ============================================================
-
-def render_fish_registry_page():
-    st.header("🐠 Fish Master Registry")
-    st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
-
-    tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
-
-    with tab_register:
-        render_register_tab()
-
-    with tab_view:
-        render_list_tab()
+    age_text = format_fish_age
