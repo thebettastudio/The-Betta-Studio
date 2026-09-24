@@ -842,4 +842,396 @@ def _render_milestone_timeline(milestones: list[dict]):
                 st.caption(f"Shape: {m['body_shape']}")
             if m.get("notes"):
                 st.caption(f"📝 {m['notes']}")
-            if st.button("🗑️ Delete", key=f"del_m_{m
+            if st.button("🗑️ Delete", key=f"del_m_{m['id']}", use_container_width=True):
+                if remove_milestone(m["id"]):
+                    st.success("Milestone deleted.")
+                    st.rerun()
+
+
+def _render_milestones_section(fish: dict, milestones: list[dict]):
+    suggestion = suggest_action(fish, milestones)
+    if suggestion:
+        if suggestion["kind"] == "promote":
+            st.success(f"{suggestion['icon']} **{suggestion['label']}** — {suggestion['reason']}")
+        else:
+            st.warning(f"{suggestion['icon']} **{suggestion['label']}** — {suggestion['reason']}")
+
+    if milestone_is_due(fish, milestones):
+        st.info(f"⏰ Milestone due — last check was {MILESTONE_INTERVAL_DAYS}+ days ago.")
+
+    with st.expander("➕ Add Milestone", expanded=False):
+        _render_milestone_add_form(fish)
+
+    st.markdown(f"**📸 Milestones ({len(milestones)})**")
+    _render_milestone_timeline(milestones)
+
+
+# ============================================================
+# CARD ACTIONS
+# ============================================================
+
+def _render_card_actions(fish: dict):
+    fish_uuid = fish["id"]
+    system_id = fish.get("system_id") or "?"
+    current_status = (fish.get("status") or "").lower()
+
+    if st.button("🌳 View Lineage", key=f"lineage_{fish_uuid}", use_container_width=True):
+        st.session_state["lineage_fish_id"] = fish_uuid
+        st.toast(f"Selected {system_id}. Open the Lineage page to view the tree.")
+
+    if not fish.get("is_breeder") and current_status not in ("sold", "deceased", "retired", "culled"):
+        if st.button("⭐ Promote to Breeder", key=f"promote_{fish_uuid}", use_container_width=True):
+            if promote_to_breeder(fish_uuid):
+                st.success(f"{system_id} promoted to breeder.")
+                st.rerun()
+
+    if current_status == "culled":
+        with st.popover("↩️ Restore from Culled", use_container_width=True):
+            st.markdown("**Restore this fish?**")
+            restore_status = st.selectbox(
+                "Restore to status",
+                options=["Active", "Jarred", "For Sale"],
+                key=f"restore_status_{fish_uuid}",
+            )
+            if st.button("Confirm Restore", key=f"restore_btn_{fish_uuid}", type="primary", use_container_width=True):
+                if restore_fish_from_culled(fish_uuid, new_status=restore_status):
+                    st.success(f"{system_id} restored.")
+                    st.rerun()
+    else:
+        with st.popover("🚫 Cull Fish", use_container_width=True):
+            st.markdown("**Cull this fish**")
+            cull_reason = st.selectbox("Reason", options=CULL_REASONS, key=f"cull_reason_{fish_uuid}")
+            cull_notes = st.text_area(
+                "Additional notes (optional)",
+                placeholder="e.g. Curled ventral fins",
+                key=f"cull_notes_{fish_uuid}",
+            )
+            confirm_cull = st.checkbox("I understand — cull this fish.", key=f"cull_confirm_{fish_uuid}")
+            if st.button(
+                "Confirm Cull",
+                key=f"cull_btn_{fish_uuid}",
+                type="primary",
+                use_container_width=True,
+                disabled=not confirm_cull,
+            ):
+                if cull_fish(fish_uuid, reason=cull_reason, notes=cull_notes):
+                    st.success(f"{system_id} culled.")
+                    st.rerun()
+
+    if current_status not in ("culled", "deceased", "retired"):
+        tank_opts = _get_available_tank_options()
+        if tank_opts:
+            dd = [{"id": None, "label": "— Leave / Clear Tank —"}] + tank_opts
+            selected_idx = st.selectbox(
+                "Move to Tank",
+                options=range(len(dd)),
+                format_func=lambda i: dd[i]["label"],
+                key=f"move_tank_{fish_uuid}",
+            )
+            new_tank_id = dd[selected_idx]["id"]
+            if st.button("📦 Apply Move", key=f"apply_move_{fish_uuid}", use_container_width=True):
+                if fish.get("tank_id"):
+                    unassign_tank(fish["tank_id"])
+                if new_tank_id:
+                    assign_fish_to_tank(new_tank_id, fish_uuid)
+                st.success("Location updated.")
+                st.rerun()
+
+    st.divider()
+    confirm = st.checkbox("Confirm delete (removes fish + Drive photo)", key=f"del_confirm_{fish_uuid}")
+    if st.button("🔥 Delete Fish", key=f"del_btn_{fish_uuid}", disabled=not confirm, use_container_width=True):
+        if delete_fish_and_photos(fish_uuid):
+            st.success(f"{system_id} deleted.")
+            st.rerun()
+
+
+# ============================================================
+# UNIFORM PHOTO HTML
+# ============================================================
+
+def _uniform_photo_html(file_id: Optional[str], aspect: str = "4 / 3"):
+    if not file_id:
+        return (
+            f'<div style="width:100%;aspect-ratio:{aspect};background:#F3F4F6;'
+            f'border-radius:14px;display:flex;align-items:center;justify-content:center;'
+            f'color:#9CA3AF;font-size:13px;">No Photo</div>'
+        )
+    url = photo_url(file_id)
+    return (
+        f'<div style="width:100%;aspect-ratio:{aspect};overflow:hidden;'
+        f'border-radius:14px;background:#F3F4F6;">'
+        f'<img src="{url}" style="width:100%;height:100%;object-fit:cover;display:block;" /></div>'
+    )
+
+
+def _color_swatch_row(fish: dict) -> str:
+    """Render the color swatches for a fish tile."""
+    palette = fish.get("color_palette") or {}
+    if not palette:
+        return ""
+    parts = []
+    for color, pct in sorted(palette.items(), key=lambda x: -x[1])[:4]:
+        parts.append(color_swatch_html(color, size=14))
+    return "".join(parts)
+
+
+def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
+    active = [
+        f for f in all_fish
+        if (f.get("status") or "").lower() not in ("culled", "deceased", "sold", "retired")
+    ]
+    if not active:
+        return
+
+    grade_rank = {"Show Grade": 5, "High Grade": 4, "Breeder Grade": 3, "Material Grade": 2, "Pet Grade": 1}
+    best = max(active, key=lambda f: grade_rank.get(f.get("grade") or "", 0))
+
+    most_ms = None
+    if milestone_counts:
+        top_id = max(milestone_counts, key=lambda k: milestone_counts[k])
+        most_ms = next((f for f in active if f["id"] == top_id), None)
+
+    recent = None
+    for f in sorted(active, key=lambda x: x.get("created_at") or "", reverse=True):
+        age = get_fish_age_days(f)
+        if age is not None and age <= 7:
+            recent = f
+            break
+
+    picks = []
+    if best:
+        picks.append(("🏆 Best Form", best))
+    if most_ms and (not best or most_ms["id"] != best["id"]):
+        picks.append((f"📸 Most Milestones ({milestone_counts[most_ms['id']]})", most_ms))
+    if recent and (not best or recent["id"] != best["id"]):
+        picks.append(("🆕 Just Added", recent))
+
+    if not picks:
+        return
+
+    st.markdown("###### ✨ Highlights")
+    cols = st.columns(len(picks))
+    for i, (label, f) in enumerate(picks):
+        with cols[i]:
+            with st.container(border=True):
+                st.markdown(_uniform_photo_html(f.get("photo_id"), aspect="4 / 3"), unsafe_allow_html=True)
+                st.caption(f"*{label}*")
+                st.markdown(f"**{f.get('system_id')}**")
+                st.caption(f"{f.get('gender') or '?'} · {f.get('variety') or '—'} · {f.get('grade') or '—'}")
+
+    st.markdown("---")
+
+
+# ============================================================
+# GRID TILE
+# ============================================================
+
+def _render_grid_tile(fish: dict, milestone_count: int = 0):
+    system_id = fish.get("system_id") or "?"
+    status = (fish.get("status") or "Active").lower()
+    is_culled = status in ("culled", "deceased")
+
+    badge_bg = grade_badge_color(fish.get("grade"))
+    badge_fg = grade_badge_text_color(fish.get("grade"))
+    grade_text = fish.get("grade") or "—"
+
+    age_days = get_fish_age_days(fish)
+    age_text = format_fish_age(age_days)
+
+    gender = (fish.get("gender") or "?").lower()
+    gender_sym = "♂" if gender == "male" else ("♀" if gender == "female" else "•")
+
+    with st.container(border=True):
+        st.markdown(_uniform_photo_html(fish.get("photo_id"), aspect="4 / 3"), unsafe_allow_html=True)
+
+        st.markdown(
+            f'<span style="display:inline-block;background:{badge_bg};color:{badge_fg};'
+            f'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;'
+            f'margin-top:6px;">{grade_text}</span>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(f"**{system_id}** · {gender_sym} {fish.get('variety') or '—'}")
+
+        # Color swatches row
+        swatch_html = _color_swatch_row(fish)
+        if swatch_html:
+            st.markdown(f'<div style="margin-top:4px;">{swatch_html}</div>', unsafe_allow_html=True)
+
+        badges = []
+        if milestone_count:
+            badges.append(f"📸 {milestone_count}")
+        if age_text and age_text != "—":
+            badges.append(f"🗓 {age_text}")
+        if is_culled:
+            badges.append("⛔ Culled")
+        if fish.get("iridescence_level") and fish["iridescence_level"] != "none":
+            badges.append(f"✨ {fish['iridescence_level']}")
+        if fish.get("location"):
+            badges.append(f"🪣 {fish['location']}")
+        if badges:
+            st.caption(" · ".join(badges))
+
+        with st.popover("⚙️ Manage", use_container_width=True):
+            _render_card_actions(fish)
+
+        with st.popover("📸 Milestones" + (f" ({milestone_count})" if milestone_count else ""), use_container_width=True):
+            milestones = get_milestones_for_fish(fish["id"])
+            _render_milestones_section(fish, milestones)
+
+
+# ============================================================
+# TABLE VIEW
+# ============================================================
+
+def _render_table_view(filtered: list[dict], milestone_counts: dict):
+    rows = []
+    for f in filtered:
+        age_days = get_fish_age_days(f)
+        palette = f.get("color_palette") or {}
+        palette_str = ", ".join(f"{k} {v:.0f}%" for k, v in sorted(palette.items(), key=lambda x: -x[1])[:3])
+        rows.append({
+            "ID": f.get("system_id") or "?",
+            "Gender": f.get("gender") or "—",
+            "Variety": f.get("variety") or "—",
+            "Grade": f.get("grade") or "—",
+            "Line": f.get("line_code") or "—",
+            "Gen": f.get("generation") or "—",
+            "Colors": palette_str or "—",
+            "Irid.": f.get("iridescence_level") or "—",
+            "Location": f.get("location") or "—",
+            "Status": f.get("status") or "—",
+            "Age": format_fish_age(age_days),
+            "Milestones": milestone_counts.get(f["id"], 0),
+        })
+    st.dataframe(
+        rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Milestones": st.column_config.NumberColumn("📸", width="small"),
+            "Age": st.column_config.TextColumn("Age", width="small"),
+        },
+    )
+
+
+# ============================================================
+# LIST TAB
+# ============================================================
+
+CARD_PAGE_SIZE = 15
+
+
+def render_list_tab():
+    st.subheader("📋 Registered Fish Database")
+
+    all_fish = get_all_fish()
+    if not all_fish:
+        st.info("No fish registered yet. Use the Register tab to add your first fish.")
+        return
+
+    milestone_counts = get_milestone_counts_by_fish()
+
+    alive = [
+        f for f in all_fish
+        if (f.get("status") or "").lower() not in ("culled", "deceased")
+    ]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Fish", len(all_fish))
+    m2.metric("Alive", len(alive))
+    m3.metric("Males", sum(1 for f in alive if (f.get("gender") or "").lower() == "male"))
+    m4.metric("Females", sum(1 for f in alive if (f.get("gender") or "").lower() == "female"))
+
+    st.divider()
+
+    _render_highlight_strip(all_fish, milestone_counts)
+
+    st.markdown("##### 🔍 Filter Database")
+    f_col1, f_col2, f_col3, f_col4 = st.columns(4)
+
+    with f_col1:
+        gender_filter = st.multiselect(
+            "Gender",
+            options=sorted({f.get("gender") for f in all_fish if f.get("gender")}),
+        )
+    with f_col2:
+        grade_filter = st.multiselect(
+            "Grade",
+            options=sorted({f.get("grade") for f in all_fish if f.get("grade")}),
+        )
+    with f_col3:
+        variety_filter = st.multiselect(
+            "Variety",
+            options=sorted({f.get("variety") for f in all_fish if f.get("variety")}),
+        )
+    with f_col4:
+        iri_filter = st.multiselect(
+            "Iridescence",
+            options=["none", "faint", "moderate", "strong"],
+        )
+
+    view_mode = st.radio(
+        "View",
+        options=["🎨 Grid", "📊 Table"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    hide_culled = st.checkbox("Hide culled & deceased", value=True)
+
+    filtered = all_fish
+    if gender_filter:
+        filtered = [f for f in filtered if f.get("gender") in gender_filter]
+    if grade_filter:
+        filtered = [f for f in filtered if f.get("grade") in grade_filter]
+    if variety_filter:
+        filtered = [f for f in filtered if f.get("variety") in variety_filter]
+    if iri_filter:
+        filtered = [f for f in filtered if f.get("iridescence_level") in iri_filter]
+    if hide_culled:
+        filtered = [f for f in filtered if (f.get("status") or "").lower() not in ("culled", "deceased")]
+
+    st.caption(f"Showing {len(filtered)} of {len(all_fish)} fish.")
+    st.markdown("---")
+
+    if not filtered:
+        st.warning("No fish match the current filters.")
+        return
+
+    if view_mode == "📊 Table":
+        _render_table_view(filtered, milestone_counts)
+        return
+
+    total_pages = max(1, (len(filtered) + CARD_PAGE_SIZE - 1) // CARD_PAGE_SIZE)
+    if total_pages > 1:
+        page = st.number_input(
+            f"Page (1–{total_pages})",
+            min_value=1, max_value=total_pages, value=1, step=1,
+            key="fish_page_number",
+        )
+    else:
+        page = 1
+
+    start = (page - 1) * CARD_PAGE_SIZE
+    page_items = filtered[start : start + CARD_PAGE_SIZE]
+
+    cols = st.columns(3)
+    for idx, fish in enumerate(page_items):
+        with cols[idx % 3]:
+            _render_grid_tile(fish, milestone_count=milestone_counts.get(fish["id"], 0))
+
+
+# ============================================================
+# PAGE
+# ============================================================
+
+def render_fish_registry_page():
+    st.header("🐠 Fish Master Registry")
+    st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
+
+    tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
+
+    with tab_register:
+        render_register_tab()
+
+    with tab_view:
+        render_list_tab()
