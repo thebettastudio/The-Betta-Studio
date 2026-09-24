@@ -3,10 +3,12 @@
 # Session 6  — Fish + Breeder unified. Uses Supabase via database.py.
 # Session 9  — Added list_breeders() and register_breeder() for breeder_view.
 # Session 22 — Added cull_fish() and restore_fish_from_culled().
+# Session 23 — Added get_fish_age_days() and grade color helper.
 # breeder_registry.py is retired; all breeder logic lives here.
 
 from __future__ import annotations
 
+import datetime as _dt
 from typing import Optional
 
 import streamlit as st
@@ -70,6 +72,67 @@ CULL_REASONS = [
     "Stunted growth",
     "Other",
 ]
+
+
+# ============================================================
+# DISPLAY HELPERS (Session 23)
+# ============================================================
+
+def grade_badge_color(grade: Optional[str]) -> str:
+    """
+    Return a hex color for a grade badge.
+    Used by the fish list grid tiles.
+    """
+    g = (grade or "").strip().lower()
+    if "show" in g:
+        return "#FFD700"      # gold
+    if "high" in g:
+        return "#C0C0C0"      # silver
+    if "breeder" in g:
+        return "#CD7F32"      # bronze
+    if "material" in g:
+        return "#9CA3AF"      # grey
+    if "pet" in g:
+        return "#E5E7EB"      # light grey
+    return "#E5E7EB"          # default
+
+
+def grade_badge_text_color(grade: Optional[str]) -> str:
+    """Text color that contrasts well with the badge background."""
+    g = (grade or "").strip().lower()
+    if "show" in g:
+        return "#4A3800"      # dark brown on gold
+    if "high" in g:
+        return "#333333"      # dark on silver
+    if "breeder" in g:
+        return "#FFFFFF"      # white on bronze
+    return "#1F2937"          # dark grey
+
+
+def get_fish_age_days(fish: dict) -> Optional[int]:
+    """
+    Days since the fish row was created (registration date).
+    Returns None if created_at is missing or unparseable.
+    """
+    created = fish.get("created_at")
+    if not created:
+        return None
+    try:
+        d = _dt.date.fromisoformat(str(created)[:10])
+        return (_dt.date.today() - d).days
+    except Exception:
+        return None
+
+
+def format_fish_age(days: Optional[int]) -> str:
+    """Humanize age for the tile badge."""
+    if days is None:
+        return "—"
+    if days < 30:
+        return f"{days}d"
+    if days < 365:
+        return f"{days // 30}mo"
+    return f"{days // 365}y"
 
 
 # ============================================================
@@ -158,8 +221,6 @@ def register_new_fish(
     """
     Register a manually-acquired fish (purchased or unknown origin).
     Generates FISH-NNNN system_id.
-
-    For batch-born fish use `register_fish_from_spawn()` instead.
     """
     system_id = generate_fish_id()
 
@@ -207,7 +268,7 @@ def register_new_fish(
 
 def register_fish_from_spawn(
     *,
-    spawn_id: str,                 # spawn uuid
+    spawn_id: str,
     gender: str,
     grade: str = "Pet Grade",
     location: str = "",
@@ -215,11 +276,7 @@ def register_fish_from_spawn(
     photo_file=None,
 ) -> Optional[dict]:
     """
-    Register a jarred fry from a spawn. Inherits lineage:
-      - sire_id, dam_id from spawn
-      - line_code, generation from spawn
-      - batch_id = spawn.id
-      - system_id = {spawn.system_id}-NN
+    Register a jarred fry from a spawn. Inherits lineage.
     """
     spawn = next((s for s in get_all_spawns() if s["id"] == spawn_id), None)
     if not spawn:
@@ -299,7 +356,7 @@ def edit_fish(fish_id: str, updates: dict) -> bool:
 
 
 def change_location(fish_id: str, new_location: str) -> bool:
-    """Move a fish to a new tank/jar (tape code). Updates both fish and old tank."""
+    """Move a fish to a new tank/jar (tape code)."""
     fish = get_fish_by_id(fish_id)
     if not fish:
         return False
@@ -368,7 +425,6 @@ def cull_fish(fish_id: str, reason: str = "", notes: str = "") -> bool:
         else f"{tag} {notes}".strip()
     )
 
-    # Free any tank holding this fish
     if fish.get("tank_id"):
         from database import clear_occupant
         clear_occupant(fish["tank_id"])
@@ -395,7 +451,6 @@ def cull_fish(fish_id: str, reason: str = "", notes: str = "") -> bool:
 def restore_fish_from_culled(fish_id: str, new_status: str = "Active") -> bool:
     """
     Undo a cull — useful if you culled by mistake.
-    Sets status back and leaves a note.
     """
     fish = get_fish_by_id(fish_id)
     if not fish:
@@ -430,7 +485,6 @@ def list_breeders(include_retired: bool = False) -> list[dict]:
     """
     Return all fish marked as breeders.
     By default excludes Retired / Inactive breeder_status.
-    Used by breeder_view and any breeder inventory UI.
     """
     out = []
     for f in get_all_fish():
@@ -457,10 +511,6 @@ def register_breeder(
 ) -> Optional[dict]:
     """
     Convenience wrapper: register a new fish AND immediately promote to breeder.
-    Used by breeder_view's Register Breeder form.
-
-    `lineage` becomes line_code (sanitized, upper-cased).
-    `dob` is stored in purchase_date (schema has no separate dob column).
     """
     from modules.id_generator import _sanitize
 
@@ -470,7 +520,7 @@ def register_breeder(
         origin="Purchased",
         gender=sex,
         variety=variety,
-        form_type="HMPK",       # matches old breeder_view hardcoded prefix
+        form_type="HMPK",
         grade=grade,
         body_shape=body_shape,
         fin_checks=fin_checks or {},
@@ -489,10 +539,7 @@ def register_breeder(
 
 
 def promote_to_breeder(fish_id: str, breeder_status: str = "Available") -> bool:
-    """
-    Promote a fish to breeder. Fish keeps its system_id.
-    Fish status becomes 'Conditioning'.
-    """
+    """Promote a fish to breeder."""
     ok = promote_fish_to_breeder(fish_id, breeder_status)
     if ok:
         fish = get_fish_by_id(fish_id)
@@ -522,9 +569,7 @@ def retire_breeder(fish_id: str, reason: str = "", notes: str = "") -> bool:
 
 
 def list_available_breeders(gender: Optional[str] = None) -> list[dict]:
-    """
-    Available breeders, optionally filtered by gender. Returns fish rows.
-    """
+    """Available breeders, optionally filtered by gender. Returns fish rows."""
     breeders = get_available_breeders()
     if gender:
         g = gender.strip().lower()
@@ -533,10 +578,7 @@ def list_available_breeders(gender: Optional[str] = None) -> list[dict]:
 
 
 def get_breeder_pairs_data() -> tuple[list[dict], list[dict]]:
-    """
-    Returns (males, females) as dropdown items for pairing UI.
-    Each item: {'id': uuid, 'system_id': 'FISH-0042', 'label': '...'}
-    """
+    """Returns (males, females) as dropdown items for pairing UI."""
     males, females = [], []
     for b in get_available_breeders():
         item = {
@@ -570,13 +612,12 @@ def get_breeder_stats() -> dict:
 def sync_breeder_status(fish_id: str, new_status: str) -> bool:
     """
     Called by spawn_manager when a pairing starts/ends.
-    Updates only breeder_status (not overall fish status).
     """
     return update_fish(fish_id, {"breeder_status": new_status})
 
 
 # ============================================================
-# LINEAGE HELPERS (used by Session 16 lineage tree)
+# LINEAGE HELPERS
 # ============================================================
 
 def get_parents(fish_id: str) -> tuple[Optional[dict], Optional[dict]]:
