@@ -13,3 +13,4 @@ pillow
 qrcode[pil]
 pillow-heif
 streamlit-cropper
+scipy
