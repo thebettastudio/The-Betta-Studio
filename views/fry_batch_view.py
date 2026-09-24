@@ -1,6 +1,7 @@
 # views/fry_batch_view.py
 # Betta Farm Management System
 # Session 15 — Fry batch tracking UI.
+# Session 24B — Outcome panel + culled/female count editors on batch cards.
 
 import datetime
 from typing import Optional
@@ -25,6 +26,12 @@ from modules.fry_batch_manager import (
 )
 from modules.tank_registry import get_tank_dropdown_items
 from modules.fish_manager import VALID_GENDERS, VALID_GRADES
+from modules.spawn_outcome import (
+    compute_spawn_outcome,
+    compute_all_spawn_outcomes,
+    verdict_badge_html,
+    grade_breakdown_short,
+)
 
 
 # ============================================================
@@ -131,6 +138,44 @@ def _render_create_section():
 
 
 # ============================================================
+# OUTCOME PANEL (shared)
+# ============================================================
+
+def _render_outcome_panel(outcome: dict):
+    """Compact outcome panel: verdict badge + key metrics + grades."""
+    verdict_icon = outcome.get("verdict_icon", "—")
+    verdict_reason = outcome.get("verdict_reason", "")
+    jarred = outcome.get("jarred_count", 0)
+    culled = outcome.get("culled_count", 0)
+    females = outcome.get("female_count", 0)
+    avg_score = outcome.get("avg_form_score")
+    breakdown = grade_breakdown_short(outcome)
+    best = outcome.get("best_fish")
+
+    st.markdown("**📊 Batch Outcome**")
+    st.markdown(
+        f'{verdict_badge_html(outcome)} &nbsp; <span style="color:#6B7280;'
+        f'font-size:13px;">{verdict_reason}</span>',
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Jarred", jarred)
+    col2.metric("Culled", culled)
+    col3.metric("Females", females)
+    col4.metric("Avg Form", f"{avg_score:.0f}" if avg_score is not None else "—")
+
+    if breakdown and breakdown != "—":
+        st.caption(f"**Grades:** {breakdown}")
+
+    if best:
+        st.caption(
+            f"🏆 Best: `{best.get('system_id') or '?'}` "
+            f"({best.get('grade') or '—'})"
+        )
+
+
+# ============================================================
 # BATCH CARD
 # ============================================================
 
@@ -189,14 +234,65 @@ def _render_jar_popover(batch: dict):
                 location=location.strip(),
             )
             if created:
-                # Decrement current_count by how many we jarred
                 new_count = max(0, (batch.get("current_count") or 0) - len(created))
                 set_current_count(batch_uuid, new_count)
                 st.success(f"Jarred {len(created)} fry. Remaining in batch: {new_count}.")
                 st.rerun()
 
 
-def _render_batch_card(item: dict):
+def _render_counts_popover(batch: dict):
+    """
+    Popover to edit current_count, culled_count, female_count.
+    These feed the outcome panel.
+    """
+    batch_uuid = batch["id"]
+
+    with st.popover("🔢 Update Counts", use_container_width=True):
+        st.markdown("**Update batch counts**")
+        st.caption(
+            "Culled = fry you culled (never jarred or removed). "
+            "Females = fry kept in sorority (not individually tracked)."
+        )
+
+        new_current = st.number_input(
+            "Current fry count (unjarred)",
+            min_value=0,
+            value=int(batch.get("current_count") or 0),
+            step=1,
+            key=f"count_cur_{batch_uuid}",
+        )
+        new_culled = st.number_input(
+            "Culled count",
+            min_value=0,
+            value=int(batch.get("culled_count") or 0),
+            step=1,
+            key=f"count_culled_{batch_uuid}",
+        )
+        new_female = st.number_input(
+            "Female count (kept in sorority)",
+            min_value=0,
+            value=int(batch.get("female_count") or 0),
+            step=1,
+            key=f"count_female_{batch_uuid}",
+        )
+
+        if st.button(
+            "Save Counts",
+            type="primary",
+            use_container_width=True,
+            key=f"save_counts_{batch_uuid}",
+        ):
+            ok = edit_batch(batch_uuid, {
+                "current_count": int(new_current),
+                "culled_count": int(new_culled),
+                "female_count": int(new_female),
+            })
+            if ok:
+                st.success("Counts updated.")
+                st.rerun()
+
+
+def _render_batch_card(item: dict, outcome: Optional[dict] = None):
     batch = item["batch"]
     spawn = item.get("spawn")
     tank = item.get("tank")
@@ -233,22 +329,31 @@ def _render_batch_card(item: dict):
                         st.success(f"Stage → {new_stage}")
                         st.rerun()
 
-        # Counts
+        # Counts row
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Initial", batch.get("initial_count") or 0)
         col2.metric("Current", batch.get("current_count") or 0)
         col3.metric("Survival", _survival_label(survival))
         col4.metric("Stage", f"{icon} {stage}")
 
-        # Dates + tank
+        # Dates + tank + culled/female inline
+        culled_n = batch.get("culled_count") or 0
+        female_n = batch.get("female_count") or 0
         st.caption(
             f"🥚 Hatch: {_format_date(batch.get('hatch_date'))} | "
             f"🫙 Jarred: {_format_date(batch.get('jarring_date'))} | "
-            f"🪣 Tank: {tank.get('location_code') if tank else 'Unassigned'}"
+            f"🪣 Tank: {tank.get('location_code') if tank else 'Unassigned'} | "
+            f"🚫 Culled: {culled_n} | "
+            f"♀ Females: {female_n}"
         )
 
         if batch.get("notes"):
             st.info(batch["notes"])
+
+        # ---- Outcome panel ----
+        if outcome and outcome.get("verdict_key") not in ("unknown",):
+            st.divider()
+            _render_outcome_panel(outcome)
 
         st.divider()
 
@@ -259,18 +364,7 @@ def _render_batch_card(item: dict):
             _render_jar_popover(batch)
 
         with col_b:
-            with st.popover("📊 Update Count", use_container_width=True):
-                new_count = st.number_input(
-                    "Current fry count",
-                    min_value=0,
-                    value=int(batch.get("current_count") or 0),
-                    step=1,
-                    key=f"count_{batch_uuid}",
-                )
-                if st.button("Save Count", key=f"save_count_{batch_uuid}", use_container_width=True):
-                    if set_current_count(batch_uuid, int(new_count)):
-                        st.success("Count updated.")
-                        st.rerun()
+            _render_counts_popover(batch)
 
         with col_c:
             with st.popover("🪣 Assign Tank", use_container_width=True):
@@ -378,8 +472,14 @@ def _render_list_section():
         st.info("No batches match the current filter.")
         return
 
+    # Precompute outcomes for all spawns (single pass)
+    outcome_map = compute_all_spawn_outcomes()
+
     for it in items:
-        _render_batch_card(it)
+        batch = it["batch"]
+        spawn_id = batch.get("spawn_id")
+        outcome = outcome_map.get(spawn_id) if spawn_id else None
+        _render_batch_card(it, outcome=outcome)
 
 
 # ============================================================
