@@ -1,18 +1,8 @@
 # modules/spawn_outcome.py
 # Betta Farm Management System
 # Session 24B — Computed batch outcome per spawn.
-# Session 24B fix — Cull rate = culled ÷ (jarred + culled) [caps at 100%].
-#
-# Aggregates jarred fish grades + cull rate + female count into a
-# batch verdict. No manual input — everything is derived.
-#
-# Verdict logic:
-#   🌟 Excellent : >=50% High+ grade AND cull rate < 20%
-#   ✅ Solid     : 25-50% High+ grade AND cull rate 20-40%
-#   ⚠️ Mixed     : 10-25% High+ grade OR cull rate 40-60%
-#   ❌ Weak      : <10% High+ grade OR cull rate > 60%
-#   🚫 Failed    : no jarred fish AND culls happened
-#   ⏳ Pending   : no jarring yet, no culls yet
+# Session 24B fix — Cull rate = culled ÷ (jarred + culled).
+# Session 24B fix 2 — Verdict priority: cull rate bounds must be respected.
 
 from __future__ import annotations
 
@@ -98,6 +88,15 @@ def _compute_verdict(
     """
     Returns (verdict_key, reason_short).
     Cull rate = culled ÷ (jarred + culled). Always in [0, 1].
+
+    Priority:
+      1. Failed (no jarred, culls happened)
+      2. Pending (no data)
+      3. Excellent (>=50% High+ AND <20% cull)
+      4. Weak (<10% High+ OR >60% cull)          <- checked BEFORE Mixed
+      5. Solid (25-50% High+ AND 20-40% cull)
+      6. Mixed (10-25% High+ OR 40-60% cull)
+      7. Fallback -> Weak
     """
     total = jarred_count + culled_count
 
@@ -113,13 +112,22 @@ def _compute_verdict(
     high_pct = high_plus_count / jarred_count
     cull_rate = culled_count / total if total > 0 else 0.0
 
+    summary = f"{high_pct*100:.0f}% High+ · {cull_rate*100:.0f}% culled"
+
+    # Excellent
     if high_pct >= 0.50 and cull_rate < 0.20:
-        return ("excellent", f"{high_pct*100:.0f}% High+ · {cull_rate*100:.0f}% culled")
+        return ("excellent", summary)
+
+    # Weak (checked BEFORE Mixed so cull rate dominates if extreme)
+    if high_pct < 0.10 or cull_rate > 0.60:
+        return ("weak", summary)
+
+    # Solid
     if high_pct >= 0.25 and cull_rate <= 0.40:
-        return ("solid", f"{high_pct*100:.0f}% High+ · {cull_rate*100:.0f}% culled")
-    if high_pct >= 0.10 or cull_rate <= 0.60:
-        return ("mixed", f"{high_pct*100:.0f}% High+ · {cull_rate*100:.0f}% culled")
-    return ("weak", f"{high_pct*100:.0f}% High+ · {cull_rate*100:.0f}% culled")
+        return ("solid", summary)
+
+    # Mixed (remaining cases)
+    return ("mixed", summary)
 
 
 # ============================================================
