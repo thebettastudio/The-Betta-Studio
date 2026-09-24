@@ -7,6 +7,7 @@
 # Session 20 — Added milestone tracking section on each fish card.
 # Session 22 — Added "Cull Fish" button with reason picker.
 # Session 23 — Rewrote fish list: Visual Grid + Table toggle + Highlight strip.
+# Session 23b — Uniform 4:3 rounded images in grid tiles.
 
 import io
 import datetime
@@ -615,46 +616,35 @@ def _render_card_actions(fish: dict):
             st.rerun()
 
 
-def _render_detail_expander(fish: dict, milestone_count: int = 0):
-    """Full fish details shown when a grid tile is expanded."""
-    system_id = fish.get("system_id") or "?"
-    st.markdown(f"#### 🐟 {system_id}")
-
-    col_info, col_img = st.columns([2, 1])
-    with col_img:
-        if fish.get("photo_id"):
-            st.image(photo_url(fish["photo_id"]), use_container_width=True)
-        else:
-            st.caption("📷 *No Photo*")
-
-    with col_info:
-        st.write(f"**Gender:** {fish.get('gender') or '—'}")
-        st.write(f"**Variety:** {fish.get('variety') or '—'}")
-        st.write(f"**Form:** {fish.get('form_type') or '—'}")
-        st.write(f"**Grade:** {fish.get('grade') or '—'}")
-        st.write(f"**Status:** {fish.get('status') or 'Active'}")
-        if fish.get("line_code") and fish["line_code"] != "UNK":
-            st.write(f"**Line:** {fish['line_code']} ({fish.get('generation') or 'P1'})")
-        if fish.get("location"):
-            st.write(f"**Location:** `{fish['location']}`")
-        if milestone_count:
-            st.write(f"**Milestones:** {milestone_count}")
-
-    with st.expander("⚙️ Manage", expanded=False):
-        _render_card_actions(fish)
-
-    with st.expander("📸 Milestones", expanded=False):
-        milestones = get_milestones_for_fish(fish["id"])
-        _render_milestones_section(fish, milestones)
-
-
 # ============================================================
 # HIGHLIGHT STRIP
 # ============================================================
 
+def _uniform_photo_html(file_id: Optional[str], aspect: str = "4 / 3"):
+    """
+    Render a Drive image inside a fixed aspect-ratio container
+    with rounded corners and object-fit: cover.
+    Ensures every photo displays at identical dimensions.
+    """
+    if not file_id:
+        return (
+            f'<div style="width:100%;aspect-ratio:{aspect};background:#F3F4F6;'
+            f'border-radius:14px;display:flex;align-items:center;justify-content:center;'
+            f'color:#9CA3AF;font-size:13px;">No Photo</div>'
+        )
+
+    url = photo_url(file_id)
+    return (
+        f'<div style="width:100%;aspect-ratio:{aspect};overflow:hidden;'
+        f'border-radius:14px;background:#F3F4F6;">'
+        f'<img src="{url}" '
+        f'style="width:100%;height:100%;object-fit:cover;display:block;" />'
+        f'</div>'
+    )
+
+
 def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
     """Top-of-page curated strip: best grade, most milestones, recently added."""
-    # Filter out culled/deceased/sold
     active = [
         f for f in all_fish
         if (f.get("status") or "").lower() not in ("culled", "deceased", "sold", "retired")
@@ -662,20 +652,17 @@ def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
     if not active:
         return
 
-    # Best grade fish (highest rank with Show > High > Breeder > Material > Pet)
     grade_rank = {
         "Show Grade": 5, "High Grade": 4, "Breeder Grade": 3,
         "Material Grade": 2, "Pet Grade": 1,
     }
     best = max(active, key=lambda f: grade_rank.get(f.get("grade") or "", 0))
 
-    # Most milestones
     most_ms = None
     if milestone_counts:
         top_id = max(milestone_counts, key=lambda k: milestone_counts[k])
         most_ms = next((f for f in active if f["id"] == top_id), None)
 
-    # Recently added (last 7 days)
     recent = None
     for f in sorted(active, key=lambda x: x.get("created_at") or "", reverse=True):
         age = get_fish_age_days(f)
@@ -699,10 +686,10 @@ def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
     for i, (label, f) in enumerate(picks):
         with cols[i]:
             with st.container(border=True):
-                if f.get("photo_id"):
-                    st.image(photo_url(f["photo_id"]), use_container_width=True)
-                else:
-                    st.caption("📷 *No photo*")
+                st.markdown(
+                    _uniform_photo_html(f.get("photo_id"), aspect="4 / 3"),
+                    unsafe_allow_html=True,
+                )
                 st.caption(f"*{label}*")
                 st.markdown(f"**{f.get('system_id')}**")
                 st.caption(
@@ -718,43 +705,36 @@ def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
 # ============================================================
 
 def _render_grid_tile(fish: dict, milestone_count: int = 0):
-    """Compact visual grid tile for the fish list."""
+    """Compact visual grid tile for the fish list. Uniform 4:3 rounded photos."""
     system_id = fish.get("system_id") or "?"
     status = (fish.get("status") or "Active").lower()
     is_culled = status in ("culled", "deceased")
 
-    # Grade badge colors
     badge_bg = grade_badge_color(fish.get("grade"))
     badge_fg = grade_badge_text_color(fish.get("grade"))
     grade_text = fish.get("grade") or "—"
 
-    # Age badge
     age_days = get_fish_age_days(fish)
     age_text = format_fish_age(age_days)
 
-    # Gender symbol
     gender = (fish.get("gender") or "?").lower()
     gender_sym = "♂" if gender == "male" else ("♀" if gender == "female" else "•")
 
-    # Dim culled fish
-    opacity = 0.45 if is_culled else 1.0
+    # Dim container for culled
+    wrapper_open = '<div style="opacity:0.45;">' if is_culled else '<div style="opacity:1.0;">'
 
     with st.container(border=True):
-        # Photo
-        if fish.get("photo_id"):
-            st.image(photo_url(fish["photo_id"]), use_container_width=True)
-        else:
-            st.markdown(
-                '<div style="width:100%;aspect-ratio:1/1;display:flex;align-items:center;'
-                'justify-content:center;background:#F3F4F6;color:#9CA3AF;'
-                'border-radius:8px;font-size:12px;">No Photo</div>',
-                unsafe_allow_html=True,
-            )
+        # Uniform photo (4:3, rounded)
+        st.markdown(
+            _uniform_photo_html(fish.get("photo_id"), aspect="4 / 3"),
+            unsafe_allow_html=True,
+        )
 
         # Grade badge
         st.markdown(
             f'<span style="display:inline-block;background:{badge_bg};color:{badge_fg};'
-            f'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;">{grade_text}</span>',
+            f'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;'
+            f'margin-top:6px;">{grade_text}</span>',
             unsafe_allow_html=True,
         )
 
@@ -774,7 +754,7 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
         if badges:
             st.caption(" · ".join(badges))
 
-        # Quick actions (kept minimal for tile)
+        # Quick actions
         with st.popover("⚙️ Manage", use_container_width=True):
             _render_card_actions(fish)
 
@@ -915,29 +895,4 @@ def render_list_tab():
             key="fish_page_number",
         )
     else:
-        page = 1
-
-    start = (page - 1) * CARD_PAGE_SIZE
-    page_items = filtered[start : start + CARD_PAGE_SIZE]
-
-    cols = st.columns(3)
-    for idx, fish in enumerate(page_items):
-        with cols[idx % 3]:
-            _render_grid_tile(fish, milestone_count=milestone_counts.get(fish["id"], 0))
-
-
-# ============================================================
-# PAGE
-# ============================================================
-
-def render_fish_registry_page():
-    st.header("🐠 Fish Master Registry")
-    st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
-
-    tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
-
-    with tab_register:
-        render_register_tab()
-
-    with tab_view:
-        render_list_tab()
+       
