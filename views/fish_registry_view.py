@@ -6,6 +6,7 @@
 # Session 18 — Strains fully DB-managed (no more hardcoded defaults).
 # Session 20 — Added milestone tracking section on each fish card.
 # Session 22 — Added "Cull Fish" button with reason picker.
+# Session 23 — Rewrote fish list: Visual Grid + Table toggle + Highlight strip.
 
 import io
 import datetime
@@ -36,6 +37,10 @@ from modules.fish_manager import (
     promote_to_breeder,
     cull_fish,
     restore_fish_from_culled,
+    grade_badge_color,
+    grade_badge_text_color,
+    get_fish_age_days,
+    format_fish_age,
     VALID_GRADES,
     VALID_GENDERS,
     CULL_REASONS,
@@ -65,6 +70,7 @@ from modules.fish_milestones import (
 # ============================================================
 
 FISH_TABLE_ICON = "🐠"
+HIDE_STATUSES_DEFAULT = ["Culled", "Deceased"]
 
 
 # ============================================================
@@ -384,7 +390,7 @@ def render_register_tab():
 # ============================================================
 
 def _render_milestone_add_form(fish: dict):
-    """Inline form to add a milestone. Uses a form to avoid rerun churn."""
+    """Inline form to add a milestone."""
     fish_uuid = fish["id"]
 
     with st.form(f"add_milestone_{fish_uuid}", clear_on_submit=True):
@@ -432,7 +438,6 @@ def _render_milestone_add_form(fish: dict):
     if not submit:
         return
 
-    # Compute score if any checkbox checked OR shape selected
     checks = {
         "caudal_180": c1,
         "caudal_prop": c2,
@@ -465,7 +470,6 @@ def _render_milestone_timeline(milestones: list[dict]):
         st.caption("No milestones yet.")
         return
 
-    # Trend summary
     trend = compute_trend(milestones)
     if trend["direction"] == "rising":
         st.success(f"📈 Rising — latest score **{trend['latest_score']}** (+{trend['delta']})")
@@ -473,9 +477,7 @@ def _render_milestone_timeline(milestones: list[dict]):
         st.warning(f"📉 Falling — latest score **{trend['latest_score']}** ({trend['delta']})")
     elif trend["direction"] == "flat":
         st.info(f"➡️ Flat — latest score **{trend['latest_score']}**")
-    # insufficient → no message
 
-    # Photo grid + metadata
     cols = st.columns(3)
     for idx, m in enumerate(milestones):
         with cols[idx % 3]:
@@ -491,7 +493,6 @@ def _render_milestone_timeline(milestones: list[dict]):
             if m.get("notes"):
                 st.caption(f"📝 {m['notes']}")
 
-            # Delete button per milestone
             if st.button("🗑️ Delete", key=f"del_m_{m['id']}", use_container_width=True):
                 if remove_milestone(m["id"]):
                     st.success("Milestone deleted.")
@@ -499,8 +500,7 @@ def _render_milestone_timeline(milestones: list[dict]):
 
 
 def _render_milestones_section(fish: dict, milestones: list[dict]):
-    """Full milestones expander content: suggestions, add form, timeline."""
-    # 1. Suggestion banner (if trend-based suggestion exists)
+    """Full milestones expander content."""
     suggestion = suggest_action(fish, milestones)
     if suggestion:
         if suggestion["kind"] == "promote":
@@ -508,79 +508,35 @@ def _render_milestones_section(fish: dict, milestones: list[dict]):
         else:
             st.warning(f"{suggestion['icon']} **{suggestion['label']}** — {suggestion['reason']}")
 
-    # 2. Due indicator
     if milestone_is_due(fish, milestones):
         st.info(f"⏰ Milestone due — last check was {MILESTONE_INTERVAL_DAYS}+ days ago.")
 
-    # 3. Add milestone form (collapsible by using expander inside)
     with st.expander("➕ Add Milestone", expanded=False):
         _render_milestone_add_form(fish)
 
-    # 4. Timeline
     st.markdown(f"**📸 Milestones ({len(milestones)})**")
     _render_milestone_timeline(milestones)
 
 
 # ============================================================
-# CARD RENDERING
+# CARD ACTIONS (shared by grid + table)
 # ============================================================
-
-CARD_PAGE_SIZE = 20
-
-
-def _render_fish_card(fish: dict, milestone_count: int = 0):
-    with st.container(border=True):
-        if fish.get("photo_id"):
-            st.image(photo_url(fish["photo_id"]), use_container_width=True)
-        else:
-            st.caption("📷 *No Photo*")
-
-        system_id = fish.get("system_id") or "?"
-        st.markdown(f"### {system_id}")
-        st.caption(
-            f"**{fish.get('gender') or '?'}** | "
-            f"`{fish.get('status') or 'Active'}` | "
-            f"{fish.get('grade') or '—'}"
-        )
-        st.write(f"🧬 **Variety:** {fish.get('variety') or '—'}")
-        if fish.get("form_type"):
-            st.write(f"📐 **Form:** {fish['form_type']}")
-        if fish.get("line_code") and fish["line_code"] != "UNK":
-            st.write(f"🏷️ **Line:** {fish['line_code']} ({fish.get('generation') or 'P1'})")
-        if fish.get("location"):
-            st.write(f"🪣 **Location:** `{fish['location']}`")
-
-        # Milestone badge
-        if milestone_count:
-            st.caption(f"📸 {milestone_count} milestone{'s' if milestone_count != 1 else ''}")
-
-        with st.expander("⚙️ Manage"):
-            _render_card_actions(fish)
-
-        # Milestones expander (populated lazily to keep list fast)
-        with st.expander("📸 Milestones", expanded=False):
-            milestones = get_milestones_for_fish(fish["id"])
-            _render_milestones_section(fish, milestones)
-
 
 def _render_card_actions(fish: dict):
     fish_uuid = fish["id"]
     system_id = fish.get("system_id") or "?"
     current_status = (fish.get("status") or "").lower()
 
-    # Lineage shortcut
     if st.button("🌳 View Lineage", key=f"lineage_{fish_uuid}", use_container_width=True):
         st.session_state["lineage_fish_id"] = fish_uuid
         st.toast(f"Selected {system_id}. Open the Lineage page to view the tree.")
 
-    # Promote to breeder
     if not fish.get("is_breeder") and current_status not in ("sold", "deceased", "retired", "culled"):
         if st.button("⭐ Promote to Breeder", key=f"promote_{fish_uuid}", use_container_width=True):
             if promote_to_breeder(fish_uuid):
                 st.success(f"{system_id} promoted to breeder.")
                 st.rerun()
 
-    # Cull / Restore
     if current_status == "culled":
         with st.popover("↩️ Restore from Culled", use_container_width=True):
             st.markdown("**Restore this fish?**")
@@ -623,7 +579,6 @@ def _render_card_actions(fish: dict):
                     st.success(f"{system_id} culled.")
                     st.rerun()
 
-    # Move tank — only if not culled/deceased/retired
     if current_status not in ("culled", "deceased", "retired"):
         tank_opts = _get_available_tank_options()
         if tank_opts:
@@ -644,7 +599,6 @@ def _render_card_actions(fish: dict):
                 st.success("Location updated.")
                 st.rerun()
 
-    # Delete
     st.divider()
     confirm = st.checkbox(
         "Confirm delete (removes fish + Drive photo)",
@@ -661,9 +615,214 @@ def _render_card_actions(fish: dict):
             st.rerun()
 
 
+def _render_detail_expander(fish: dict, milestone_count: int = 0):
+    """Full fish details shown when a grid tile is expanded."""
+    system_id = fish.get("system_id") or "?"
+    st.markdown(f"#### 🐟 {system_id}")
+
+    col_info, col_img = st.columns([2, 1])
+    with col_img:
+        if fish.get("photo_id"):
+            st.image(photo_url(fish["photo_id"]), use_container_width=True)
+        else:
+            st.caption("📷 *No Photo*")
+
+    with col_info:
+        st.write(f"**Gender:** {fish.get('gender') or '—'}")
+        st.write(f"**Variety:** {fish.get('variety') or '—'}")
+        st.write(f"**Form:** {fish.get('form_type') or '—'}")
+        st.write(f"**Grade:** {fish.get('grade') or '—'}")
+        st.write(f"**Status:** {fish.get('status') or 'Active'}")
+        if fish.get("line_code") and fish["line_code"] != "UNK":
+            st.write(f"**Line:** {fish['line_code']} ({fish.get('generation') or 'P1'})")
+        if fish.get("location"):
+            st.write(f"**Location:** `{fish['location']}`")
+        if milestone_count:
+            st.write(f"**Milestones:** {milestone_count}")
+
+    with st.expander("⚙️ Manage", expanded=False):
+        _render_card_actions(fish)
+
+    with st.expander("📸 Milestones", expanded=False):
+        milestones = get_milestones_for_fish(fish["id"])
+        _render_milestones_section(fish, milestones)
+
+
 # ============================================================
-# LIST TAB
+# HIGHLIGHT STRIP
 # ============================================================
+
+def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
+    """Top-of-page curated strip: best grade, most milestones, recently added."""
+    # Filter out culled/deceased/sold
+    active = [
+        f for f in all_fish
+        if (f.get("status") or "").lower() not in ("culled", "deceased", "sold", "retired")
+    ]
+    if not active:
+        return
+
+    # Best grade fish (highest rank with Show > High > Breeder > Material > Pet)
+    grade_rank = {
+        "Show Grade": 5, "High Grade": 4, "Breeder Grade": 3,
+        "Material Grade": 2, "Pet Grade": 1,
+    }
+    best = max(active, key=lambda f: grade_rank.get(f.get("grade") or "", 0))
+
+    # Most milestones
+    most_ms = None
+    if milestone_counts:
+        top_id = max(milestone_counts, key=lambda k: milestone_counts[k])
+        most_ms = next((f for f in active if f["id"] == top_id), None)
+
+    # Recently added (last 7 days)
+    recent = None
+    for f in sorted(active, key=lambda x: x.get("created_at") or "", reverse=True):
+        age = get_fish_age_days(f)
+        if age is not None and age <= 7:
+            recent = f
+            break
+
+    picks = []
+    if best:
+        picks.append(("🏆 Best Form", best))
+    if most_ms and (not best or most_ms["id"] != best["id"]):
+        picks.append((f"📸 Most Milestones ({milestone_counts[most_ms['id']]})", most_ms))
+    if recent and (not best or recent["id"] != best["id"]):
+        picks.append(("🆕 Just Added", recent))
+
+    if not picks:
+        return
+
+    st.markdown("###### ✨ Highlights")
+    cols = st.columns(len(picks))
+    for i, (label, f) in enumerate(picks):
+        with cols[i]:
+            with st.container(border=True):
+                if f.get("photo_id"):
+                    st.image(photo_url(f["photo_id"]), use_container_width=True)
+                else:
+                    st.caption("📷 *No photo*")
+                st.caption(f"*{label}*")
+                st.markdown(f"**{f.get('system_id')}**")
+                st.caption(
+                    f"{f.get('gender') or '?'} · {f.get('variety') or '—'} · "
+                    f"{f.get('grade') or '—'}"
+                )
+
+    st.markdown("---")
+
+
+# ============================================================
+# GRID TILE
+# ============================================================
+
+def _render_grid_tile(fish: dict, milestone_count: int = 0):
+    """Compact visual grid tile for the fish list."""
+    system_id = fish.get("system_id") or "?"
+    status = (fish.get("status") or "Active").lower()
+    is_culled = status in ("culled", "deceased")
+
+    # Grade badge colors
+    badge_bg = grade_badge_color(fish.get("grade"))
+    badge_fg = grade_badge_text_color(fish.get("grade"))
+    grade_text = fish.get("grade") or "—"
+
+    # Age badge
+    age_days = get_fish_age_days(fish)
+    age_text = format_fish_age(age_days)
+
+    # Gender symbol
+    gender = (fish.get("gender") or "?").lower()
+    gender_sym = "♂" if gender == "male" else ("♀" if gender == "female" else "•")
+
+    # Dim culled fish
+    opacity = 0.45 if is_culled else 1.0
+
+    with st.container(border=True):
+        # Photo
+        if fish.get("photo_id"):
+            st.image(photo_url(fish["photo_id"]), use_container_width=True)
+        else:
+            st.markdown(
+                '<div style="width:100%;aspect-ratio:1/1;display:flex;align-items:center;'
+                'justify-content:center;background:#F3F4F6;color:#9CA3AF;'
+                'border-radius:8px;font-size:12px;">No Photo</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Grade badge
+        st.markdown(
+            f'<span style="display:inline-block;background:{badge_bg};color:{badge_fg};'
+            f'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;">{grade_text}</span>',
+            unsafe_allow_html=True,
+        )
+
+        # ID + gender + variety
+        st.markdown(f"**{system_id}** · {gender_sym} {fish.get('variety') or '—'}")
+
+        # Badges row
+        badges = []
+        if milestone_count:
+            badges.append(f"📸 {milestone_count}")
+        if age_text and age_text != "—":
+            badges.append(f"🗓 {age_text}")
+        if is_culled:
+            badges.append("⛔ Culled")
+        if fish.get("location"):
+            badges.append(f"🪣 {fish['location']}")
+        if badges:
+            st.caption(" · ".join(badges))
+
+        # Quick actions (kept minimal for tile)
+        with st.popover("⚙️ Manage", use_container_width=True):
+            _render_card_actions(fish)
+
+        with st.popover("📸 Milestones" + (f" ({milestone_count})" if milestone_count else ""), use_container_width=True):
+            milestones = get_milestones_for_fish(fish["id"])
+            _render_milestones_section(fish, milestones)
+
+
+# ============================================================
+# TABLE VIEW
+# ============================================================
+
+def _render_table_view(filtered: list[dict], milestone_counts: dict):
+    """Dense table view for power users."""
+    rows = []
+    for f in filtered:
+        age_days = get_fish_age_days(f)
+        rows.append({
+            "ID": f.get("system_id") or "?",
+            "Gender": f.get("gender") or "—",
+            "Variety": f.get("variety") or "—",
+            "Grade": f.get("grade") or "—",
+            "Line": f.get("line_code") or "—",
+            "Gen": f.get("generation") or "—",
+            "Location": f.get("location") or "—",
+            "Status": f.get("status") or "—",
+            "Age": format_fish_age(age_days),
+            "Milestones": milestone_counts.get(f["id"], 0),
+        })
+
+    st.dataframe(
+        rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Milestones": st.column_config.NumberColumn("📸", width="small"),
+            "Age": st.column_config.TextColumn("Age", width="small"),
+        },
+    )
+    st.caption("💡 Tip: use the Grid view for photo browsing. Table view is best for finding a specific fish fast.")
+
+
+# ============================================================
+# LIST TAB (MAIN)
+# ============================================================
+
+CARD_PAGE_SIZE = 15
+
 
 def render_list_tab():
     st.subheader("📋 Registered Fish Database")
@@ -673,29 +832,55 @@ def render_list_tab():
         st.info("No fish registered yet. Use the Register tab to add your first fish.")
         return
 
-    # Fast milestone count lookup
     milestone_counts = get_milestone_counts_by_fish()
 
+    # ---- Metrics ----
+    alive = [
+        f for f in all_fish
+        if (f.get("status") or "").lower() not in ("culled", "deceased")
+    ]
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Fish", len(all_fish))
-    m2.metric("Males", sum(1 for f in all_fish if (f.get("gender") or "").lower() == "male"))
-    m3.metric("Females", sum(1 for f in all_fish if (f.get("gender") or "").lower() == "female"))
-    m4.metric(
-        "Show/High Grade",
-        sum(1 for f in all_fish if f.get("grade") in ("Show Grade", "High Grade")),
-    )
+    m2.metric("Alive", len(alive))
+    m3.metric("Males", sum(1 for f in alive if (f.get("gender") or "").lower() == "male"))
+    m4.metric("Females", sum(1 for f in alive if (f.get("gender") or "").lower() == "female"))
 
     st.divider()
 
-    st.markdown("##### 🔍 Filter Database")
-    f_col1, f_col2, f_col3 = st.columns(3)
-    with f_col1:
-        gender_filter = st.multiselect("Gender", options=sorted({f.get("gender") for f in all_fish if f.get("gender")}))
-    with f_col2:
-        grade_filter = st.multiselect("Grade", options=sorted({f.get("grade") for f in all_fish if f.get("grade")}))
-    with f_col3:
-        variety_filter = st.multiselect("Variety", options=sorted({f.get("variety") for f in all_fish if f.get("variety")}))
+    # ---- Highlight Strip ----
+    _render_highlight_strip(all_fish, milestone_counts)
 
+    # ---- Filters ----
+    st.markdown("##### 🔍 Filter Database")
+    f_col1, f_col2, f_col3, f_col4 = st.columns(4)
+
+    with f_col1:
+        gender_filter = st.multiselect(
+            "Gender",
+            options=sorted({f.get("gender") for f in all_fish if f.get("gender")}),
+        )
+    with f_col2:
+        grade_filter = st.multiselect(
+            "Grade",
+            options=sorted({f.get("grade") for f in all_fish if f.get("grade")}),
+        )
+    with f_col3:
+        variety_filter = st.multiselect(
+            "Variety",
+            options=sorted({f.get("variety") for f in all_fish if f.get("variety")}),
+        )
+    with f_col4:
+        hide_culled = st.checkbox("Hide culled & deceased", value=True)
+
+    # ---- View toggle ----
+    view_mode = st.radio(
+        "View",
+        options=["🎨 Grid", "📊 Table"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    # ---- Apply filters ----
     filtered = all_fish
     if gender_filter:
         filtered = [f for f in filtered if f.get("gender") in gender_filter]
@@ -703,45 +888,7 @@ def render_list_tab():
         filtered = [f for f in filtered if f.get("grade") in grade_filter]
     if variety_filter:
         filtered = [f for f in filtered if f.get("variety") in variety_filter]
-
-    st.caption(f"Showing {len(filtered)} of {len(all_fish)} fish.")
-    st.markdown("---")
-
-    if not filtered:
-        st.warning("No fish match the current filters.")
-        return
-
-    total_pages = max(1, (len(filtered) + CARD_PAGE_SIZE - 1) // CARD_PAGE_SIZE)
-    if total_pages > 1:
-        page = st.number_input(
-            f"Page (1–{total_pages})",
-            min_value=1, max_value=total_pages, value=1, step=1,
-            key="fish_page_number",
-        )
-    else:
-        page = 1
-
-    start = (page - 1) * CARD_PAGE_SIZE
-    page_items = filtered[start : start + CARD_PAGE_SIZE]
-
-    cols = st.columns(2)
-    for idx, fish in enumerate(page_items):
-        with cols[idx % 2]:
-            _render_fish_card(fish, milestone_count=milestone_counts.get(fish["id"], 0))
-
-
-# ============================================================
-# PAGE
-# ============================================================
-
-def render_fish_registry_page():
-    st.header("🐠 Fish Master Registry")
-    st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
-
-    tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
-
-    with tab_register:
-        render_register_tab()
-
-    with tab_view:
-        render_list_tab()
+    if hide_culled:
+        filtered = [
+            f for f in filtered
+            if (f.get("status") or "").lower() not in
