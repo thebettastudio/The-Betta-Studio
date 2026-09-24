@@ -895,4 +895,29 @@ def render_list_tab():
             key="fish_page_number",
         )
     else:
-       
+        page = 1
+
+    start = (page - 1) * CARD_PAGE_SIZE
+    page_items = filtered[start : start + CARD_PAGE_SIZE]
+
+    cols = st.columns(3)
+    for idx, fish in enumerate(page_items):
+        with cols[idx % 3]:
+            _render_grid_tile(fish, milestone_count=milestone_counts.get(fish["id"], 0))
+
+
+# ============================================================
+# PAGE
+# ============================================================
+
+def render_fish_registry_page():
+    st.header("🐠 Fish Master Registry")
+    st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
+
+    tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
+
+    with tab_register:
+        render_register_tab()
+
+    with tab_view:
+        render_list_tab()
