@@ -3,6 +3,7 @@
 # Session 12 — Ported to Supabase via spawn_manager, fish_manager,
 # tank_registry, database, photo_service.
 # Session 19 — Added inbreeding/lineage check to the pairing screen.
+# Session 24B — Show computed batch outcome in History + Active cards.
 
 import datetime
 from typing import Optional
@@ -33,6 +34,12 @@ from modules.tank_registry import (
 from modules.id_generator import calculate_child_lineage, generate_spawn_code
 from modules.lineage import check_inbreeding
 from modules.photo_service import photo_url
+from modules.spawn_outcome import (
+    compute_spawn_outcome,
+    compute_all_spawn_outcomes,
+    verdict_badge_html,
+    grade_breakdown_short,
+)
 
 
 # ============================================================
@@ -88,6 +95,54 @@ def _default_batch_name(spawn: dict) -> str:
     else:
         base = line
     return f"{base}-{gen}" if gen else base
+
+
+# ============================================================
+# OUTCOME PANEL (Session 24B)
+# ============================================================
+
+def _render_outcome_panel(outcome: dict):
+    """
+    Renders the computed batch outcome as a compact panel.
+    Used in Active Pairing cards and expandable in History.
+    """
+    verdict_key = outcome.get("verdict_key", "unknown")
+    verdict_icon = outcome.get("verdict_icon", "—")
+    verdict_reason = outcome.get("verdict_reason", "")
+    jarred = outcome.get("jarred_count", 0)
+    culled = outcome.get("culled_count", 0)
+    females = outcome.get("female_count", 0)
+    avg_score = outcome.get("avg_form_score")
+    breakdown = grade_breakdown_short(outcome)
+    best = outcome.get("best_fish")
+
+    st.markdown("**📊 Batch Outcome**")
+    st.markdown(
+        f'{verdict_badge_html(outcome)} &nbsp; <span style="color:#6B7280;'
+        f'font-size:13px;">{verdict_reason}</span>',
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Jarred", jarred)
+    col2.metric("Culled", culled)
+    col3.metric("Females", females)
+    col4.metric("Avg Form", f"{avg_score:.0f}" if avg_score is not None else "—")
+
+    if breakdown and breakdown != "—":
+        st.caption(f"**Grades:** {breakdown}")
+
+    if best:
+        st.caption(
+            f"🏆 Best: `{best.get('system_id') or '?'}` "
+            f"({best.get('grade') or '—'})"
+        )
+
+    if verdict_key in ("pending", "unknown"):
+        st.caption(
+            "💡 Jar fry and cull fish to populate this outcome — it's "
+            "computed from your existing data."
+        )
 
 
 # ============================================================
@@ -180,7 +235,7 @@ def _render_edit_popover(spawn: dict):
                 st.error("Failed to update spawn.")
 
 
-def _render_active_pairing_card(item: dict):
+def _render_active_pairing_card(item: dict, outcome: Optional[dict] = None):
     spawn = item["spawn"]
     male = item["male"]
     female = item["female"]
@@ -211,6 +266,11 @@ def _render_active_pairing_card(item: dict):
         if spawn.get("notes"):
             st.info(f"**Notes:** {spawn['notes']}")
 
+        # Show outcome panel if there's anything to show
+        if outcome and outcome.get("verdict_key") not in ("unknown",):
+            st.divider()
+            _render_outcome_panel(outcome)
+
         st.divider()
 
         col_male, col_female = st.columns(2)
@@ -238,8 +298,13 @@ def render_active_pairings_tab():
         st.info("No active pairings. Start one in the 'Start New Pairing' tab.")
         return
 
+    # Precompute outcomes for active spawns
+    outcome_map = compute_all_spawn_outcomes()
+
     for item in active:
-        _render_active_pairing_card(item)
+        spawn_uuid = item["spawn"]["id"]
+        outcome = outcome_map.get(spawn_uuid)
+        _render_active_pairing_card(item, outcome=outcome)
 
 
 # ============================================================
@@ -247,17 +312,13 @@ def render_active_pairings_tab():
 # ============================================================
 
 def _render_lineage_check(male_uuid: str, female_uuid: str) -> dict:
-    """
-    Render the lineage check panel.
-    Returns the check result dict so the caller can decide whether to block.
-    """
+    """Render the lineage check panel. Returns the check result dict."""
     result = check_inbreeding(male_uuid, female_uuid)
     level = result.get("level", "clear")
     icon = result.get("icon", "🟢")
     label = result.get("label", "Clear")
     summary = result.get("summary", "")
 
-    # Pick a Streamlit call for the visual style
     body = f"**{icon} Lineage check: {label}**  \n{summary}"
 
     if level == "clear":
@@ -266,10 +327,9 @@ def _render_lineage_check(male_uuid: str, female_uuid: str) -> dict:
         st.info(body)
     elif level == "caution":
         st.warning(body)
-    else:  # risky or dangerous
+    else:
         st.error(body)
 
-    # Details expander if there are shared ancestors
     shared = result.get("shared") or []
     if shared:
         with st.expander(f"🔍 Shared ancestors ({len(shared)})"):
@@ -290,7 +350,6 @@ def _render_lineage_check(male_uuid: str, female_uuid: str) -> dict:
 def render_start_pairing_tab():
     st.subheader("Pair Male & Female Breeder")
 
-    # --- Build breeder dropdowns ---
     from database import get_all_fish
     all_fish = get_all_fish()
 
@@ -299,7 +358,7 @@ def render_start_pairing_tab():
         if not f.get("system_id"):
             continue
         status = (f.get("status") or "").lower()
-        if status in ("deceased", "sold", "retired"):
+        if status in ("deceased", "sold", "retired", "culled"):
             continue
         gender = (f.get("gender") or "").lower()
         item = {
@@ -311,7 +370,6 @@ def render_start_pairing_tab():
         elif gender == "female":
             females_dd.append(item)
 
-    # --- Tank dropdown (available spawning tanks) ---
     tank_dd = get_tank_dropdown_items(purpose="Spawning")
 
     if not males_dd or not females_dd:
@@ -352,10 +410,8 @@ def render_start_pairing_tab():
             placeholder="e.g. Improve caudal spread & clean dorsal",
         )
 
-    # --- Lineage / inbreeding check ---
     lineage_result = _render_lineage_check(male_uuid, female_uuid)
 
-    # --- Live preview of line/gen/spawn_id ---
     male_fish = next((f for f in all_fish if f["id"] == male_uuid), None)
     female_fish = next((f for f in all_fish if f["id"] == female_uuid), None)
 
@@ -379,7 +435,6 @@ def render_start_pairing_tab():
         placeholder="e.g. Both pre-conditioned for 7 days on bloodworms",
     )
 
-    # --- Dangerous pairs require confirmation ---
     dangerous = lineage_result.get("level") == "dangerous"
     confirm_dangerous = True
     if dangerous:
@@ -426,11 +481,30 @@ def render_history_tab():
         st.info("No spawn history recorded yet.")
         return
 
+    # Precompute outcomes for all spawns in one pass
+    outcome_map = compute_all_spawn_outcomes()
+
     rows = []
     for it in items:
         s = it["spawn"]
         male = it.get("male")
         female = it.get("female")
+        spawn_uuid = s["id"]
+        outcome = outcome_map.get(spawn_uuid) or {}
+
+        # Verdict + jarred + culled + avg score from outcome
+        v_key = outcome.get("verdict_key", "unknown")
+        v_icon = outcome.get("verdict_icon", "—")
+        v_label = {
+            "excellent": "Excellent",
+            "solid": "Solid",
+            "mixed": "Mixed",
+            "weak": "Weak",
+            "failed": "Failed",
+            "pending": "Pending",
+            "unknown": "—",
+        }.get(v_key, "—")
+
         rows.append({
             "Spawn ID": s.get("system_id") or "?",
             "Code": s.get("spawn_code") or "",
@@ -443,14 +517,39 @@ def render_history_tab():
             "Batch": s.get("batch_name") or "",
             "Free Swim": s.get("free_swimming_date") or "",
             "Fry (est)": s.get("estimated_fry_count") or 0,
-            "Fry (final)": s.get("fry_count") or 0,
+            "Jarred": outcome.get("jarred_count", 0),
+            "Culled": outcome.get("culled_count", 0),
+            "Females": outcome.get("female_count", 0),
+            "Avg Score": (
+                round(outcome.get("avg_form_score") or 0)
+                if outcome.get("avg_form_score") is not None else "—"
+            ),
+            "Grades": grade_breakdown_short(outcome),
+            "Verdict": f"{v_icon} {v_label}",
             "Tank": it.get("tank_location") or "Unassigned",
-            "Goal": s.get("line_goal") or "",
             "Notes": s.get("notes") or "",
         })
 
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # Below the table: expandable full outcome per spawn
+    st.markdown("---")
+    st.markdown("##### 📊 Full Outcome Details")
+    st.caption("Click any spawn to see grade breakdown, best fish, and verdict reasoning.")
+
+    for it in items:
+        s = it["spawn"]
+        spawn_uuid = s["id"]
+        outcome = outcome_map.get(spawn_uuid) or {}
+        system_id = s.get("system_id") or "?"
+
+        # Skip spawns with nothing to show
+        if outcome.get("verdict_key") in ("unknown",):
+            continue
+
+        with st.expander(f"🧪 {system_id} — {outcome.get('verdict_icon', '')} {outcome.get('verdict_reason', '')}"):
+            _render_outcome_panel(outcome)
 
 
 # ============================================================
