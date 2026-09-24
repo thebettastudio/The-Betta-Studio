@@ -1,7 +1,6 @@
 # views/webrtc_test.py
 # Session 26B — Minimal WebRTC test page.
-# Proves the camera stream works before integrating with color analysis.
-# DELETE this file after Session 26B is confirmed working.
+# Session 26B fix — Poll ctx.state for live stats + manual refresh.
 
 import time
 import streamlit as st
@@ -14,27 +13,33 @@ try:
 except ImportError:
     _WEBRTC_AVAILABLE = False
 
-import av
+try:
+    import av
+    _AV_AVAILABLE = True
+except ImportError:
+    _AV_AVAILABLE = False
 
 
 class FrameSampler(VideoProcessorBase):
     """
-    Samples frames from the WebRTC stream and stores them in memory.
-    Records frame count + timestamps.
+    Samples frames from the WebRTC stream.
+    Stores frame count, last frame, and up to 100 sampled frames.
     """
     def __init__(self):
         self.last_frame = None
         self.frame_count = 0
         self.start_time = time.time()
-        self.samples = []  # list of (numpy array, timestamp)
+        self.samples = []
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="rgb24")
-        self.last_frame = img
-        self.frame_count += 1
-        # Sample 1 frame per ~10 frames to save memory
-        if self.frame_count % 10 == 0 and len(self.samples) < 100:
-            self.samples.append((img, time.time()))
+    def recv(self, frame):
+        try:
+            img = frame.to_ndarray(format="rgb24")
+            self.last_frame = img
+            self.frame_count += 1
+            if self.frame_count % 10 == 0 and len(self.samples) < 100:
+                self.samples.append((img, time.time()))
+        except Exception as e:
+            print(f"recv error: {e}")
         return frame
 
 
@@ -46,14 +51,17 @@ def render_webrtc_test():
         st.error("streamlit-webrtc not installed. Run: `py -m pip install streamlit-webrtc av`")
         return
 
+    if not _AV_AVAILABLE:
+        st.error("av (PyAV) not installed. Run: `py -m pip install av`")
+        return
+
     st.markdown("### Instructions")
     st.markdown(
         "1. Click **START** below\n"
         "2. Browser will ask for camera permission — **Allow once**\n"
         "3. You should see a live camera preview\n"
-        "4. Move around, verify video is smooth\n"
-        "5. Click **STOP** to end the stream\n"
-        "6. Frame stats appear below"
+        "4. Click **🔄 Refresh stats** to see the frame count\n"
+        "5. Click **STOP** to end the stream"
     )
 
     ctx = webrtc_streamer(
@@ -67,20 +75,37 @@ def render_webrtc_test():
         async_processing=True,
     )
 
-    # Live stats
+    st.markdown("---")
+    st.markdown("### 📊 Stream Status")
+
+    # Connection state (always fresh)
+    if ctx.state.playing:
+        st.success("✅ Stream is PLAYING")
+    else:
+        st.info("⏸ Stream is stopped — click START above")
+
+    # Manual refresh button
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("🔄 Refresh stats", use_container_width=True):
+            st.rerun()
+    with col2:
+        st.caption("Frame count updates only when you click Refresh (Streamlit limitation).")
+
+    # Frame stats from the video processor
     if ctx.video_processor:
-        st.success(f"✅ Camera connected — frames received: **{ctx.video_processor.frame_count}**")
+        vp = ctx.video_processor
+        st.metric("Frames received", vp.frame_count)
 
-        if ctx.video_processor.last_frame is not None:
+        if vp.last_frame is not None:
             st.markdown("**Last captured frame:**")
-            st.image(ctx.video_processor.last_frame, width=320)
+            st.image(vp.last_frame, width=320)
 
-            # Test: run simple color detection on this frame
+            # Run color detector on the last frame
             from modules.color_detector import analyze_photo
             import io
 
-            # Convert numpy RGB to JPEG bytes for the detector
-            pil_img = Image.fromarray(ctx.video_processor.last_frame)
+            pil_img = Image.fromarray(vp.last_frame)
             buf = io.BytesIO()
             pil_img.save(buf, format="JPEG", quality=85)
             raw_bytes = buf.getvalue()
@@ -97,8 +122,10 @@ def render_webrtc_test():
                 else:
                     err = (analysis or {}).get("error", "unknown")
                     st.warning(f"Analysis failed: {err}")
+        else:
+            st.caption("No frame captured yet — the callback may not have run.")
     else:
-        st.info("Click **START** to begin camera stream.")
+        st.caption("Waiting for stream to start...")
 
 
 def render_webrtc_test_page():
@@ -106,6 +133,5 @@ def render_webrtc_test_page():
     render_webrtc_test()
 
 
-# Direct call for testing when running this file standalone:
 if __name__ == "__main__":
     render_webrtc_test()
