@@ -14,4 +14,4 @@ qrcode[pil]
 pillow-heif
 streamlit-cropper
 scipy
-
+streamlit-image-coordinates
