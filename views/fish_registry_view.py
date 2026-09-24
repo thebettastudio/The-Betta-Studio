@@ -5,6 +5,7 @@
 # Session 16 — Added "View Lineage" button on each fish card.
 # Session 18 — Strains fully DB-managed (no more hardcoded defaults).
 # Session 20 — Added milestone tracking section on each fish card.
+# Session 22 — Added "Cull Fish" button with reason picker.
 
 import io
 import datetime
@@ -33,8 +34,11 @@ from modules.fish_manager import (
     edit_fish,
     delete_fish_and_photos,
     promote_to_breeder,
+    cull_fish,
+    restore_fish_from_culled,
     VALID_GRADES,
     VALID_GENDERS,
+    CULL_REASONS,
     _fish_label,
 )
 from modules.tank_registry import (
@@ -562,6 +566,7 @@ def _render_fish_card(fish: dict, milestone_count: int = 0):
 def _render_card_actions(fish: dict):
     fish_uuid = fish["id"]
     system_id = fish.get("system_id") or "?"
+    current_status = (fish.get("status") or "").lower()
 
     # Lineage shortcut
     if st.button("🌳 View Lineage", key=f"lineage_{fish_uuid}", use_container_width=True):
@@ -569,31 +574,75 @@ def _render_card_actions(fish: dict):
         st.toast(f"Selected {system_id}. Open the Lineage page to view the tree.")
 
     # Promote to breeder
-    if not fish.get("is_breeder") and fish.get("status") not in ("Sold", "Deceased", "Retired"):
+    if not fish.get("is_breeder") and current_status not in ("sold", "deceased", "retired", "culled"):
         if st.button("⭐ Promote to Breeder", key=f"promote_{fish_uuid}", use_container_width=True):
             if promote_to_breeder(fish_uuid):
                 st.success(f"{system_id} promoted to breeder.")
                 st.rerun()
 
-    # Move tank
-    tank_opts = _get_available_tank_options()
-    if tank_opts:
-        dd = [{"id": None, "label": "— Leave / Clear Tank —"}] + tank_opts
-        selected_idx = st.selectbox(
-            "Move to Tank",
-            options=range(len(dd)),
-            format_func=lambda i: dd[i]["label"],
-            key=f"move_tank_{fish_uuid}",
-        )
-        new_tank_id = dd[selected_idx]["id"]
+    # Cull / Restore
+    if current_status == "culled":
+        with st.popover("↩️ Restore from Culled", use_container_width=True):
+            st.markdown("**Restore this fish?**")
+            st.caption("Sets status back to Active. Adds a note.")
+            restore_status = st.selectbox(
+                "Restore to status",
+                options=["Active", "Jarred", "For Sale"],
+                key=f"restore_status_{fish_uuid}",
+            )
+            if st.button("Confirm Restore", key=f"restore_btn_{fish_uuid}", type="primary", use_container_width=True):
+                if restore_fish_from_culled(fish_uuid, new_status=restore_status):
+                    st.success(f"{system_id} restored.")
+                    st.rerun()
+    else:
+        with st.popover("🚫 Cull Fish", use_container_width=True):
+            st.markdown("**Cull this fish**")
+            st.caption("Marks as culled, frees its tank, and logs the reason.")
+            cull_reason = st.selectbox(
+                "Reason",
+                options=CULL_REASONS,
+                key=f"cull_reason_{fish_uuid}",
+            )
+            cull_notes = st.text_area(
+                "Additional notes (optional)",
+                placeholder="e.g. Curled ventral fins, poor appetite since day 10",
+                key=f"cull_notes_{fish_uuid}",
+            )
+            confirm_cull = st.checkbox(
+                "I understand — cull this fish.",
+                key=f"cull_confirm_{fish_uuid}",
+            )
+            if st.button(
+                "Confirm Cull",
+                key=f"cull_btn_{fish_uuid}",
+                type="primary",
+                use_container_width=True,
+                disabled=not confirm_cull,
+            ):
+                if cull_fish(fish_uuid, reason=cull_reason, notes=cull_notes):
+                    st.success(f"{system_id} culled.")
+                    st.rerun()
 
-        if st.button("📦 Apply Move", key=f"apply_move_{fish_uuid}", use_container_width=True):
-            if fish.get("tank_id"):
-                unassign_tank(fish["tank_id"])
-            if new_tank_id:
-                assign_fish_to_tank(new_tank_id, fish_uuid)
-            st.success("Location updated.")
-            st.rerun()
+    # Move tank — only if not culled/deceased/retired
+    if current_status not in ("culled", "deceased", "retired"):
+        tank_opts = _get_available_tank_options()
+        if tank_opts:
+            dd = [{"id": None, "label": "— Leave / Clear Tank —"}] + tank_opts
+            selected_idx = st.selectbox(
+                "Move to Tank",
+                options=range(len(dd)),
+                format_func=lambda i: dd[i]["label"],
+                key=f"move_tank_{fish_uuid}",
+            )
+            new_tank_id = dd[selected_idx]["id"]
+
+            if st.button("📦 Apply Move", key=f"apply_move_{fish_uuid}", use_container_width=True):
+                if fish.get("tank_id"):
+                    unassign_tank(fish["tank_id"])
+                if new_tank_id:
+                    assign_fish_to_tank(new_tank_id, fish_uuid)
+                st.success("Location updated.")
+                st.rerun()
 
     # Delete
     st.divider()
