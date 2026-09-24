@@ -4,6 +4,7 @@
 # Session 11 — added delete_strain().
 # Session 15 — added fry batch read/delete helpers.
 # Session 20 — added fish_milestones CRUD.
+# Session 22 — added culled_count + female_count to FRY_BATCH_FIELDS.
 
 from __future__ import annotations
 
@@ -424,7 +425,8 @@ def get_activity_log(limit: int = 200) -> list[dict]:
 
 FRY_BATCH_FIELDS = [
     "batch_tag", "batch_code", "spawn_id", "hatch_date", "jarring_date",
-    "initial_count", "current_count", "stage", "tank_id", "notes",
+    "initial_count", "current_count", "culled_count", "female_count",
+    "stage", "tank_id", "notes",
 ]
 
 
