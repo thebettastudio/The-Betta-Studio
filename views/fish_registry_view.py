@@ -9,7 +9,7 @@
 # Session 23 — Rewrote fish list: Visual Grid + Table toggle + Highlight strip.
 # Session 23b — Uniform 4:3 rounded images in grid tiles.
 # Session 24A — Added photo cropper UI (4:3) at upload time.
-# Session 24A fix — Auto-save crop on every render (removed Save button + rerun loop).
+# Session 24A fix — Auto-save crop on every render; clear form after successful save.
 
 import io
 import datetime
@@ -163,8 +163,6 @@ def _render_cropper_ui(raw_bytes: bytes, key_prefix: str) -> Optional[bytes]:
     """
     Renders the crop UI. Returns the current cropped bytes on every render
     (auto-saves on every rerun). Returns None if cropper unavailable.
-
-    The "Skip (auto center-crop)" button returns an auto-cropped version.
     """
     if not _CROPPER_AVAILABLE:
         return None
@@ -284,6 +282,9 @@ def render_register_tab():
     next_id = generate_fish_id()
     st.info(f"📌 Next Assigned Fish ID: **#{next_id}**")
 
+    # Version counter — bump after successful save to reset all form widgets
+    form_version = st.session_state.get("reg_form_version", 0)
+
     strains_list = _get_strain_names()
 
     strain_col_select, strain_col_btn = st.columns([4, 1])
@@ -297,9 +298,9 @@ def render_register_tab():
                 new_strain_val = st.text_input(
                     "Strain Name",
                     placeholder="e.g. Copper Blue Star",
-                    key="new_strain_input",
+                    key=f"new_strain_input_{form_version}",
                 ).strip()
-                if st.button("Save Strain", use_container_width=True, type="primary", key="btn_add_strain"):
+                if st.button("Save Strain", use_container_width=True, type="primary", key=f"btn_add_strain_{form_version}"):
                     if new_strain_val:
                         if _add_strain(new_strain_val):
                             st.session_state["selected_strain"] = new_strain_val
@@ -313,9 +314,9 @@ def render_register_tab():
                     strain_to_delete = st.selectbox(
                         "Select Strain to Delete",
                         options=strains_list,
-                        key="select_strain_to_delete",
+                        key=f"select_strain_to_delete_{form_version}",
                     )
-                    if st.button("Delete Strain", use_container_width=True, type="primary", key="btn_delete_strain"):
+                    if st.button("Delete Strain", use_container_width=True, type="primary", key=f"btn_delete_strain_{form_version}"):
                         _delete_strain(strain_to_delete)
                         if st.session_state.get("selected_strain") == strain_to_delete:
                             st.session_state.pop("selected_strain", None)
@@ -332,7 +333,7 @@ def render_register_tab():
             "Select Strain",
             options=strains_list if strains_list else ["No Strains Available"],
             index=default_index if strains_list else 0,
-            key="select_strain_dropdown",
+            key=f"select_strain_dropdown_{form_version}",
         )
 
     # ============================================================
@@ -341,12 +342,13 @@ def render_register_tab():
     st.markdown("##### 📷 Fish Photo Capture / Upload")
     img_col1, img_col2 = st.columns(2)
     with img_col1:
-        camera_photo = st.camera_input("Take a Live Photo of Fish")
+        camera_photo = st.camera_input("Take a Live Photo of Fish", key=f"cam_{form_version}")
     with img_col2:
         uploaded_photo = st.file_uploader(
             "Or Upload Photo File",
             type=["jpg", "jpeg", "png", "heic", "heif"],
             help="Supports iPhone HEIC and standard JPEG/PNG.",
+            key=f"upl_{form_version}",
         )
 
     if camera_photo is not None:
@@ -358,37 +360,52 @@ def render_register_tab():
 
     raw_bytes = st.session_state.get("fish_photo_raw")
 
-    # Crop step — auto-save on every render
     if raw_bytes and not st.session_state.get("fish_photo_bytes"):
-        cropped_bytes = _render_cropper_ui(raw_bytes, key_prefix="fish_reg")
+        cropped_bytes = _render_cropper_ui(raw_bytes, key_prefix=f"fish_reg_{form_version}")
         if cropped_bytes:
             st.session_state["fish_photo_bytes"] = cropped_bytes
 
-    # Preview the final (cropped) photo
     if st.session_state.get("fish_photo_bytes"):
         try:
             preview_img = Image.open(io.BytesIO(st.session_state["fish_photo_bytes"]))
             st.markdown("**Final photo (as it will appear in grid):**")
             st.image(preview_img, caption="Cropped to 4:3", width=320)
-            if st.button("🔄 Re-crop photo", key="recrop_fish"):
+            if st.button("🔄 Re-crop photo", key=f"recrop_fish_{form_version}"):
                 st.session_state.pop("fish_photo_bytes", None)
                 st.rerun()
         except Exception:
             pass
 
     # ============================================================
-    # Main registration form
+    # Main registration form (keys include form_version so they reset)
     # ============================================================
-    with st.form("register_fish_form", clear_on_submit=False):
+    with st.form(f"register_fish_form_{form_version}", clear_on_submit=False):
         col1, col2 = st.columns(2)
 
         with col1:
             st.markdown("##### 🧬 Variety & Details")
-            form_type = st.text_input("Form / Type", value="HMPK", help="e.g. HMPK, HM, PK, CT")
-            gender = st.selectbox("Gender", VALID_GENDERS)
-            seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder")
-            purchase_date = st.date_input("Purchase Date", datetime.date.today())
-            purchase_cost = st.number_input("Purchase Cost (₱)", min_value=0.0, value=0.0, step=50.0)
+            form_type = st.text_input(
+                "Form / Type",
+                value="HMPK",
+                help="e.g. HMPK, HM, PK, CT",
+                key=f"form_type_{form_version}",
+            )
+            gender = st.selectbox("Gender", VALID_GENDERS, key=f"gender_{form_version}")
+            seller = st.text_input(
+                "Seller / Source",
+                placeholder="e.g. Aquarama Import / Local Breeder",
+                key=f"seller_{form_version}",
+            )
+            purchase_date = st.date_input(
+                "Purchase Date",
+                datetime.date.today(),
+                key=f"pdate_{form_version}",
+            )
+            purchase_cost = st.number_input(
+                "Purchase Cost (₱)",
+                min_value=0.0, value=0.0, step=50.0,
+                key=f"pcost_{form_version}",
+            )
 
         with col2:
             st.markdown("##### 🪣 Tank & Container Assignment")
@@ -396,7 +413,11 @@ def render_register_tab():
             tank_types = sorted({t["label"].split(" | ")[-1].rstrip(")") for t in tank_opts})
             type_filter_options = ["All Types"] + tank_types
 
-            selected_type_filter = st.selectbox("Filter Tank Type", options=type_filter_options)
+            selected_type_filter = st.selectbox(
+                "Filter Tank Type",
+                options=type_filter_options,
+                key=f"ttype_{form_version}",
+            )
 
             if selected_type_filter != "All Types":
                 filtered = [t for t in tank_opts if selected_type_filter in t["label"]]
@@ -408,6 +429,7 @@ def render_register_tab():
                 "Select Available Tank / Jar Location",
                 options=range(len(tank_dropdown)),
                 format_func=lambda i: tank_dropdown[i]["label"],
+                key=f"tank_sel_{form_version}",
             )
             selected_tank_id = tank_dropdown[selected_tank_idx]["id"]
 
@@ -416,12 +438,12 @@ def render_register_tab():
 
         chk_col, shape_col = st.columns([3, 2])
         with chk_col:
-            caudal_spread = st.checkbox("Caudal Fin Spread 180°", value=True)
-            caudal_prop   = st.checkbox("Caudal Fin Proportion (Good branching, no damage)", value=True)
-            dorsal_struct = st.checkbox("Dorsal Fin Structure (Broad base & clean overlapping)", value=True)
-            anal_struct   = st.checkbox("Anal Fin Structure (Parallel & proper length)", value=True)
-            ventral_fins  = st.checkbox("Ventral Fins (Straight, broad, no curl)", value=True)
-            pectoral_fins = st.checkbox("Pectoral Fins (Full & undamaged)", value=True)
+            caudal_spread = st.checkbox("Caudal Fin Spread 180°", value=True, key=f"cs_{form_version}")
+            caudal_prop   = st.checkbox("Caudal Fin Proportion (Good branching, no damage)", value=True, key=f"cp_{form_version}")
+            dorsal_struct = st.checkbox("Dorsal Fin Structure (Broad base & clean overlapping)", value=True, key=f"ds_{form_version}")
+            anal_struct   = st.checkbox("Anal Fin Structure (Parallel & proper length)", value=True, key=f"as_{form_version}")
+            ventral_fins  = st.checkbox("Ventral Fins (Straight, broad, no curl)", value=True, key=f"vf_{form_version}")
+            pectoral_fins = st.checkbox("Pectoral Fins (Full & undamaged)", value=True, key=f"pf_{form_version}")
 
         with shape_col:
             body_shape = st.selectbox(
@@ -429,6 +451,7 @@ def render_register_tab():
                 options=["Bullet Head", "Regular", "Spoonhead"],
                 index=0,
                 help="Select the head profile/body shape structure.",
+                key=f"bs_{form_version}",
             )
 
         evaluation_checks = {
@@ -447,10 +470,12 @@ def render_register_tab():
         manual_image_id = st.text_input(
             "Or Paste Existing Drive ID",
             placeholder="Paste raw Drive file ID (not a URL)",
+            key=f"manual_img_{form_version}",
         )
         notes = st.text_area(
             "Notes / Characteristics",
             placeholder="e.g. Strong dorsal, solid iridescence, aggressive disposition",
+            key=f"notes_{form_version}",
         )
 
         submit = st.form_submit_button("💾 Register Fish", use_container_width=True)
@@ -506,12 +531,15 @@ def render_register_tab():
     if selected_tank_id:
         assign_fish_to_tank(selected_tank_id, result["id"])
 
+    # Clear photo + bump form version so all inputs reset on next render
     st.session_state.pop("fish_photo_bytes", None)
     st.session_state.pop("fish_photo_raw", None)
+    st.session_state["reg_form_version"] = form_version + 1
 
     st.balloons()
     st.success(
-        f"🎉 Fish **#{result.get('system_id')}** ({selected_strain}) registered!"
+        f"🎉 Fish **#{result.get('system_id')}** ({selected_strain}) registered! "
+        f"Form reset for next entry."
     )
     st.rerun()
 
@@ -540,7 +568,6 @@ def _render_milestone_add_form(fish: dict):
 
     raw = st.session_state.get(f"{crop_key}_raw")
 
-    # Crop step — auto-save on every render
     if raw and not st.session_state.get(f"{crop_key}_cropped"):
         cropped = _render_cropper_ui(raw, key_prefix=crop_key)
         if cropped:
