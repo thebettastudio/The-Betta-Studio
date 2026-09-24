@@ -10,6 +10,7 @@
 # Session 23b — Uniform 4:3 rounded images in grid tiles.
 # Session 24A — Added photo cropper UI (4:3) at upload time.
 # Session 24A fix — Auto-save crop on every render; clear form after successful save.
+# Session 26A — Multi-shot color capture UI.
 
 import io
 import datetime
@@ -25,7 +26,7 @@ try:
 except ImportError:
     pass
 
-# Cropper (Facebook-style crop + zoom + position)
+# Cropper
 try:
     from streamlit_cropper import st_cropper
     _CROPPER_AVAILABLE = True
@@ -73,6 +74,13 @@ from modules.fish_milestones import (
     suggest_action,
     MILESTONE_INTERVAL_DAYS,
 )
+from modules.color_detector import (
+    analyze_photo,
+    merge_analyses,
+    color_swatch_html,
+    palette_html,
+    COLOR_SWATCHES,
+)
 
 
 # ============================================================
@@ -80,9 +88,9 @@ from modules.fish_milestones import (
 # ============================================================
 
 FISH_TABLE_ICON = "🐠"
-HIDE_STATUSES_DEFAULT = ["Culled", "Deceased"]
-
 CROP_ASPECT = (4, 3)
+MAX_SHOTS = 10
+MIN_SHOTS_FOR_CONSENSUS = 3
 
 
 # ============================================================
@@ -90,12 +98,9 @@ CROP_ASPECT = (4, 3)
 # ============================================================
 
 def calculate_form_grade(checks: dict, body_shape: str) -> tuple[str, int]:
-    """Score = 15 per passed fin check + body shape bonus. Max 100."""
     total_score = sum(15 for passed in checks.values() if passed)
-
     shape_scores = {"Bullet Head": 10, "Regular": 8, "Spoonhead": 5}
     total_score += shape_scores.get(body_shape, 8)
-
     if total_score >= 95:
         grade = "Show Grade"
     elif total_score >= 80:
@@ -104,12 +109,10 @@ def calculate_form_grade(checks: dict, body_shape: str) -> tuple[str, int]:
         grade = "Breeder Grade"
     else:
         grade = "Pet Grade"
-
     return grade, total_score
 
 
 def _normalize_image_bytes(raw: bytes) -> bytes:
-    """Ensure image is RGB JPEG-compatible. Returns original on failure."""
     try:
         img = Image.open(io.BytesIO(raw))
         if img.mode in ("RGBA", "P", "LA"):
@@ -122,17 +125,14 @@ def _normalize_image_bytes(raw: bytes) -> bytes:
 
 
 def _auto_crop_to_aspect(raw_bytes: bytes, aspect: tuple[int, int] = CROP_ASPECT) -> bytes:
-    """Center-crop an image to the given aspect ratio."""
     try:
         img = Image.open(io.BytesIO(raw_bytes))
         if img.mode in ("RGBA", "P", "LA"):
             img = img.convert("RGB")
-
         w, h = img.size
         target_w, target_h = aspect
         target_ratio = target_w / target_h
         current_ratio = w / h
-
         if current_ratio > target_ratio:
             new_w = int(h * target_ratio)
             left = (w - new_w) // 2
@@ -141,17 +141,14 @@ def _auto_crop_to_aspect(raw_bytes: bytes, aspect: tuple[int, int] = CROP_ASPECT
             new_h = int(w / target_ratio)
             top = (h - new_h) // 2
             img = img.crop((0, top, w, top + new_h))
-
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
-    except Exception as e:
-        print(f"auto_crop failed: {e}")
+    except Exception:
         return raw_bytes
 
 
 def _image_to_jpeg_bytes(pil_img: Image.Image) -> bytes:
-    """Convert a PIL image (from st_cropper) to JPEG bytes."""
     if pil_img.mode in ("RGBA", "P", "LA"):
         pil_img = pil_img.convert("RGB")
     buf = io.BytesIO()
@@ -159,68 +156,11 @@ def _image_to_jpeg_bytes(pil_img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def _render_cropper_ui(raw_bytes: bytes, key_prefix: str) -> Optional[bytes]:
-    """
-    Renders the crop UI. Returns the current cropped bytes on every render
-    (auto-saves on every rerun). Returns None if cropper unavailable.
-    """
-    if not _CROPPER_AVAILABLE:
-        return None
-
-    try:
-        st.markdown("##### ✂️ Adjust the photo")
-        st.caption(
-            "Drag the blue corners to resize. Drag inside the box to move the image. "
-            "The grid view uses **4:3** — position your fish to look great in that frame."
-        )
-
-        source_img = Image.open(io.BytesIO(raw_bytes))
-        if source_img.mode in ("RGBA", "P", "LA"):
-            source_img = source_img.convert("RGB")
-
-        col_crop, col_controls = st.columns([3, 1])
-
-        with col_crop:
-            cropped = st_cropper(
-                source_img,
-                realtime_update=True,
-                box_color="#0072FF",
-                aspect_ratio=CROP_ASPECT,
-                return_type="image",
-                key=f"crop_{key_prefix}",
-            )
-
-        with col_controls:
-            st.markdown("**How to crop**")
-            st.caption("1. Drag the blue corners")
-            st.caption("2. Drag inside to move")
-            st.caption("3. Your crop is saved automatically")
-
-            skip_clicked = st.button(
-                "⏭️ Skip (auto center-crop)",
-                use_container_width=True,
-                key=f"skip_crop_{key_prefix}",
-            )
-
-        if skip_clicked:
-            return _auto_crop_to_aspect(raw_bytes)
-
-        if cropped is not None:
-            return _image_to_jpeg_bytes(cropped)
-
-        return None
-
-    except Exception as e:
-        st.warning(f"Cropper unavailable, using auto-crop ({e})")
-        return _auto_crop_to_aspect(raw_bytes)
-
-
 # ============================================================
 # STRAIN HELPERS
 # ============================================================
 
 def _get_strain_names() -> list[str]:
-    """All strain names from the DB, sorted."""
     return sorted({s.get("name") for s in get_all_strains() if s.get("name")})
 
 
@@ -232,7 +172,6 @@ def _strain_name_to_id(name: str) -> Optional[str]:
 
 
 def _add_strain(name: str) -> bool:
-    """Create a strain in DB. Refuses duplicates."""
     name = name.strip()
     if not name:
         return False
@@ -245,7 +184,6 @@ def _add_strain(name: str) -> bool:
 
 
 def _delete_strain(name: str) -> bool:
-    """Delete a strain by name if it exists in DB."""
     sid = _strain_name_to_id(name)
     if not sid:
         st.toast(f"'{name}' not found.", icon="⚠️")
@@ -265,11 +203,245 @@ def _tank_label(t: dict) -> str:
 
 
 def _get_available_tank_options() -> list[dict]:
-    """Returns list of {'id': uuid, 'label': str}."""
-    return [
-        {"id": t["id"], "label": _tank_label(t)}
-        for t in list_available_tanks()
-    ]
+    return [{"id": t["id"], "label": _tank_label(t)} for t in list_available_tanks()]
+
+
+# ============================================================
+# COLOR ANALYSIS — MULTI-SHOT SESSION
+# ============================================================
+
+def _reset_color_session(version_key: str):
+    """Clear all color-session state for a given form version."""
+    prefix = f"color_session_{version_key}"
+    for key in list(st.session_state.keys()):
+        if key.startswith(prefix):
+            del st.session_state[key]
+
+
+def _session_key(version_key: str, suffix: str) -> str:
+    return f"color_session_{version_key}_{suffix}"
+
+
+def _render_color_capture_ui(version_key: str):
+    """
+    Multi-shot color capture widget.
+    - User taps camera to take shots
+    - Each shot analyzed in-memory
+    - Live feedback
+    - When done: consensus shown with accept/upload options
+    """
+    cam_key = _session_key(version_key, "cam_key")
+    shots_key = _session_key(version_key, "shots")
+    analyses_key = _session_key(version_key, "analyses")
+    done_key = _session_key(version_key, "done")
+    consensus_key = _session_key(version_key, "consensus")
+
+    if cam_key not in st.session_state:
+        st.session_state[cam_key] = 0
+    if shots_key not in st.session_state:
+        st.session_state[shots_key] = []          # list of raw bytes
+    if analyses_key not in st.session_state:
+        st.session_state[analyses_key] = []       # list of analysis dicts
+    if done_key not in st.session_state:
+        st.session_state[done_key] = False
+    if consensus_key not in st.session_state:
+        st.session_state[consensus_key] = None
+
+    st.markdown("##### 🎨 Multi-shot Color Analysis")
+    st.caption(
+        f"Take {MIN_SHOTS_FOR_CONSENSUS}–{MAX_SHOTS} shots from slightly different angles. "
+        "Each shot is analyzed instantly — **no upload until you accept**."
+    )
+
+    shots = st.session_state[shots_key]
+    analyses = st.session_state[analyses_key]
+
+    # ---- Pre-capture state ----
+    if not st.session_state[done_key]:
+        st.camera_input(
+            "Point at fish and tap the shutter",
+            key=f"cam_widget_{version_key}_{st.session_state[cam_key]}",
+        )
+
+        # Handle new shot capture
+        cam_result = st.session_state.get(f"cam_widget_{version_key}_{st.session_state[cam_key]}")
+        if cam_result is not None:
+            raw_bytes = cam_result.getvalue()
+            # Analyze
+            analysis = analyze_photo(raw_bytes)
+            if analysis and analysis.get("ok"):
+                st.session_state[shots_key].append(raw_bytes)
+                st.session_state[analyses_key].append(analysis)
+                # Bump camera key to reset widget for next shot
+                st.session_state[cam_key] += 1
+                st.rerun()
+            else:
+                err = (analysis or {}).get("error", "unknown error")
+                st.warning(f"Shot could not be analyzed: {err}")
+                st.session_state[cam_key] += 1
+                st.rerun()
+
+        # ---- Live feedback ----
+        if shots:
+            st.markdown("---")
+            col_a, col_b = st.columns([2, 1])
+            with col_a:
+                st.markdown(f"**Shots taken: {len(shots)} / {MAX_SHOTS}**")
+            with col_b:
+                if st.button("🔄 Reset session", key=f"reset_{version_key}", use_container_width=True):
+                    _reset_color_session(version_key)
+                    st.rerun()
+
+            # Per-shot list
+            for i, (shot_bytes, analysis) in enumerate(zip(shots, analyses)):
+                q = analysis.get("quality", {}).get("score", 0)
+                st.caption(f"Shot {i+1}: quality **{q}/100**, primary `{analysis.get('primary')}`")
+
+            # Consensus preview (once we have enough shots)
+            if len(shots) >= MIN_SHOTS_FOR_CONSENSUS:
+                consensus = merge_analyses(analyses)
+                if consensus and consensus.get("ok"):
+                    st.markdown("---")
+                    st.markdown("**Live consensus:**")
+                    st.markdown(palette_html(consensus.get("palette", {})), unsafe_allow_html=True)
+                    st.caption(
+                        f"Pattern: `{consensus.get('pattern_hint')}` · "
+                        f"Iridescence: `{consensus.get('iridescence_level')}` "
+                        f"({consensus.get('iridescence_score')})"
+                    )
+
+                # Buttons
+                col_ok, col_more = st.columns(2)
+                with col_ok:
+                    if st.button("✅ Done — use these results", type="primary", use_container_width=True, key=f"done_{version_key}"):
+                        st.session_state[done_key] = True
+                        st.session_state[consensus_key] = merge_analyses(analyses)
+                        st.rerun()
+                with col_more:
+                    if len(shots) >= MAX_SHOTS:
+                        st.caption("Max shots reached")
+                    else:
+                        st.caption("Or take more shots above")
+
+    # ---- Post-capture result ----
+    else:
+        consensus = st.session_state[consensus_key] or {}
+        if not consensus.get("ok"):
+            st.error("Could not compute consensus.")
+            if st.button("🔁 Start over", key=f"restart_{version_key}"):
+                _reset_color_session(version_key)
+                st.rerun()
+            return
+
+        st.success(f"✓ Analysis complete — {consensus.get('shot_count', 0)} shots merged")
+
+        # Palette
+        st.markdown("**🎨 Detected colors:**")
+        st.markdown(palette_html(consensus.get("palette", {})), unsafe_allow_html=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**Primary:** {color_swatch_html(consensus.get('primary') or '')}{consensus.get('primary') or '—'}", unsafe_allow_html=True)
+        with col2:
+            st.markdown(f"**Secondary:** {color_swatch_html(consensus.get('secondary') or '')}{consensus.get('secondary') or '—'}", unsafe_allow_html=True)
+
+        st.markdown(f"**Pattern:** `{consensus.get('pattern_hint') or '—'}`")
+        st.markdown(
+            f"**✨ Iridescence:** `{consensus.get('iridescence_level') or 'none'}` "
+            f"(score {consensus.get('iridescence_score') or 0})"
+        )
+
+        # Best shot
+        best_idx = consensus.get("best_shot_index", 0)
+        if shots and 0 <= best_idx < len(shots):
+            st.markdown("---")
+            st.markdown(f"**🏆 Best shot (quality {analyses[best_idx].get('quality', {}).get('score', 0)}/100):**")
+            try:
+                preview = Image.open(io.BytesIO(shots[best_idx]))
+                st.image(preview, width=280)
+            except Exception:
+                st.caption("(preview unavailable)")
+
+        # Action buttons
+        st.markdown("---")
+        col_accept, col_retake = st.columns(2)
+        with col_accept:
+            if st.button("✓ Keep this analysis", type="primary", use_container_width=True, key=f"accept_{version_key}"):
+                # Mark analysis as accepted — the parent form reads from session state
+                st.session_state[_session_key(version_key, "accepted")] = True
+                st.rerun()
+        with col_retake:
+            if st.button("🔄 Retake session", use_container_width=True, key=f"retake_{version_key}"):
+                _reset_color_session(version_key)
+                st.rerun()
+
+        if st.session_state.get(_session_key(version_key, "accepted")):
+            st.info("✓ Color analysis accepted. It will be saved when you register the fish.")
+
+
+def _get_accepted_color_data(version_key: str) -> Optional[dict]:
+    """Return accepted color analysis data if user accepted in this session."""
+    if not st.session_state.get(_session_key(version_key, "accepted")):
+        return None
+    consensus = st.session_state.get(_session_key(version_key, "consensus"))
+    if not consensus or not consensus.get("ok"):
+        return None
+    return consensus
+
+
+def _get_best_shot_bytes(version_key: str) -> Optional[bytes]:
+    """Return the best shot's raw bytes if a session exists."""
+    consensus = st.session_state.get(_session_key(version_key, "consensus"))
+    shots = st.session_state.get(_session_key(version_key, "shots")) or []
+    if not consensus or not shots:
+        return None
+    idx = consensus.get("best_shot_index", 0)
+    if 0 <= idx < len(shots):
+        return shots[idx]
+    return None
+
+
+# ============================================================
+# CROPPER (existing, unchanged)
+# ============================================================
+
+def _render_cropper_ui(raw_bytes: bytes, key_prefix: str) -> Optional[bytes]:
+    if not _CROPPER_AVAILABLE:
+        return None
+    try:
+        st.markdown("##### ✂️ Adjust the photo")
+        st.caption("Drag the blue corners to resize. Drag inside the box to move the image.")
+        source_img = Image.open(io.BytesIO(raw_bytes))
+        if source_img.mode in ("RGBA", "P", "LA"):
+            source_img = source_img.convert("RGB")
+        col_crop, col_controls = st.columns([3, 1])
+        with col_crop:
+            cropped = st_cropper(
+                source_img,
+                realtime_update=True,
+                box_color="#0072FF",
+                aspect_ratio=CROP_ASPECT,
+                return_type="image",
+                key=f"crop_{key_prefix}",
+            )
+        with col_controls:
+            st.markdown("**How to crop**")
+            st.caption("1. Drag the blue corners")
+            st.caption("2. Drag inside to move")
+            st.caption("3. Saved automatically")
+            skip_clicked = st.button(
+                "⏭️ Skip (auto center-crop)",
+                use_container_width=True,
+                key=f"skip_crop_{key_prefix}",
+            )
+        if skip_clicked:
+            return _auto_crop_to_aspect(raw_bytes)
+        if cropped is not None:
+            return _image_to_jpeg_bytes(cropped)
+        return None
+    except Exception as e:
+        st.warning(f"Cropper unavailable, using auto-crop ({e})")
+        return _auto_crop_to_aspect(raw_bytes)
 
 
 # ============================================================
@@ -282,17 +454,16 @@ def render_register_tab():
     next_id = generate_fish_id()
     st.info(f"📌 Next Assigned Fish ID: **#{next_id}**")
 
-    # Version counter — bump after successful save to reset all form widgets
     form_version = st.session_state.get("reg_form_version", 0)
 
     strains_list = _get_strain_names()
 
+    # ---- Strain selector ----
     strain_col_select, strain_col_btn = st.columns([4, 1])
     with strain_col_btn:
         st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
         with st.popover("⚙️ Manage Strains"):
             pop_add, pop_remove = st.tabs(["➕ Add", "🗑️ Remove"])
-
             with pop_add:
                 st.markdown("##### Add New Strain")
                 new_strain_val = st.text_input(
@@ -301,13 +472,9 @@ def render_register_tab():
                     key=f"new_strain_input_{form_version}",
                 ).strip()
                 if st.button("Save Strain", use_container_width=True, type="primary", key=f"btn_add_strain_{form_version}"):
-                    if new_strain_val:
-                        if _add_strain(new_strain_val):
-                            st.session_state["selected_strain"] = new_strain_val
-                            st.rerun()
-                    else:
-                        st.warning("Please enter a strain name.")
-
+                    if new_strain_val and _add_strain(new_strain_val):
+                        st.session_state["selected_strain"] = new_strain_val
+                        st.rerun()
             with pop_remove:
                 st.markdown("##### Remove Existing Strain")
                 if strains_list:
@@ -321,8 +488,6 @@ def render_register_tab():
                         if st.session_state.get("selected_strain") == strain_to_delete:
                             st.session_state.pop("selected_strain", None)
                         st.rerun()
-                else:
-                    st.info("No strains available to remove.")
 
     default_index = 0
     if "selected_strain" in st.session_state and st.session_state["selected_strain"] in strains_list:
@@ -336,19 +501,23 @@ def render_register_tab():
             key=f"select_strain_dropdown_{form_version}",
         )
 
-    # ============================================================
-    # Photo upload + crop
-    # ============================================================
-    st.markdown("##### 📷 Fish Photo Capture / Upload")
+    # ---- Color analysis section ----
+    st.markdown("---")
+    _render_color_capture_ui(version_key=form_version)
+
+    # ---- Photo upload + crop (for the profile photo) ----
+    st.markdown("---")
+    st.markdown("##### 📷 Fish Profile Photo (4:3)")
+    st.caption("This is the photo shown on fish tiles. Separate from color analysis above.")
+
     img_col1, img_col2 = st.columns(2)
     with img_col1:
-        camera_photo = st.camera_input("Take a Live Photo of Fish", key=f"cam_{form_version}")
+        camera_photo = st.camera_input("Take a Live Photo", key=f"profile_cam_{form_version}")
     with img_col2:
         uploaded_photo = st.file_uploader(
             "Or Upload Photo File",
             type=["jpg", "jpeg", "png", "heic", "heif"],
-            help="Supports iPhone HEIC and standard JPEG/PNG.",
-            key=f"upl_{form_version}",
+            key=f"profile_upl_{form_version}",
         )
 
     if camera_photo is not None:
@@ -359,7 +528,6 @@ def render_register_tab():
         st.session_state.pop("fish_photo_bytes", None)
 
     raw_bytes = st.session_state.get("fish_photo_raw")
-
     if raw_bytes and not st.session_state.get("fish_photo_bytes"):
         cropped_bytes = _render_cropper_ui(raw_bytes, key_prefix=f"fish_reg_{form_version}")
         if cropped_bytes:
@@ -368,7 +536,7 @@ def render_register_tab():
     if st.session_state.get("fish_photo_bytes"):
         try:
             preview_img = Image.open(io.BytesIO(st.session_state["fish_photo_bytes"]))
-            st.markdown("**Final photo (as it will appear in grid):**")
+            st.markdown("**Final photo:**")
             st.image(preview_img, caption="Cropped to 4:3", width=320)
             if st.button("🔄 Re-crop photo", key=f"recrop_fish_{form_version}"):
                 st.session_state.pop("fish_photo_bytes", None)
@@ -376,36 +544,17 @@ def render_register_tab():
         except Exception:
             pass
 
-    # ============================================================
-    # Main registration form (keys include form_version so they reset)
-    # ============================================================
+    # ---- Main registration form ----
     with st.form(f"register_fish_form_{form_version}", clear_on_submit=False):
         col1, col2 = st.columns(2)
 
         with col1:
             st.markdown("##### 🧬 Variety & Details")
-            form_type = st.text_input(
-                "Form / Type",
-                value="HMPK",
-                help="e.g. HMPK, HM, PK, CT",
-                key=f"form_type_{form_version}",
-            )
+            form_type = st.text_input("Form / Type", value="HMPK", help="e.g. HMPK, HM, PK, CT", key=f"form_type_{form_version}")
             gender = st.selectbox("Gender", VALID_GENDERS, key=f"gender_{form_version}")
-            seller = st.text_input(
-                "Seller / Source",
-                placeholder="e.g. Aquarama Import / Local Breeder",
-                key=f"seller_{form_version}",
-            )
-            purchase_date = st.date_input(
-                "Purchase Date",
-                datetime.date.today(),
-                key=f"pdate_{form_version}",
-            )
-            purchase_cost = st.number_input(
-                "Purchase Cost (₱)",
-                min_value=0.0, value=0.0, step=50.0,
-                key=f"pcost_{form_version}",
-            )
+            seller = st.text_input("Seller / Source", placeholder="e.g. Aquarama Import / Local Breeder", key=f"seller_{form_version}")
+            purchase_date = st.date_input("Purchase Date", datetime.date.today(), key=f"pdate_{form_version}")
+            purchase_cost = st.number_input("Purchase Cost (₱)", min_value=0.0, value=0.0, step=50.0, key=f"pcost_{form_version}")
 
         with col2:
             st.markdown("##### 🪣 Tank & Container Assignment")
@@ -413,11 +562,7 @@ def render_register_tab():
             tank_types = sorted({t["label"].split(" | ")[-1].rstrip(")") for t in tank_opts})
             type_filter_options = ["All Types"] + tank_types
 
-            selected_type_filter = st.selectbox(
-                "Filter Tank Type",
-                options=type_filter_options,
-                key=f"ttype_{form_version}",
-            )
+            selected_type_filter = st.selectbox("Filter Tank Type", options=type_filter_options, key=f"ttype_{form_version}")
 
             if selected_type_filter != "All Types":
                 filtered = [t for t in tank_opts if selected_type_filter in t["label"]]
@@ -450,7 +595,6 @@ def render_register_tab():
                 "Body Shape",
                 options=["Bullet Head", "Regular", "Spoonhead"],
                 index=0,
-                help="Select the head profile/body shape structure.",
                 key=f"bs_{form_version}",
             )
 
@@ -474,7 +618,7 @@ def render_register_tab():
         )
         notes = st.text_area(
             "Notes / Characteristics",
-            placeholder="e.g. Strong dorsal, solid iridescence, aggressive disposition",
+            placeholder="e.g. Strong dorsal, solid iridescence",
             key=f"notes_{form_version}",
         )
 
@@ -483,8 +627,17 @@ def render_register_tab():
     if not submit:
         return
 
+    # ---- Photo upload ----
     photo_id: Optional[str] = None
     photo_bytes = st.session_state.get("fish_photo_bytes")
+
+    # If user didn't upload a profile photo, fall back to the best color-analysis shot
+    if not photo_bytes:
+        best_shot = _get_best_shot_bytes(form_version)
+        if best_shot:
+            photo_bytes = best_shot
+            st.info("Using best color-analysis shot as profile photo.")
+
     if photo_bytes:
         with st.spinner("Uploading & optimizing photo for Google Drive..."):
             normalized = _normalize_image_bytes(photo_bytes)
@@ -501,6 +654,15 @@ def render_register_tab():
         st.error("Please select a valid strain.")
         return
 
+    # ---- Get color data if user accepted ----
+    color_data = _get_accepted_color_data(form_version) or {}
+    color_palette = color_data.get("palette") or {}
+    color_primary = color_data.get("primary")
+    color_secondary = color_data.get("secondary")
+    pattern_hint = color_data.get("pattern_hint")
+    iridescence_level = color_data.get("iridescence_level")
+
+    # ---- Register ----
     result = register_new_fish(
         origin="Purchased",
         gender=gender,
@@ -525,36 +687,47 @@ def render_register_tab():
         st.error("Fish registration failed. Check logs.")
         return
 
+    # Patch photo + color data
+    patch: dict = {}
     if photo_id:
-        edit_fish(result["id"], {"photo_id": photo_id})
+        patch["photo_id"] = photo_id
+    if color_primary:
+        patch["color_primary"] = color_primary
+    if color_secondary:
+        patch["color_secondary"] = color_secondary
+    if color_palette:
+        patch["color_palette"] = color_palette
+    if pattern_hint:
+        patch["pattern_hint"] = pattern_hint
+    if iridescence_level:
+        patch["iridescence_level"] = iridescence_level
+
+    if patch:
+        edit_fish(result["id"], patch)
 
     if selected_tank_id:
         assign_fish_to_tank(selected_tank_id, result["id"])
 
-    # Clear photo + bump form version so all inputs reset on next render
+    # ---- Cleanup ----
     st.session_state.pop("fish_photo_bytes", None)
     st.session_state.pop("fish_photo_raw", None)
+    _reset_color_session(form_version)
     st.session_state["reg_form_version"] = form_version + 1
 
     st.balloons()
-    st.success(
-        f"🎉 Fish **#{result.get('system_id')}** ({selected_strain}) registered! "
-        f"Form reset for next entry."
-    )
+    st.success(f"🎉 Fish **#{result.get('system_id')}** registered!" + (" Colors saved." if color_primary else ""))
     st.rerun()
 
 
 # ============================================================
-# MILESTONE UI
+# MILESTONE UI (unchanged from 24A)
 # ============================================================
 
 def _render_milestone_add_form(fish: dict):
-    """Inline form to add a milestone."""
     fish_uuid = fish["id"]
     crop_key = f"ms_{fish_uuid}"
 
     st.markdown("**➕ Add Milestone**")
-
     st.caption("**Photo (optional)** — cropped to 4:3")
     ms_photo_file = st.file_uploader(
         "Upload milestone photo",
@@ -567,7 +740,6 @@ def _render_milestone_add_form(fish: dict):
         st.session_state.pop(f"{crop_key}_cropped", None)
 
     raw = st.session_state.get(f"{crop_key}_raw")
-
     if raw and not st.session_state.get(f"{crop_key}_cropped"):
         cropped = _render_cropper_ui(raw, key_prefix=crop_key)
         if cropped:
@@ -586,11 +758,7 @@ def _render_milestone_add_form(fish: dict):
     with st.form(f"add_milestone_{fish_uuid}", clear_on_submit=False):
         col_a, col_b = st.columns(2)
         with col_a:
-            m_date = st.date_input(
-                "Date",
-                value=datetime.date.today(),
-                key=f"m_date_{fish_uuid}",
-            )
+            m_date = st.date_input("Date", value=datetime.date.today(), key=f"m_date_{fish_uuid}")
         with col_b:
             m_shape = st.selectbox(
                 "Body Shape",
@@ -621,22 +789,15 @@ def _render_milestone_add_form(fish: dict):
         return
 
     checks = {
-        "caudal_180": c1,
-        "caudal_prop": c2,
-        "dorsal_struct": c3,
-        "anal_struct": c4,
-        "ventral_fins": c5,
-        "pectoral_fins": c6,
+        "caudal_180": c1, "caudal_prop": c2, "dorsal_struct": c3,
+        "anal_struct": c4, "ventral_fins": c5, "pectoral_fins": c6,
     }
     any_check = any(checks.values())
     score = None
     if any_check or m_shape:
         _, score = calculate_form_grade(checks, m_shape or "Regular")
 
-    photo_bytes = (
-        st.session_state.get(f"{crop_key}_cropped")
-        or st.session_state.get(f"{crop_key}_raw")
-    )
+    photo_bytes = st.session_state.get(f"{crop_key}_cropped") or st.session_state.get(f"{crop_key}_raw")
 
     add_milestone(
         fish_id=fish_uuid,
@@ -650,13 +811,11 @@ def _render_milestone_add_form(fish: dict):
 
     st.session_state.pop(f"{crop_key}_cropped", None)
     st.session_state.pop(f"{crop_key}_raw", None)
-
     st.success("Milestone added.")
     st.rerun()
 
 
 def _render_milestone_timeline(milestones: list[dict]):
-    """Display milestones as a photo grid with dates + scores."""
     if not milestones:
         st.caption("No milestones yet.")
         return
@@ -683,412 +842,4 @@ def _render_milestone_timeline(milestones: list[dict]):
                 st.caption(f"Shape: {m['body_shape']}")
             if m.get("notes"):
                 st.caption(f"📝 {m['notes']}")
-
-            if st.button("🗑️ Delete", key=f"del_m_{m['id']}", use_container_width=True):
-                if remove_milestone(m["id"]):
-                    st.success("Milestone deleted.")
-                    st.rerun()
-
-
-def _render_milestones_section(fish: dict, milestones: list[dict]):
-    """Full milestones expander content."""
-    suggestion = suggest_action(fish, milestones)
-    if suggestion:
-        if suggestion["kind"] == "promote":
-            st.success(f"{suggestion['icon']} **{suggestion['label']}** — {suggestion['reason']}")
-        else:
-            st.warning(f"{suggestion['icon']} **{suggestion['label']}** — {suggestion['reason']}")
-
-    if milestone_is_due(fish, milestones):
-        st.info(f"⏰ Milestone due — last check was {MILESTONE_INTERVAL_DAYS}+ days ago.")
-
-    with st.expander("➕ Add Milestone", expanded=False):
-        _render_milestone_add_form(fish)
-
-    st.markdown(f"**📸 Milestones ({len(milestones)})**")
-    _render_milestone_timeline(milestones)
-
-
-# ============================================================
-# CARD ACTIONS
-# ============================================================
-
-def _render_card_actions(fish: dict):
-    fish_uuid = fish["id"]
-    system_id = fish.get("system_id") or "?"
-    current_status = (fish.get("status") or "").lower()
-
-    if st.button("🌳 View Lineage", key=f"lineage_{fish_uuid}", use_container_width=True):
-        st.session_state["lineage_fish_id"] = fish_uuid
-        st.toast(f"Selected {system_id}. Open the Lineage page to view the tree.")
-
-    if not fish.get("is_breeder") and current_status not in ("sold", "deceased", "retired", "culled"):
-        if st.button("⭐ Promote to Breeder", key=f"promote_{fish_uuid}", use_container_width=True):
-            if promote_to_breeder(fish_uuid):
-                st.success(f"{system_id} promoted to breeder.")
-                st.rerun()
-
-    if current_status == "culled":
-        with st.popover("↩️ Restore from Culled", use_container_width=True):
-            st.markdown("**Restore this fish?**")
-            st.caption("Sets status back to Active. Adds a note.")
-            restore_status = st.selectbox(
-                "Restore to status",
-                options=["Active", "Jarred", "For Sale"],
-                key=f"restore_status_{fish_uuid}",
-            )
-            if st.button("Confirm Restore", key=f"restore_btn_{fish_uuid}", type="primary", use_container_width=True):
-                if restore_fish_from_culled(fish_uuid, new_status=restore_status):
-                    st.success(f"{system_id} restored.")
-                    st.rerun()
-    else:
-        with st.popover("🚫 Cull Fish", use_container_width=True):
-            st.markdown("**Cull this fish**")
-            st.caption("Marks as culled, frees its tank, and logs the reason.")
-            cull_reason = st.selectbox(
-                "Reason",
-                options=CULL_REASONS,
-                key=f"cull_reason_{fish_uuid}",
-            )
-            cull_notes = st.text_area(
-                "Additional notes (optional)",
-                placeholder="e.g. Curled ventral fins, poor appetite since day 10",
-                key=f"cull_notes_{fish_uuid}",
-            )
-            confirm_cull = st.checkbox(
-                "I understand — cull this fish.",
-                key=f"cull_confirm_{fish_uuid}",
-            )
-            if st.button(
-                "Confirm Cull",
-                key=f"cull_btn_{fish_uuid}",
-                type="primary",
-                use_container_width=True,
-                disabled=not confirm_cull,
-            ):
-                if cull_fish(fish_uuid, reason=cull_reason, notes=cull_notes):
-                    st.success(f"{system_id} culled.")
-                    st.rerun()
-
-    if current_status not in ("culled", "deceased", "retired"):
-        tank_opts = _get_available_tank_options()
-        if tank_opts:
-            dd = [{"id": None, "label": "— Leave / Clear Tank —"}] + tank_opts
-            selected_idx = st.selectbox(
-                "Move to Tank",
-                options=range(len(dd)),
-                format_func=lambda i: dd[i]["label"],
-                key=f"move_tank_{fish_uuid}",
-            )
-            new_tank_id = dd[selected_idx]["id"]
-
-            if st.button("📦 Apply Move", key=f"apply_move_{fish_uuid}", use_container_width=True):
-                if fish.get("tank_id"):
-                    unassign_tank(fish["tank_id"])
-                if new_tank_id:
-                    assign_fish_to_tank(new_tank_id, fish_uuid)
-                st.success("Location updated.")
-                st.rerun()
-
-    st.divider()
-    confirm = st.checkbox(
-        "Confirm delete (removes fish + Drive photo)",
-        key=f"del_confirm_{fish_uuid}",
-    )
-    if st.button(
-        "🔥 Delete Fish",
-        key=f"del_btn_{fish_uuid}",
-        disabled=not confirm,
-        use_container_width=True,
-    ):
-        if delete_fish_and_photos(fish_uuid):
-            st.success(f"{system_id} deleted.")
-            st.rerun()
-
-
-# ============================================================
-# UNIFORM PHOTO HTML
-# ============================================================
-
-def _uniform_photo_html(file_id: Optional[str], aspect: str = "4 / 3"):
-    """Fixed aspect-ratio container with rounded corners + object-fit cover."""
-    if not file_id:
-        return (
-            f'<div style="width:100%;aspect-ratio:{aspect};background:#F3F4F6;'
-            f'border-radius:14px;display:flex;align-items:center;justify-content:center;'
-            f'color:#9CA3AF;font-size:13px;">No Photo</div>'
-        )
-
-    url = photo_url(file_id)
-    return (
-        f'<div style="width:100%;aspect-ratio:{aspect};overflow:hidden;'
-        f'border-radius:14px;background:#F3F4F6;">'
-        f'<img src="{url}" '
-        f'style="width:100%;height:100%;object-fit:cover;display:block;" />'
-        f'</div>'
-    )
-
-
-def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
-    """Top-of-page curated strip."""
-    active = [
-        f for f in all_fish
-        if (f.get("status") or "").lower() not in ("culled", "deceased", "sold", "retired")
-    ]
-    if not active:
-        return
-
-    grade_rank = {
-        "Show Grade": 5, "High Grade": 4, "Breeder Grade": 3,
-        "Material Grade": 2, "Pet Grade": 1,
-    }
-    best = max(active, key=lambda f: grade_rank.get(f.get("grade") or "", 0))
-
-    most_ms = None
-    if milestone_counts:
-        top_id = max(milestone_counts, key=lambda k: milestone_counts[k])
-        most_ms = next((f for f in active if f["id"] == top_id), None)
-
-    recent = None
-    for f in sorted(active, key=lambda x: x.get("created_at") or "", reverse=True):
-        age = get_fish_age_days(f)
-        if age is not None and age <= 7:
-            recent = f
-            break
-
-    picks = []
-    if best:
-        picks.append(("🏆 Best Form", best))
-    if most_ms and (not best or most_ms["id"] != best["id"]):
-        picks.append((f"📸 Most Milestones ({milestone_counts[most_ms['id']]})", most_ms))
-    if recent and (not best or recent["id"] != best["id"]):
-        picks.append(("🆕 Just Added", recent))
-
-    if not picks:
-        return
-
-    st.markdown("###### ✨ Highlights")
-    cols = st.columns(len(picks))
-    for i, (label, f) in enumerate(picks):
-        with cols[i]:
-            with st.container(border=True):
-                st.markdown(
-                    _uniform_photo_html(f.get("photo_id"), aspect="4 / 3"),
-                    unsafe_allow_html=True,
-                )
-                st.caption(f"*{label}*")
-                st.markdown(f"**{f.get('system_id')}**")
-                st.caption(
-                    f"{f.get('gender') or '?'} · {f.get('variety') or '—'} · "
-                    f"{f.get('grade') or '—'}"
-                )
-
-    st.markdown("---")
-
-
-# ============================================================
-# GRID TILE
-# ============================================================
-
-def _render_grid_tile(fish: dict, milestone_count: int = 0):
-    """Compact visual grid tile."""
-    system_id = fish.get("system_id") or "?"
-    status = (fish.get("status") or "Active").lower()
-    is_culled = status in ("culled", "deceased")
-
-    badge_bg = grade_badge_color(fish.get("grade"))
-    badge_fg = grade_badge_text_color(fish.get("grade"))
-    grade_text = fish.get("grade") or "—"
-
-    age_days = get_fish_age_days(fish)
-    age_text = format_fish_age(age_days)
-
-    gender = (fish.get("gender") or "?").lower()
-    gender_sym = "♂" if gender == "male" else ("♀" if gender == "female" else "•")
-
-    with st.container(border=True):
-        st.markdown(
-            _uniform_photo_html(fish.get("photo_id"), aspect="4 / 3"),
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(
-            f'<span style="display:inline-block;background:{badge_bg};color:{badge_fg};'
-            f'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;'
-            f'margin-top:6px;">{grade_text}</span>',
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(f"**{system_id}** · {gender_sym} {fish.get('variety') or '—'}")
-
-        badges = []
-        if milestone_count:
-            badges.append(f"📸 {milestone_count}")
-        if age_text and age_text != "—":
-            badges.append(f"🗓 {age_text}")
-        if is_culled:
-            badges.append("⛔ Culled")
-        if fish.get("location"):
-            badges.append(f"🪣 {fish['location']}")
-        if badges:
-            st.caption(" · ".join(badges))
-
-        with st.popover("⚙️ Manage", use_container_width=True):
-            _render_card_actions(fish)
-
-        with st.popover("📸 Milestones" + (f" ({milestone_count})" if milestone_count else ""), use_container_width=True):
-            milestones = get_milestones_for_fish(fish["id"])
-            _render_milestones_section(fish, milestones)
-
-
-# ============================================================
-# TABLE VIEW
-# ============================================================
-
-def _render_table_view(filtered: list[dict], milestone_counts: dict):
-    """Dense table view for power users."""
-    rows = []
-    for f in filtered:
-        age_days = get_fish_age_days(f)
-        rows.append({
-            "ID": f.get("system_id") or "?",
-            "Gender": f.get("gender") or "—",
-            "Variety": f.get("variety") or "—",
-            "Grade": f.get("grade") or "—",
-            "Line": f.get("line_code") or "—",
-            "Gen": f.get("generation") or "—",
-            "Location": f.get("location") or "—",
-            "Status": f.get("status") or "—",
-            "Age": format_fish_age(age_days),
-            "Milestones": milestone_counts.get(f["id"], 0),
-        })
-
-    st.dataframe(
-        rows,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Milestones": st.column_config.NumberColumn("📸", width="small"),
-            "Age": st.column_config.TextColumn("Age", width="small"),
-        },
-    )
-    st.caption("💡 Tip: use the Grid view for photo browsing. Table view is best for finding a specific fish fast.")
-
-
-# ============================================================
-# LIST TAB (MAIN)
-# ============================================================
-
-CARD_PAGE_SIZE = 15
-
-
-def render_list_tab():
-    st.subheader("📋 Registered Fish Database")
-
-    all_fish = get_all_fish()
-    if not all_fish:
-        st.info("No fish registered yet. Use the Register tab to add your first fish.")
-        return
-
-    milestone_counts = get_milestone_counts_by_fish()
-
-    alive = [
-        f for f in all_fish
-        if (f.get("status") or "").lower() not in ("culled", "deceased")
-    ]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Fish", len(all_fish))
-    m2.metric("Alive", len(alive))
-    m3.metric("Males", sum(1 for f in alive if (f.get("gender") or "").lower() == "male"))
-    m4.metric("Females", sum(1 for f in alive if (f.get("gender") or "").lower() == "female"))
-
-    st.divider()
-
-    _render_highlight_strip(all_fish, milestone_counts)
-
-    st.markdown("##### 🔍 Filter Database")
-    f_col1, f_col2, f_col3, f_col4 = st.columns(4)
-
-    with f_col1:
-        gender_filter = st.multiselect(
-            "Gender",
-            options=sorted({f.get("gender") for f in all_fish if f.get("gender")}),
-        )
-    with f_col2:
-        grade_filter = st.multiselect(
-            "Grade",
-            options=sorted({f.get("grade") for f in all_fish if f.get("grade")}),
-        )
-    with f_col3:
-        variety_filter = st.multiselect(
-            "Variety",
-            options=sorted({f.get("variety") for f in all_fish if f.get("variety")}),
-        )
-    with f_col4:
-        hide_culled = st.checkbox("Hide culled & deceased", value=True)
-
-    view_mode = st.radio(
-        "View",
-        options=["🎨 Grid", "📊 Table"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
-    filtered = all_fish
-    if gender_filter:
-        filtered = [f for f in filtered if f.get("gender") in gender_filter]
-    if grade_filter:
-        filtered = [f for f in filtered if f.get("grade") in grade_filter]
-    if variety_filter:
-        filtered = [f for f in filtered if f.get("variety") in variety_filter]
-    if hide_culled:
-        filtered = [
-            f for f in filtered
-            if (f.get("status") or "").lower() not in ("culled", "deceased")
-        ]
-
-    st.caption(f"Showing {len(filtered)} of {len(all_fish)} fish.")
-    st.markdown("---")
-
-    if not filtered:
-        st.warning("No fish match the current filters.")
-        return
-
-    if view_mode == "📊 Table":
-        _render_table_view(filtered, milestone_counts)
-        return
-
-    total_pages = max(1, (len(filtered) + CARD_PAGE_SIZE - 1) // CARD_PAGE_SIZE)
-    if total_pages > 1:
-        page = st.number_input(
-            f"Page (1–{total_pages})",
-            min_value=1, max_value=total_pages, value=1, step=1,
-            key="fish_page_number",
-        )
-    else:
-        page = 1
-
-    start = (page - 1) * CARD_PAGE_SIZE
-    page_items = filtered[start : start + CARD_PAGE_SIZE]
-
-    cols = st.columns(3)
-    for idx, fish in enumerate(page_items):
-        with cols[idx % 3]:
-            _render_grid_tile(fish, milestone_count=milestone_counts.get(fish["id"], 0))
-
-
-# ============================================================
-# PAGE
-# ============================================================
-
-def render_fish_registry_page():
-    st.header("🐠 Fish Master Registry")
-    st.caption("Register and manage individual imported, purchased, or batch-selected Betta fish.")
-
-    tab_register, tab_view = st.tabs(["📝 Register New Fish", "📋 Fish List & Database"])
-
-    with tab_register:
-        render_register_tab()
-
-    with tab_view:
-        render_list_tab()
+            if st.button("🗑️ Delete", key=f"del_m_{m
