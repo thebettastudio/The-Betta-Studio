@@ -10,8 +10,9 @@
 # Session 26E — Two-pass posture strategy + 5-region split + Side A/B.
 #   • Pass 1 (strict): clean side profile + fully flared + complete
 #   • Pass 2 (lenient + regional): per-frame regional fallback
-#   • Motion-map pipeline: fish moves, background doesn't.
-#     Background + tank wall + divider excluded via temporal diff.
+#   • Motion map: pixels that moved at least once (fish region).
+#   • Persistence map: pixels that moved in most frames (real fish only,
+#     reflection excluded since it appears only intermittently).
 #   • IBC body ratio uses interquartile depth (excludes fin tips)
 #   • Candidate picker: split merged blob, pick best IBC side view
 #   • Connectivity + anal-slope discriminators reject broken reflections
@@ -98,14 +99,19 @@ EDGE_MARGIN_PX = 2
 
 
 # ============================================================
-# MOTION MAP CONSTANTS
+# MOTION + PERSISTENCE CONSTANTS
 # ============================================================
 
 # Pixel diff threshold (0-255 mean across RGB) to count as "changed"
 MOTION_DIFF_THRESHOLD = 18
 
-# A pixel is "fish region" if it moved in at least this % of transitions
+# A pixel is "motion region" if it moved in at least this % of transitions
 MOTION_PCT_THRESHOLD = 0.15
+
+# A pixel is "persistence region" (real fish) if it moved in at least
+# this % of transitions. Reflection appears only intermittently →
+# falls below this cutoff.
+PERSISTENCE_PCT_THRESHOLD = 0.55
 
 # Dilate motion region slightly so we don't clip fish tails
 MOTION_DILATE_ITER = 3
@@ -304,7 +310,7 @@ def _mask_fish_region(
 
 
 # ============================================================
-# MOTION MAP
+# MOTION + PERSISTENCE MAPS
 # ============================================================
 
 def _build_motion_map(frames_rgb: list[np.ndarray]) -> np.ndarray:
@@ -327,7 +333,6 @@ def _build_motion_map(frames_rgb: list[np.ndarray]) -> np.ndarray:
     for t in range(1, len(frames_rgb)):
         curr = frames_rgb[t].astype(np.int16)
         if curr.shape[:2] != (H, W):
-            # Skip mismatched
             prev = curr
             continue
         diff = np.abs(curr - prev).mean(axis=-1)
@@ -344,7 +349,7 @@ def _motion_region_mask(motion_map: np.ndarray,
     Pixels that moved in >= pct_threshold of transitions.
 
     Returns bool mask. If video had no motion, returns all-True
-    (graceful fallback — behaves like old per-frame pipeline).
+    (graceful fallback).
     """
     if motion_map.max() == 0:
         return np.ones_like(motion_map, dtype=bool)
@@ -358,9 +363,47 @@ def _motion_region_mask(motion_map: np.ndarray,
         except Exception:
             pass
 
-    # If region is tiny (<1% of frame), fall back to all-True
     if region.sum() < 0.01 * region.size:
         return np.ones_like(region, dtype=bool)
+
+    return region
+
+
+def _persistence_region_mask(motion_map: np.ndarray,
+                               pct_threshold: float = PERSISTENCE_PCT_THRESHOLD) -> np.ndarray:
+    """
+    Pixels that moved in >= pct_threshold of transitions.
+
+    This is the "real fish" region: because the real fish is visible
+    in every frame, its motion is present in every transition. The
+    mirror reflection appears only intermittently and falls below
+    the persistence threshold.
+
+    Falls back to motion region if persistence is tiny.
+    """
+    if motion_map.max() == 0:
+        return np.ones_like(motion_map, dtype=bool)
+
+    thresh = motion_map.max() * pct_threshold
+    region = motion_map >= thresh
+
+    # If persistence is <1% of frame, fall back to all-True
+    if region.sum() < 0.01 * region.size:
+        return np.ones_like(region, dtype=bool)
+
+    # Clean up: keep only largest connected component + dilate
+    if _SCIPY_AVAILABLE:
+        try:
+            labeled, num = _ndimage.label(region)
+            if num > 1:
+                sizes = _ndimage.sum(region, labeled, index=range(1, num + 1))
+                largest = int(np.argmax(sizes)) + 1
+                region = (labeled == largest)
+
+            # Dilate generously — persistence is narrower than motion
+            region = _ndimage.binary_dilation(region, iterations=6)
+        except Exception:
+            pass
 
     return region
 
@@ -1343,14 +1386,6 @@ def _classify_pattern(palette: dict[str, float]) -> str:
 def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
                   use_blob: bool = True, skip_posture: bool = False,
                   motion_hint: Optional[np.ndarray] = None) -> Optional[dict]:
-    """
-    Analyze a photo using 5-region full-fish split + posture validation.
-
-    motion_hint: optional bool mask (same H,W as the processed frame).
-                 If provided, only pixels inside the hint are eligible
-                 to be fish (used by the video pipeline to exclude the
-                 static background/divider/wall).
-    """
     img = _load_image_rgb(raw_bytes)
     if img is None:
         return {"ok": False, "error": "Could not load image"}
@@ -1367,7 +1402,6 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
 
     mask = _mask_fish_region(hsv, rgb_u8, water_tint=water_tint, bg_color=bg_color)
 
-    # Apply motion hint if provided (and same shape)
     if motion_hint is not None and motion_hint.shape == mask.shape:
         mask &= motion_hint
 
@@ -1622,12 +1656,13 @@ def analyze_video(
     k_clusters: int = 5,
 ) -> dict:
     """
-    Two-pass video pipeline with motion-map background exclusion.
+    Video pipeline with motion + persistence background exclusion.
 
     1. Extract frames
-    2. Build motion map across all frames → fish region mask
-    3. For each frame, analyze_photo with motion_hint = fish region
-    4. Pass 1 (strict) or Pass 2 (regional) consensus
+    2. Motion map (pixels that moved at least once)
+    3. Persistence map (pixels that moved in most frames → real fish)
+    4. Per frame: analyze inside persistence region → real fish only
+    5. Pass 1 (strict) or Pass 2 (regional) consensus
     """
     try:
         frames = extract_frames_from_video(
@@ -1641,7 +1676,7 @@ def analyze_video(
     if not frames:
         return {"ok": False, "error": "No frames could be extracted"}
 
-    # ---------- MOTION MAP ----------
+    # ---------- MOTION + PERSISTENCE MAPS ----------
     frames_rgb: list[np.ndarray] = []
     for fbytes in frames:
         img = _load_image_rgb(fbytes)
@@ -1652,7 +1687,7 @@ def analyze_video(
         frames_rgb.append(np.asarray(img.convert("RGB")).astype(np.uint8))
 
     motion_map = _build_motion_map(frames_rgb)
-    motion_region = _motion_region_mask(motion_map)
+    persistence_region = _persistence_region_mask(motion_map)
 
     # ---------- PASS 1 ----------
     strict_analyses = []
@@ -1661,7 +1696,7 @@ def analyze_video(
     for fi, fbytes in enumerate(frames):
         try:
             a = analyze_photo(fbytes, k_clusters=k_clusters, use_blob=True,
-                              motion_hint=motion_region)
+                              motion_hint=persistence_region)
             if not a or not a.get("ok"):
                 continue
             if a.get("pass", 3) != 1:
@@ -1702,7 +1737,7 @@ def analyze_video(
                 "side_b_count": sum(1 for a in kept if a.get("side_label") == "B"),
                 "majority_side": majority,
                 "discarded_minority_frames": len(strict_analyses) - len(kept),
-                "motion_region_pct": round(float(motion_region.sum() / motion_region.size * 100), 2),
+                "persistence_region_pct": round(float(persistence_region.sum() / persistence_region.size * 100), 2),
             }
 
     # ---------- PASS 2: regional fallback ----------
@@ -1728,8 +1763,8 @@ def analyze_video(
 
             mask = _mask_fish_region(hsv, rgb_u8,
                                      water_tint=water_tint, bg_color=bg_color)
-            if motion_region.shape == mask.shape:
-                mask &= motion_region
+            if persistence_region.shape == mask.shape:
+                mask &= persistence_region
             if mask.sum() < 50:
                 continue
             mask = _isolate_largest_blob(mask, rgb_u8, min_size_pct=0.5)
@@ -1808,7 +1843,7 @@ def analyze_video(
             "best_frame_bytes": frames[0] if frames else None,
             "side_a_count": 0,
             "side_b_count": 0,
-            "motion_region_pct": round(float(motion_region.sum() / motion_region.size * 100), 2),
+            "persistence_region_pct": round(float(persistence_region.sum() / persistence_region.size * 100), 2),
         }
 
     return {
@@ -1819,7 +1854,7 @@ def analyze_video(
         ),
         "strict_frames_found": len(strict_analyses),
         "regional_contributors": regional_contributors,
-        "motion_region_pct": round(float(motion_region.sum() / motion_region.size * 100), 2),
+        "persistence_region_pct": round(float(persistence_region.sum() / persistence_region.size * 100), 2),
     }
 
 
