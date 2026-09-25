@@ -3,16 +3,8 @@
 # Session 26A — Color analysis via computer vision.
 # Session 26B — Added analyze_region() for tap-to-select flow.
 # Session 26C — Added extract_frames_from_video() for video upload flow.
-#
-# Pipeline per photo:
-#   1. Load image → convert to HSV
-#   2. Filter background
-#   3. Crop to center 70%
-#   4. K-means cluster remaining pixels (k=5)
-#   5. Map each cluster centroid → nearest color category
-#   6. Compute % per category
-#   7. Detect iridescence
-#   8. Score photo quality
+# Session 26C fix — Added blob detection to isolate the largest fish region
+#                   (solves multi-fish + background contamination).
 
 from __future__ import annotations
 
@@ -29,7 +21,6 @@ try:
 except ImportError:
     _SCIPY_AVAILABLE = False
 
-# Video support — PyAV
 try:
     import av
     _AV_AVAILABLE = True
@@ -123,6 +114,43 @@ def _mask_fish_region(hsv: np.ndarray) -> np.ndarray:
     is_fish &= center_mask
 
     return is_fish
+
+
+def _isolate_largest_blob(mask: np.ndarray, min_size_pct: float = 0.5) -> np.ndarray:
+    """
+    Return a new mask containing only the largest connected component
+    (in pixels). Small blobs (reflections, tape, specks) are dropped.
+
+    min_size_pct: blob must be at least this % of total image pixels
+                  to be considered (avoids noise-only frames).
+    Falls back to original mask if scipy isn't available or no
+    components are large enough.
+    """
+    if not _SCIPY_AVAILABLE or mask.sum() == 0:
+        return mask
+
+    try:
+        labeled, num = _ndimage.label(mask)
+        if num == 0:
+            return mask
+
+        # Count pixels in each component
+        component_sizes = _ndimage.sum(mask, labeled, index=range(1, num + 1))
+        if len(component_sizes) == 0:
+            return mask
+
+        # Find the largest
+        largest_idx = int(np.argmax(component_sizes)) + 1
+        largest_mask = (labeled == largest_idx)
+
+        # Sanity check: largest blob should be reasonably big
+        total = mask.size
+        if largest_mask.sum() / total < min_size_pct / 100.0:
+            return mask
+
+        return largest_mask
+    except Exception:
+        return mask
 
 
 # ============================================================
@@ -304,7 +332,14 @@ def _score_quality(img: Image.Image, mask: np.ndarray, hsv: np.ndarray) -> dict:
 # MAIN: ANALYZE FULL PHOTO
 # ============================================================
 
-def analyze_photo(raw_bytes: bytes, k_clusters: int = 5) -> Optional[dict]:
+def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) -> Optional[dict]:
+    """
+    Analyze a full photo.
+
+    use_blob=True → isolates the largest connected region (fish body)
+                    before color analysis. Recommended for multi-fish
+                    or cluttered-background scenes.
+    """
     img = _load_image_rgb(raw_bytes)
     if img is None:
         return {"ok": False, "error": "Could not load image"}
@@ -317,6 +352,12 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5) -> Optional[dict]:
     mask = _mask_fish_region(hsv)
     if mask.sum() < 50:
         return {"ok": False, "error": "Too little fish region detected"}
+
+    # NEW: isolate the largest blob
+    if use_blob:
+        mask = _isolate_largest_blob(mask, min_size_pct=0.5)
+        if mask.sum() < 50:
+            return {"ok": False, "error": "No significant fish region found"}
 
     fish_pixels = rgb[mask]
     centroids, labels = _kmeans(fish_pixels.astype(np.float32), k=k_clusters)
@@ -378,6 +419,11 @@ def analyze_region(
     region_size: int = 150,
     k_clusters: int = 5,
 ) -> Optional[dict]:
+    """
+    Analyze a small square region around a tap point.
+    Region is already tight → blob detection is NOT applied here
+    (we trust the user's tap).
+    """
     img = _load_image_rgb(raw_bytes)
     if img is None:
         return {"ok": False, "error": "Could not load image"}
@@ -407,7 +453,8 @@ def analyze_region(
     cropped.save(buf, format="JPEG", quality=90)
     cropped_bytes = buf.getvalue()
 
-    analysis = analyze_photo(cropped_bytes, k_clusters=k_clusters)
+    # User picked this region → no blob isolation needed
+    analysis = analyze_photo(cropped_bytes, k_clusters=k_clusters, use_blob=False)
     if not analysis or not analysis.get("ok"):
         return analysis or {"ok": False, "error": "Region analysis failed"}
 
@@ -433,16 +480,7 @@ def extract_frames_from_video(
     max_frames: int = 30,
     target_width: int = 640,
 ) -> list[bytes]:
-    """
-    Extract sampled frames from a video file (in-memory).
-
-    - sample_every: take 1 frame out of every N
-    - max_frames: hard cap on total frames returned
-    - target_width: downscale each frame to this width (for speed)
-
-    Returns: list of JPEG-encoded frame bytes.
-    Raises RuntimeError if PyAV isn't available or the video can't be opened.
-    """
+    """Extract sampled frames from a video file (in-memory)."""
     if not _AV_AVAILABLE:
         raise RuntimeError("PyAV (av) not installed. Run: `py -m pip install av`")
 
@@ -466,8 +504,7 @@ def extract_frames_from_video(
         for frame in container.decode(video_stream):
             if idx % sample_every == 0:
                 try:
-                    img = frame.to_image()  # PIL Image
-                    # Downscale to target width to speed analysis
+                    img = frame.to_image()
                     w, h = img.size
                     if w > target_width:
                         ratio = target_width / w
@@ -482,7 +519,6 @@ def extract_frames_from_video(
                     if len(frames) >= max_frames:
                         break
                 except Exception:
-                    # Skip frames that fail to convert
                     pass
             idx += 1
     finally:
@@ -502,16 +538,8 @@ def analyze_video(
 ) -> dict:
     """
     Full video pipeline: extract sampled frames → analyze each → consensus.
-
-    Returns:
-      {
-        "ok": True,
-        "frames_analyzed": N,
-        "analyses": [analysis dicts],
-        "consensus": merge_analyses result,
-        "best_frame_idx": int,
-      }
-    Or {"ok": False, "error": "..."}.
+    Uses blob detection per frame to isolate the largest fish.
+    Skips frames that fail quality/coverage thresholds.
     """
     try:
         frames = extract_frames_from_video(
@@ -528,16 +556,18 @@ def analyze_video(
     analyses = []
     for fbytes in frames:
         try:
-            a = analyze_photo(fbytes, k_clusters=k_clusters)
+            a = analyze_photo(fbytes, k_clusters=k_clusters, use_blob=True)
             if a and a.get("ok"):
-                analyses.append(a)
+                # Skip low-coverage frames (fish too small / mostly background)
+                if a.get("coverage_pct", 0) >= 2.0:
+                    analyses.append(a)
         except Exception:
             continue
 
     if len(analyses) < 3:
         return {
             "ok": False,
-            "error": f"Only {len(analyses)} frames analyzed — need at least 3. Try a clearer video.",
+            "error": f"Only {len(analyses)} good frames — try a clearer video with the fish filling more of the frame.",
         }
 
     consensus = merge_analyses(analyses)
