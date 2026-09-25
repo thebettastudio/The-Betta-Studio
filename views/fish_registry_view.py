@@ -11,6 +11,7 @@
 # Session 26A — Multi-shot color capture (photo-based).
 # Session 26B — Multi-photo upload + tap-to-select region analysis.
 # Session 26C — Added video upload (auto frame scan).
+# Session 26D fix — Better video UX + best frame handling.
 
 import io
 import datetime
@@ -99,9 +100,9 @@ MAX_SAMPLES = 10
 MIN_SAMPLES_FOR_CONSENSUS = 3
 TAP_REGION_SIZE = 150
 DISPLAY_WIDTH = 480
-VIDEO_SAMPLE_EVERY = 5      # 1 frame out of every 5
-VIDEO_MAX_FRAMES = 30       # hard cap
-VIDEO_MAX_MB = 150          # upload size warning threshold
+VIDEO_SAMPLE_EVERY = 5
+VIDEO_MAX_FRAMES = 30
+VIDEO_MAX_MB = 150
 
 
 # ============================================================
@@ -241,11 +242,7 @@ def _session_key(version_key: str, suffix: str) -> str:
 
 
 def _render_color_capture_ui(version_key: str):
-    """
-    Color analysis via either:
-      A) Multi-photo upload + tap-to-select
-      B) Single video upload + auto frame scan
-    """
+    """Color analysis via Photos (tap-to-select) or Video (auto scan)."""
     session_prefix = f"color_session_{version_key}"
 
     defaults = {
@@ -276,7 +273,6 @@ def _render_color_capture_ui(version_key: str):
     if st.session_state[f"{session_prefix}_accepted"]:
         st.success("✓ Color analysis accepted. Save it with the fish registration below.")
 
-    # ---- Method selector ----
     method = st.radio(
         "Method",
         options=["📸 Photos (tap to select)", "🎬 Video (auto scan)"],
@@ -375,11 +371,26 @@ def _render_color_capture_ui(version_key: str):
     # METHOD B — VIDEO UPLOAD + AUTO SCAN
     # ============================================================
     else:
-        st.caption(
-            f"Record a **5–10 second video** with your phone (1080p@60fps recommended). "
-            f"Point at one fish. Upload — the app extracts and analyzes ~{VIDEO_MAX_FRAMES} frames automatically. "
-            f"**The video is never saved to Drive.**"
+        st.markdown(
+            f"**🎬 Video (auto scan)** — records 5–10 seconds, extracts ~{VIDEO_MAX_FRAMES} frames, "
+            "analyzes each, shows consensus. **Video is never saved to Drive.**"
         )
+        with st.expander("📋 Recording tips", expanded=False):
+            st.markdown(
+                "**✅ Best for:**\n"
+                "- Fish in a plain jar (fish fills 30–60% of frame)\n"
+                "- Fish with a **mirror background** — the app picks the "
+                "**largest fish** in each frame, so the real fish wins over its "
+                "smaller reflection\n"
+                "\n"
+                "**❌ Avoid:**\n"
+                "- Multiple fish in the same frame\n"
+                "- Fish cut off by frame edges\n"
+                "- Camera shake\n"
+                "- Very dark / very bright lighting\n"
+                "\n"
+                "**Recommended:** 1080p@60fps, 5–10 seconds"
+            )
 
         video_file = st.file_uploader(
             "🎬 Upload a video of the fish",
@@ -414,24 +425,15 @@ def _render_color_capture_ui(version_key: str):
                 else:
                     analyses = result.get("analyses") or []
                     consensus = result.get("consensus") or {}
-                    best_idx = result.get("best_frame_idx", 0)
+                    best_frame_bytes = result.get("best_frame_bytes")
 
                     st.session_state[f"{session_prefix}_samples"] = analyses
                     st.session_state[f"{session_prefix}_consensus"] = consensus
                     st.session_state[f"{session_prefix}_done"] = True
 
-                    # Extract the best frame as a snapshot for the profile photo
-                    # Note: only the best frame bytes survive
-                    from modules.color_detector import extract_frames_from_video
-                    try:
-                        frames = extract_frames_from_video(
-                            video_bytes,
-                            sample_every=VIDEO_SAMPLE_EVERY,
-                            max_frames=VIDEO_MAX_FRAMES,
-                        )
-                        if frames and 0 <= best_idx < len(frames):
-                            st.session_state[f"{session_prefix}_snapshots"] = [frames[best_idx]]
-                    except Exception:
+                    if best_frame_bytes:
+                        st.session_state[f"{session_prefix}_snapshots"] = [best_frame_bytes]
+                    else:
                         st.session_state[f"{session_prefix}_snapshots"] = []
 
                     st.success(f"✓ Analyzed {len(analyses)} frames from video.")
@@ -536,7 +538,6 @@ def _get_best_snapshot_bytes(version_key: str) -> Optional[bytes]:
     samples = st.session_state.get(f"{session_prefix}_samples") or []
     if not snapshots or not samples:
         return None
-    # For video flow, snapshots has 1 entry (best frame)
     if len(snapshots) == 1:
         return snapshots[0]
     best_idx = max(
