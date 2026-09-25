@@ -3,6 +3,7 @@
 # Session 26E — TEMPORARY video diagnostic page.
 # Session 26H — Reference silhouettes + match_score + flare_score +
 #                posture_class + IBC grading panel.
+# Session 26H.1 — Added AI secret diagnostic block.
 # Delete this file when done (also remove the nav entry in app.py).
 
 from __future__ import annotations
@@ -305,7 +306,6 @@ def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None,
         col_img, col_gates = st.columns([1, 2])
 
         with col_img:
-            # Tabs: Original, Bbox, Blob, Trajectory
             tab_labels = ["Original"]
             tab_contents = []
 
@@ -343,7 +343,6 @@ def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None,
             st.caption(caption)
 
         with col_gates:
-            # AI verdict strip
             if ai_verdict is not None:
                 posture_class = ai_verdict.get("posture_class", "unusable")
                 pc_bg, pc_fg = _posture_color(posture_class)
@@ -367,7 +366,6 @@ def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None,
                     unsafe_allow_html=True,
                 )
 
-                # Deviations
                 deviations = ai_verdict.get("deviations", []) or []
                 if deviations:
                     with st.expander(f"Deviations ({len(deviations)})", expanded=False):
@@ -496,11 +494,13 @@ def render_video_debug_page():
 
     # AI availability
     ai_available = False
+    ai_error = None
     try:
         from modules.ai_frame_judge import is_ai_available
         ai_available = is_ai_available()
-    except Exception:
+    except Exception as _e:
         ai_available = False
+        ai_error = str(_e)
 
     if ai_available:
         st.success("🤖 **Gemini AI judge is active.** Frames sent to Gemini with reference silhouettes.")
@@ -510,6 +510,39 @@ def render_video_debug_page():
             "⚠️ **Gemini AI not configured.** Add `GOOGLE_API_KEY` to Streamlit "
             "secrets. Falling back to classical pipeline."
         )
+
+        # ---------- TEMP DIAGNOSTIC ----------
+        with st.expander("🔍 Diagnostic — why is Gemini not configured?", expanded=True):
+            try:
+                import os as _os
+                from modules import ai_frame_judge as _afj
+
+                _genai_ok = getattr(_afj, "_GENAI_AVAILABLE", "unknown")
+
+                _secret_keys = "unavailable"
+                _key_found = "unavailable"
+                _key_len = "unavailable"
+                _secret_err = None
+                try:
+                    _secret_keys = list(st.secrets.keys())
+                    _key_found = "GOOGLE_API_KEY" in st.secrets
+                    _key_len = len(str(st.secrets.get("GOOGLE_API_KEY", "")))
+                except Exception as _se:
+                    _secret_err = str(_se)
+
+                st.json({
+                    "cwd": _os.getcwd(),
+                    "secrets_file_exists": _os.path.exists(".streamlit/secrets.toml"),
+                    "genai_sdk_available": _genai_ok,
+                    "st_secrets_top_level_keys": _secret_keys,
+                    "GOOGLE_API_KEY_found": _key_found,
+                    "GOOGLE_API_KEY_length": _key_len,
+                    "st_secrets_error": _secret_err,
+                    "ai_import_error": ai_error,
+                })
+            except Exception as _de:
+                st.error(f"Diagnostic failed: {_de}")
+        # ---------- END TEMP DIAGNOSTIC ----------
 
     video_file = st.file_uploader(
         "Upload video",
@@ -543,7 +576,6 @@ def render_video_debug_page():
 
     st.success(f"Extracted {len(frames)} frames.")
 
-    # Decode frames
     with st.spinner("Decoding frames…"):
         frames_rgb = []
         for fbytes in frames:
@@ -576,7 +608,6 @@ def render_video_debug_page():
                 ai_verdicts = None
 
     if ai_verdicts:
-        # Rank by (posture_class, flare_score, match_score)
         ranked = sorted(
             ai_verdicts,
             key=lambda v: (
@@ -591,7 +622,6 @@ def render_video_debug_page():
 
         usable = [v for v in ai_verdicts if v.get("posture_class") != "unusable"]
 
-        # Summary tiles
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total frames", len(ai_verdicts))
         c2.metric("✅ Fully flared", sum(1 for v in ai_verdicts
@@ -611,7 +641,6 @@ def render_video_debug_page():
                 f"match {ranked[0].get('match_score', 0):.2f})"
             )
 
-        # Best frame + crop
         if ai_best:
             with st.expander("🏆 Gemini's best frame + suggested crop", expanded=True):
                 bidx = ai_best.get("frame_index", -1)
@@ -636,7 +665,6 @@ def render_video_debug_page():
                             st.caption(f"Crop failed: {e}")
                     st.caption(f"_{ai_best.get('reason', '')}_")
 
-        # All verdicts
         with st.expander(f"🤖 All {len(ai_verdicts)} AI verdicts", expanded=False):
             for v in ranked:
                 pc = v.get("posture_class", "unusable")
@@ -657,7 +685,7 @@ def render_video_debug_page():
                     unsafe_allow_html=True,
                 )
 
-    # ---------- Classical tracking (comparison) ----------
+    # ---------- Classical tracking ----------
     with st.spinner("Classical tracking (comparison)…"):
         blobs_per_frame = _per_frame_motion_blobs(frames_rgb)
         track = _track_largest_blob(blobs_per_frame)
@@ -677,14 +705,12 @@ def render_video_debug_page():
         else:
             st.caption("No trajectory")
 
-    # ---------- Per-frame analysis (AI-ranked) ----------
-    # Order: AI-ranked by quality, then the rest
+    # ---------- Per-frame analysis ----------
     if ai_verdicts:
         ordered_indices = [v["frame_index"] for v in sorted(
             ai_verdicts,
             key=lambda v: ai_rank.get(v["frame_index"], 9999),
         )]
-        # Append any frames not covered by AI
         for i in range(len(frames)):
             if i not in ordered_indices:
                 ordered_indices.append(i)
@@ -754,7 +780,6 @@ def render_video_debug_page():
             key=lambda v: ai_rank.get(v["frame_index"], 9999),
         )[0]
 
-        # Compute preliminary IBC from top verdict alone
         dummy_consensus = {"body_length_depth_ratio": None}
         ibc = compute_ibc_score(top_verdict, dummy_consensus)
 
@@ -775,7 +800,7 @@ def render_video_debug_page():
                         f"  _source: {f['source']}_"
                     )
 
-    # ---------- Per-frame cards (ordered by rank) ----------
+    # ---------- Per-frame cards ----------
     st.markdown("---")
     st.markdown("#### Per-frame breakdown (AI-ranked)")
 
