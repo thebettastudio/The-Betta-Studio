@@ -7,12 +7,15 @@
 # Session 26D — Major accuracy upgrade + verified.
 # Session 26D round 2 — Reject low-saturation blobs.
 # Session 26D round 3 — Suppress silver glass noise.
-# Session 26E — 5-region full-fish split + posture validation.
-#              • Tier 1: strict side-profile + flared → analyze
-#              • Tier 2: region-level fallback (partial analysis)
-#              • Tier 3: reject if no region usable
-#              • Side A/B via head direction
-#              • IBC standards module available (import-only)
+# Session 26E — Two-pass posture strategy + 5-region split + Side A/B.
+#   Pass 1 (strict): clean side profile + fully flared + complete
+#                    → if >=3 frames, consensus, mode="strict"
+#   Pass 2 (lenient + regional): per-frame regional fallback
+#                    → only clean/flared regions per frame, merged
+#   Both fail → reject with clear error.
+#   Side A = head-left, Side B = head-right.
+#   tap-to-select region crops bypass posture via skip_posture=True.
+#   IBC standards module available (import-only).
 
 from __future__ import annotations
 
@@ -63,23 +66,19 @@ COLOR_CATEGORIES = [
 
 
 # ============================================================
-# POSTURE VALIDATION CONSTANTS
+# POSTURE VALIDATION CONSTANTS (Session 26E)
 # ============================================================
 
-# A side-profile blob should be elongated, not square
-MIN_ASPECT_RATIO = 1.3           # length/height ≥ this → side profile
-MIN_COVERAGE_PCT = 2.0           # blob must be ≥2% of frame
+MIN_ASPECT_RATIO = 1.3
+MIN_COVERAGE_PCT = 2.0
+MAX_SOLIDITY_FLARED = 0.80
+MIN_FLARE_PIXELS = 40
+MIN_TAIL_SPREAD_RATIO = 1.3
 
-# Flare detection — flared fish have distinct fin extensions
-# Body height vs full fish height: clamped ≈ narrow, flared ≈ wide
-MIN_FLARE_HEIGHT_RATIO = 0.45    # blob_height / blob_length
-
-# Region split — fractions along the principal axis
 HEAD_REGION_FRAC = 0.25
 BODY_REGION_FRAC = 0.50
 TAIL_REGION_FRAC = 0.25
 
-# Region weights for palette merge
 REGION_WEIGHTS = {
     "head":   0.15,
     "body":   0.35,
@@ -87,6 +86,11 @@ REGION_WEIGHTS = {
     "dorsal": 0.15,
     "anal":   0.15,
 }
+
+MIN_STRICT_FRAMES = 3
+MIN_PARTIAL_REGION_FRAMES = 3
+MIN_REGION_PIXELS = 30
+EDGE_MARGIN_PX = 2
 
 
 # ============================================================
@@ -369,71 +373,76 @@ def _isolate_largest_blob(mask: np.ndarray, rgb: np.ndarray, min_size_pct: float
 
 
 # ============================================================
-# POSTURE VALIDATION (Session 26E)
+# ORIENTATION (PCA, vectorized)
 # ============================================================
 
 def _compute_orientation(blob_mask: np.ndarray) -> dict:
-    """
-    Compute blob orientation via PCA.
-    Returns:
-      {
-        "major_axis_angle_deg": float,      # direction of longest axis (0-180)
-        "length": float,                    # length along major axis (px)
-        "height": float,                    # width perpendicular to major axis
-        "aspect": float,                    # length/height
-        "head_direction": "left" | "right" | "up" | "down" | "unknown",
-      }
-    """
+    default = {
+        "major_axis_angle_deg": 0.0,
+        "length": 0.0,
+        "height": 0.0,
+        "aspect": 0.0,
+        "head_direction": "unknown",
+        "proj_major": None,
+        "proj_minor": None,
+        "mean": None,
+        "major_vec": None,
+        "minor_vec": None,
+    }
+
     try:
         ys, xs = np.where(blob_mask)
         if len(xs) < 10:
-            return {
-                "major_axis_angle_deg": 0.0,
-                "length": 0.0,
-                "height": 0.0,
-                "aspect": 0.0,
-                "head_direction": "unknown",
-            }
+            return default
 
         points = np.column_stack([xs, ys]).astype(np.float32)
         mean = points.mean(axis=0)
         centered = points - mean
 
-        # PCA via SVD
         cov = np.cov(centered.T)
         eigvals, eigvecs = np.linalg.eig(cov)
-
-        # Principal axis = eigenvector with largest eigenvalue
         major_idx = int(np.argmax(eigvals))
+        minor_idx = 1 - major_idx
         major_vec = eigvecs[:, major_idx].astype(np.float32)
-        minor_vec = eigvecs[:, 1 - major_idx].astype(np.float32)
+        minor_vec = eigvecs[:, minor_idx].astype(np.float32)
 
-        # Project points onto both axes to get lengths
         proj_major = centered @ major_vec
         proj_minor = centered @ minor_vec
 
         length = float(proj_major.max() - proj_major.min()) + 1
         height = float(proj_minor.max() - proj_minor.min()) + 1
-
         aspect = length / max(1.0, height)
 
-        # Angle of major axis in degrees (0 = horizontal right, 90 = vertical)
         angle_rad = math.atan2(major_vec[1], major_vec[0])
         angle_deg = math.degrees(angle_rad) % 180
 
-        # Determine "head direction": the side with more mass concentration
-        # (heads are denser in pixels because fins are spread out on the tail)
-        left_mass = float((proj_major < 0).sum())
-        right_mass = float((proj_major >= 0).sum())
+        maj_min = float(proj_major.min())
+        maj_max = float(proj_major.max())
+        span = max(1e-6, maj_max - maj_min)
+        lo_cut = maj_min + span / 3.0
+        hi_cut = maj_max - span / 3.0
 
-        # Also check if the axis is vertical (head up or down)
-        if 60 <= angle_deg <= 120:
-            # Vertical orientation
-            top_mass = float((proj_minor < 0).sum())
-            bottom_mass = float((proj_minor >= 0).sum())
-            head_direction = "up" if top_mass > bottom_mass else "down"
+        lo_mask = proj_major <= lo_cut
+        hi_mask = proj_major >= hi_cut
+
+        if lo_mask.sum() < 3 or hi_mask.sum() < 3:
+            head_direction = "left" if (proj_major < 0).sum() > (proj_major >= 0).sum() else "right"
         else:
-            head_direction = "left" if left_mass > right_mass else "right"
+            lo_spread = float(proj_minor[lo_mask].max() - proj_minor[lo_mask].min())
+            hi_spread = float(proj_minor[hi_mask].max() - proj_minor[hi_mask].min())
+
+            if abs(lo_spread - hi_spread) < 1.0:
+                head_direction = "left" if (proj_major < 0).sum() > (proj_major >= 0).sum() else "right"
+            elif lo_spread < hi_spread:
+                if 60 <= angle_deg <= 120:
+                    head_direction = "up"
+                else:
+                    head_direction = "left"
+            else:
+                if 60 <= angle_deg <= 120:
+                    head_direction = "down"
+                else:
+                    head_direction = "right"
 
         return {
             "major_axis_angle_deg": round(angle_deg, 1),
@@ -441,168 +450,268 @@ def _compute_orientation(blob_mask: np.ndarray) -> dict:
             "height": round(height, 1),
             "aspect": round(aspect, 2),
             "head_direction": head_direction,
+            "proj_major": proj_major,
+            "proj_minor": proj_minor,
+            "mean": mean,
+            "major_vec": major_vec,
+            "minor_vec": minor_vec,
         }
     except Exception:
-        return {
-            "major_axis_angle_deg": 0.0,
-            "length": 0.0,
-            "height": 0.0,
-            "aspect": 0.0,
-            "head_direction": "unknown",
-        }
+        return default
 
+
+# ============================================================
+# FLARE DETECTION (Session 26E)
+# ============================================================
 
 def _detect_flare(blob_mask: np.ndarray, orientation: dict) -> dict:
-    """
-    Determine whether fins are flared (open) or clamped.
-    Heuristic: flared fish have larger height relative to length.
-
-    Returns:
-      {
-        "is_flared": bool,
-        "confidence": float (0..1),
-        "reason": str,
-      }
-    """
     try:
+        if blob_mask.sum() < 30:
+            return {"is_flared": False, "confidence": 0.0,
+                    "reason": "Blob too small", "solidity": 1.0,
+                    "extension_px": 0, "tail_ratio": 1.0}
+
+        solidity = 1.0
+        if _SCIPY_AVAILABLE:
+            try:
+                filled = _ndimage.binary_fill_holes(blob_mask)
+                hull = _ndimage.binary_dilation(filled, iterations=3)
+                hull = _ndimage.binary_fill_holes(hull)
+                hull_area = float(hull.sum())
+                blob_area = float(blob_mask.sum())
+                solidity = blob_area / max(1.0, hull_area)
+            except Exception:
+                solidity = 1.0
+
+        extension_px = 0
+        try:
+            ys, xs = np.where(blob_mask)
+            if len(xs) > 0:
+                cx = float(xs.mean())
+                cy = float(ys.mean())
+                h_span = xs.max() - xs.min() + 1
+                v_span = ys.max() - ys.min() + 1
+                a = h_span * 0.30
+                b = v_span * 0.30
+                if a > 0 and b > 0:
+                    inside = ((xs - cx) / a) ** 2 + ((ys - cy) / b) ** 2 <= 1.0
+                    extension_px = int((~inside).sum())
+        except Exception:
+            extension_px = 0
+
+        tail_ratio = 1.0
+        proj_major = orientation.get("proj_major")
+        proj_minor = orientation.get("proj_minor")
+        if proj_major is not None and proj_minor is not None and len(proj_major) > 10:
+            try:
+                maj_min = float(proj_major.min())
+                maj_max = float(proj_major.max())
+                span = max(1e-6, maj_max - maj_min)
+                hd = orientation.get("head_direction", "left")
+
+                if hd in ("left", "up"):
+                    tail_lo = maj_min + span * 0.75
+                    mid_lo = maj_min + span * 0.35
+                    mid_hi = maj_min + span * 0.65
+                    tail_mask = proj_major >= tail_lo
+                else:
+                    tail_lo = maj_max - span * 0.75
+                    mid_lo = maj_min + span * 0.35
+                    mid_hi = maj_min + span * 0.65
+                    tail_mask = proj_major <= tail_lo
+
+                mid_mask = (proj_major >= mid_lo) & (proj_major <= mid_hi)
+
+                if tail_mask.sum() > 5 and mid_mask.sum() > 5:
+                    tail_w = float(proj_minor[tail_mask].max() - proj_minor[tail_mask].min())
+                    mid_w = float(proj_minor[mid_mask].max() - proj_minor[mid_mask].min())
+                    tail_ratio = tail_w / max(1e-6, mid_w)
+            except Exception:
+                tail_ratio = 1.0
+
+        flared_signals = 0
+        if solidity <= MAX_SOLIDITY_FLARED:
+            flared_signals += 1
+        if extension_px >= MIN_FLARE_PIXELS:
+            flared_signals += 1
+        if tail_ratio >= MIN_TAIL_SPREAD_RATIO:
+            flared_signals += 1
+
+        is_flared = flared_signals >= 2
         aspect = orientation.get("aspect", 0)
-        # Flared fish typically have aspect 1.3-2.5
-        # Clamped fish have aspect > 3 (long narrow tube)
-        if aspect <= 2.5:
-            return {
-                "is_flared": True,
-                "confidence": min(1.0, (3.0 - aspect) / 1.5),
-                "reason": f"Body/fin aspect {aspect:.2f} suggests flared",
-            }
-        elif aspect <= 3.2:
-            return {
-                "is_flared": True,
-                "confidence": 0.5,
-                "reason": f"Body/fin aspect {aspect:.2f} — possibly flared",
-            }
-        else:
-            return {
-                "is_flared": False,
-                "confidence": 0.7,
-                "reason": f"Body/fin aspect {aspect:.2f} suggests clamped fins",
-            }
-    except Exception:
+        if aspect > 3.0:
+            is_flared = False
+
+        confidence = flared_signals / 3.0
+
+        reason_bits = [
+            f"solidity={solidity:.2f}",
+            f"ext_px={extension_px}",
+            f"tail_ratio={tail_ratio:.2f}",
+        ]
+        reason = ("flared" if is_flared else "clamped") + " (" + ", ".join(reason_bits) + ")"
+
         return {
-            "is_flared": True,   # default allow
-            "confidence": 0.3,
-            "reason": "Could not evaluate flare",
+            "is_flared": is_flared,
+            "confidence": round(confidence, 2),
+            "reason": reason,
+            "solidity": round(solidity, 3),
+            "extension_px": int(extension_px),
+            "tail_ratio": round(tail_ratio, 3),
         }
+    except Exception as e:
+        return {"is_flared": False, "confidence": 0.0,
+                "reason": f"Flare check failed: {e}",
+                "solidity": 1.0, "extension_px": 0, "tail_ratio": 1.0}
 
 
-def _validate_posture(blob_mask: np.ndarray, rgb: np.ndarray, coverage_pct: float) -> dict:
-    """
-    Validate whether the blob is a good side-profile shot with flared fins.
+# ============================================================
+# POSTURE VALIDATION (Session 26E)
+# ============================================================
 
-    Returns:
-      {
-        "tier": 1 | 2 | 3,       # 1=strict pass, 2=region fallback, 3=reject
-        "is_side_profile": bool,
-        "orientation": {...},
-        "flare": {...},
-        "reason": str,
-      }
-    """
+def _check_completeness(blob_mask: np.ndarray, orientation: dict) -> dict:
+    try:
+        H, W = blob_mask.shape
+        ys, xs = np.where(blob_mask)
+        if len(xs) < 30:
+            return {"complete": False, "partial_ok": False,
+                    "reason": "Blob too small"}
+
+        b = EDGE_MARGIN_PX
+        touches_edge = (
+            xs.min() <= b or ys.min() <= b
+            or xs.max() >= W - 1 - b or ys.max() >= H - 1 - b
+        )
+
+        if not touches_edge:
+            return {"complete": True, "partial_ok": True,
+                    "reason": "Full fish visible"}
+
+        proj_major = orientation.get("proj_major")
+        if proj_major is None or len(proj_major) < 10:
+            return {"complete": False, "partial_ok": False,
+                    "reason": "Partial visibility, cannot assess regions"}
+
+        maj_min = float(proj_major.min())
+        maj_max = float(proj_major.max())
+        span = max(1e-6, maj_max - maj_min)
+        mid_lo = maj_min + span * 0.30
+        mid_hi = maj_min + span * 0.70
+
+        mid_mask = (proj_major >= mid_lo) & (proj_major <= mid_hi)
+        mid_px = int(mid_mask.sum())
+
+        if mid_px >= max(30, int(0.25 * len(proj_major))):
+            return {"complete": False, "partial_ok": True,
+                    "reason": "Partial fish — body + fin region visible"}
+        return {"complete": False, "partial_ok": False,
+                "reason": "Partial fish — body not sufficiently visible"}
+    except Exception:
+        return {"complete": False, "partial_ok": False,
+                "reason": "Completeness check failed"}
+
+
+def validate_fish_posture(blob_mask: np.ndarray, rgb: np.ndarray,
+                           coverage_pct: float) -> dict:
     orientation = _compute_orientation(blob_mask)
     flare = _detect_flare(blob_mask, orientation)
+    completeness = _check_completeness(blob_mask, orientation)
 
     aspect = orientation.get("aspect", 0)
-
     is_side_profile = aspect >= MIN_ASPECT_RATIO
-    is_complete = coverage_pct >= MIN_COVERAGE_PCT
+    is_complete = completeness.get("complete", False)
+    is_partial_ok = completeness.get("partial_ok", False)
+    is_flared = flare.get("is_flared", False)
+    flare_conf = flare.get("confidence", 0.0)
 
-    # Tier 1: strict
-    if is_side_profile and is_complete and flare.get("is_flared") and flare.get("confidence", 0) >= 0.5:
-        return {
-            "tier": 1,
-            "is_side_profile": True,
-            "orientation": orientation,
-            "flare": flare,
-            "reason": "Strict side-profile with flared fins",
-        }
+    coverage_ok = coverage_pct >= MIN_COVERAGE_PCT
 
-    # Tier 2: partial / region fallback
-    if is_complete:
-        return {
-            "tier": 2,
-            "is_side_profile": is_side_profile,
-            "orientation": orientation,
-            "flare": flare,
-            "reason": f"Region fallback — {flare.get('reason', '')}",
-        }
+    head_dir = orientation.get("head_direction", "unknown")
+    if head_dir == "left":
+        side_label = "A"
+    elif head_dir == "right":
+        side_label = "B"
+    else:
+        side_label = "?"
 
-    # Tier 3: reject
-    return {
-        "tier": 3,
-        "is_side_profile": False,
-        "orientation": orientation,
+    base = {
+        "side_profile": is_side_profile,
+        "flared": is_flared,
+        "complete": is_complete,
+        "partial_ok": is_partial_ok,
+        "head_direction": head_dir,
+        "side_label": side_label,
+        "orientation": {k: v for k, v in orientation.items()
+                        if k not in ("proj_major", "proj_minor", "mean",
+                                      "major_vec", "minor_vec")},
         "flare": flare,
-        "reason": "Coverage too low or bad orientation",
     }
 
+    if (coverage_ok and is_side_profile and is_flared and flare_conf >= 0.66
+            and (is_complete or is_partial_ok)):
+        base["pass"] = 1
+        base["reason"] = "Strict pass — side profile + flared"
+        return base
+
+    if coverage_ok and aspect >= 1.15 and is_partial_ok:
+        base["pass"] = 2
+        base["reason"] = (
+            "Regional pass — "
+            + ("flared" if is_flared else "possibly clamped")
+        )
+        return base
+
+    base["pass"] = 3
+    if not coverage_ok:
+        base["reason"] = "Fish too small in frame"
+    elif not is_side_profile and aspect < 1.15:
+        base["reason"] = "Not a side profile (head-on or top-down)"
+    elif not is_partial_ok:
+        base["reason"] = "Fish cut off — body not visible enough"
+    else:
+        base["reason"] = "Posture rejected"
+    return base
+
 
 # ============================================================
-# 5-REGION SPLIT (Session 26E)
+# 5-REGION SPLIT (Session 26E, vectorized)
 # ============================================================
 
-def _split_blob_into_regions(blob_mask: np.ndarray) -> dict:
-    """
-    Split the fish blob into 5 regions along the principal axis:
-      head   (0-25%)
-      body   (25-75%)
-      tail   (75-100%)
-      dorsal (upper half of body along perpendicular)
-      anal   (lower half of body along perpendicular)
-
-    Uses the blob's own silhouette — includes ALL pixels inside the mask,
-    so no fin regions are cut off.
-
-    Returns:
-      {
-        "head_mask": boolean array,
-        "body_mask": ...,
-        "tail_mask": ...,
-        "dorsal_mask": ...,
-        "anal_mask": ...,
-      }
-    Or {} if split fails.
-    """
+def _split_blob_into_regions(blob_mask: np.ndarray,
+                              orientation: Optional[dict] = None) -> dict:
     try:
+        if orientation is None:
+            orientation = _compute_orientation(blob_mask)
+
+        proj_major = orientation.get("proj_major")
+        proj_minor = orientation.get("proj_minor")
+        mean = orientation.get("mean")
+
+        if proj_major is None or mean is None:
+            return {}
+
         ys, xs = np.where(blob_mask)
         if len(xs) < 10:
             return {}
 
-        points = np.column_stack([xs, ys]).astype(np.float32)
-        mean = points.mean(axis=0)
-        centered = points - mean
+        maj_min = float(proj_major.min())
+        maj_max = float(proj_major.max())
+        span = max(1e-6, maj_max - maj_min)
+        norm_major = (proj_major - maj_min) / span
 
-        # PCA
-        cov = np.cov(centered.T)
-        eigvals, eigvecs = np.linalg.eig(cov)
-        major_idx = int(np.argmax(eigvals))
-        major_vec = eigvecs[:, major_idx].astype(np.float32)
-        minor_vec = eigvecs[:, 1 - major_idx].astype(np.float32)
+        hd = orientation.get("head_direction", "left")
 
-        # Project into principal coordinate frame
-        proj_major = centered @ major_vec
-        proj_minor = centered @ minor_vec
+        if hd in ("left", "up", "unknown"):
+            canon = norm_major
+        else:
+            canon = 1.0 - norm_major
 
-        # Normalize to [0, 1] along major axis
-        maj_min, maj_max = proj_major.min(), proj_major.max()
-        maj_span = max(1e-6, maj_max - maj_min)
-        norm_major = (proj_major - maj_min) / maj_span
+        is_head = canon < HEAD_REGION_FRAC
+        is_tail = canon >= (1.0 - TAIL_REGION_FRAC)
+        is_body = ~is_head & ~is_tail
 
-        # Normalize perpendicular to [-1, 1]
-        min_minor, min_max = proj_minor.min(), proj_minor.max()
-        minor_half = max(1e-6, max(abs(min_minor), abs(min_max)))
-        norm_minor = proj_minor / minor_half
-
-        # Build region masks (boolean arrays of same shape as blob_mask)
-        H, W = blob_mask.shape
+        dorsal = proj_minor < 0
+        anal = proj_minor >= 0
 
         head_mask = np.zeros_like(blob_mask, dtype=bool)
         body_mask = np.zeros_like(blob_mask, dtype=bool)
@@ -610,43 +719,11 @@ def _split_blob_into_regions(blob_mask: np.ndarray) -> dict:
         dorsal_mask = np.zeros_like(blob_mask, dtype=bool)
         anal_mask = np.zeros_like(blob_mask, dtype=bool)
 
-        # Determine which end is the "head" based on head_direction
-        # Head is where mass is concentrated. Compute mass per 10% bins.
-        head_dir = "left"  # default
-        orient = _compute_orientation(blob_mask)
-        head_dir = orient.get("head_direction", "left")
-
-        # Map pixels to regions
-        # We iterate over the points once (cheap since points are sparse)
-        for i, (x, y) in enumerate(zip(xs, ys)):
-            nm = norm_major[i]
-            np_ = norm_minor[i]
-
-            # Determine "head-half" vs "tail-half" based on head direction
-            if head_dir in ("left", "up"):
-                # Lower norm_major = head side
-                head_side = nm < 0.5
-                is_head = nm < HEAD_REGION_FRAC
-                is_tail = nm > (1 - TAIL_REGION_FRAC)
-            else:
-                # Higher norm_major = head side
-                head_side = nm > 0.5
-                is_head = nm > (1 - HEAD_REGION_FRAC)
-                is_tail = nm < TAIL_REGION_FRAC
-
-            is_body = not is_head and not is_tail
-
-            if is_head:
-                head_mask[y, x] = True
-            elif is_body:
-                body_mask[y, x] = True
-                # Dorsal vs anal — upper vs lower half relative to axis
-                if np_ < 0:
-                    dorsal_mask[y, x] = True
-                else:
-                    anal_mask[y, x] = True
-            elif is_tail:
-                tail_mask[y, x] = True
+        head_mask[ys[is_head], xs[is_head]] = True
+        body_mask[ys[is_body], xs[is_body]] = True
+        tail_mask[ys[is_tail], xs[is_tail]] = True
+        dorsal_mask[ys[dorsal], xs[dorsal]] = True
+        anal_mask[ys[anal], xs[anal]] = True
 
         return {
             "head_mask": head_mask,
@@ -654,19 +731,22 @@ def _split_blob_into_regions(blob_mask: np.ndarray) -> dict:
             "tail_mask": tail_mask,
             "dorsal_mask": dorsal_mask,
             "anal_mask": anal_mask,
-            "head_direction": head_dir,
+            "head_direction": hd,
         }
     except Exception:
         return {}
 
+
+# ============================================================
+# PER-REGION PALETTE
+# ============================================================
 
 def _palette_for_mask(
     rgb_u8: np.ndarray,
     region_mask: np.ndarray,
     k_clusters: int = 4,
 ) -> dict[str, float]:
-    """Run k-means color analysis on a specific region mask."""
-    if region_mask.sum() < 30:
+    if region_mask.sum() < MIN_REGION_PIXELS:
         return {}
 
     region_pixels = rgb_u8[region_mask]
@@ -753,7 +833,8 @@ def _map_hsv_to_category(h: float, s: float, v: float) -> Optional[str]:
     best = None
     best_dist = 999
     for name, hc, hw, smin, vmin, vmax in COLOR_CATEGORIES:
-        if name in ("white", "silver", "black", "gold_metallic", "copper", "bronze", "cream", "dark_blue"):
+        if name in ("white", "silver", "black", "gold_metallic",
+                    "copper", "bronze", "cream", "dark_blue"):
             continue
         if s < smin or not (vmin <= v <= vmax):
             continue
@@ -912,13 +993,53 @@ def _score_quality(img: Image.Image, mask: np.ndarray, hsv: np.ndarray) -> dict:
 
 
 # ============================================================
-# MAIN: ANALYZE PHOTO (5-region pipeline)
+# REGION MERGE HELPERS
 # ============================================================
 
-def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) -> Optional[dict]:
+def _merge_region_palettes(region_palettes: dict[str, dict[str, float]]) -> dict[str, float]:
+    if not region_palettes:
+        return {}
+
+    merged: dict[str, float] = {}
+    total_weight = 0.0
+    for region_name, pal in region_palettes.items():
+        weight = REGION_WEIGHTS.get(region_name, 0.0)
+        if weight == 0 or not pal:
+            continue
+        total_weight += weight
+        for color, pct in pal.items():
+            merged[color] = merged.get(color, 0) + pct * weight
+
+    if total_weight > 0:
+        merged = {k: round(v / total_weight, 1) for k, v in merged.items()}
+
+    merged = {k: v for k, v in merged.items() if v >= 3.0}
+    merged = _suppress_silver_noise(merged)
+    return dict(sorted(merged.items(), key=lambda x: -x[1]))
+
+
+def _classify_pattern(palette: dict[str, float]) -> str:
+    if not palette:
+        return "unknown"
+    keys = list(palette.keys())
+    if len(keys) == 1 or palette[keys[0]] >= 60:
+        return "solid"
+    if len(keys) == 2 and sum(palette.values()) >= 70:
+        return "bi-color"
+    return "multicolor"
+
+
+# ============================================================
+# MAIN: ANALYZE PHOTO (Session 26E two-pass)
+# ============================================================
+
+def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
+                  use_blob: bool = True, skip_posture: bool = False) -> Optional[dict]:
     """
-    Analyze a photo using 5-region full-fish split.
-    Returns a palette dict + posture info + side label.
+    Analyze a photo using 5-region full-fish split + posture validation.
+
+    skip_posture=True bypasses posture validation — used by analyze_region()
+    for tap-to-select crops that aren't full-fish silhouettes.
     """
     img = _load_image_rgb(raw_bytes)
     if img is None:
@@ -945,92 +1066,74 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) 
 
     coverage_pct = float(mask.sum() / mask.size * 100)
 
-    # Posture validation
-    posture = _validate_posture(mask, rgb_u8, coverage_pct)
-    tier = posture.get("tier", 3)
-
-    if tier == 3:
-        return {
-            "ok": False,
-            "error": "Fish posture not usable — try a side-profile shot with fins flared",
-            "posture": posture,
+    # Posture validation (skippable for tap-to-select region crops)
+    if skip_posture:
+        posture = {
+            "pass": 1,
+            "side_profile": True,
+            "flared": True,
+            "complete": True,
+            "partial_ok": True,
+            "head_direction": "unknown",
+            "side_label": "?",
+            "reason": "Posture validation skipped (region crop)",
         }
+        pass_num = 1
+    else:
+        posture = validate_fish_posture(mask, rgb_u8, coverage_pct)
+        pass_num = posture.get("pass", 3)
 
-    # 5-region split
-    regions = _split_blob_into_regions(mask)
+        if pass_num == 3:
+            return {
+                "ok": False,
+                "error": "Fish posture not usable — try a side-profile shot with fins flared",
+                "posture": posture,
+            }
+
+    orientation_full = _compute_orientation(mask)
+    regions = _split_blob_into_regions(mask, orientation=orientation_full)
+
     if not regions:
-        # Fall back to whole-blob analysis
         regions = {
             "body_mask": mask,
             "head_mask": np.zeros_like(mask, dtype=bool),
             "tail_mask": np.zeros_like(mask, dtype=bool),
             "dorsal_mask": np.zeros_like(mask, dtype=bool),
             "anal_mask": np.zeros_like(mask, dtype=bool),
-            "head_direction": posture.get("orientation", {}).get("head_direction", "unknown"),
+            "head_direction": posture.get("head_direction", "unknown"),
         }
 
-    # Analyze each region
-    region_palettes = {}
+    region_palettes: dict[str, dict[str, float]] = {}
     for region_name in ("head", "body", "tail", "dorsal", "anal"):
         rmask = regions.get(f"{region_name}_mask")
-        if rmask is not None and rmask.sum() >= 30:
-            region_palettes[region_name] = _palette_for_mask(rgb_u8, rmask, k_clusters=4)
+        if rmask is not None and rmask.sum() >= MIN_REGION_PIXELS:
+            pal = _palette_for_mask(rgb_u8, rmask, k_clusters=4)
+            if pal:
+                region_palettes[region_name] = pal
 
-    # Weighted merge
-    if region_palettes:
-        merged: dict[str, float] = {}
-        total_weight = 0.0
-        for region_name, pal in region_palettes.items():
-            weight = REGION_WEIGHTS.get(region_name, 0.0)
-            if weight == 0:
-                continue
-            total_weight += weight
-            for color, pct in pal.items():
-                merged[color] = merged.get(color, 0) + pct * weight
+    merged = _merge_region_palettes(region_palettes)
 
-        if total_weight > 0:
-            merged = {k: round(v / total_weight, 1) for k, v in merged.items()}
-    else:
-        # Last-ditch fallback — whole blob
+    if not merged:
         merged = _palette_for_mask(rgb_u8, mask, k_clusters=k_clusters)
+        merged = {k: v for k, v in merged.items() if v >= 3.0}
+        merged = _suppress_silver_noise(merged)
+        merged = dict(sorted(merged.items(), key=lambda x: -x[1]))
 
-    merged = {k: v for k, v in merged.items() if v >= 3.0}
-    merged = _suppress_silver_noise(merged)
-
-    sorted_palette = dict(sorted(merged.items(), key=lambda x: -x[1]))
-
-    keys = list(sorted_palette.keys())
-    primary = keys[0] if len(keys) > 0 else None
+    keys = list(merged.keys())
+    primary = keys[0] if keys else None
     secondary = keys[1] if len(keys) > 1 else None
-
-    if not keys:
-        pattern = "unknown"
-    elif len(keys) == 1 or sorted_palette[keys[0]] >= 60:
-        pattern = "solid"
-    elif len(keys) == 2 and sum(sorted_palette.values()) >= 70:
-        pattern = "bi-color"
-    else:
-        pattern = "multicolor"
+    pattern = _classify_pattern(merged)
 
     iri_level, iri_score = _detect_iridescence(hsv, mask)
     quality = _score_quality(img, mask, hsv)
 
-    # Determine side label from head direction
-    head_dir = regions.get("head_direction", "unknown")
-    if head_dir == "left":
-        side_label = "A"     # left-facing = Side A
-    elif head_dir == "right":
-        side_label = "B"     # right-facing = Side B
-    else:
-        side_label = "?"
-
-    # Confidence from how many regions were usable
+    side_label = posture.get("side_label", "?")
     regions_used = len(region_palettes)
-    region_confidence = min(1.0, regions_used / 5.0)
+    region_confidence = round(min(1.0, regions_used / 5.0), 2)
 
     return {
         "ok": True,
-        "palette": sorted_palette,
+        "palette": merged,
         "primary": primary,
         "secondary": secondary,
         "pattern_hint": pattern,
@@ -1040,9 +1143,10 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) 
         "coverage_pct": round(coverage_pct, 1),
         "posture": posture,
         "regions_used": list(region_palettes.keys()),
-        "region_confidence": round(region_confidence, 2),
-        "side_label": side_label,                # "A", "B", or "?"
-        "tier": tier,                            # 1 or 2
+        "region_palettes": region_palettes,
+        "region_confidence": region_confidence,
+        "side_label": side_label,
+        "pass": pass_num,
         "debug": {
             "water_tint_detected": water_tint is not None,
             "adaptive_bg_detected": bg_color is not None,
@@ -1092,7 +1196,8 @@ def analyze_region(
     cropped.save(buf, format="JPEG", quality=90)
     cropped_bytes = buf.getvalue()
 
-    analysis = analyze_photo(cropped_bytes, k_clusters=k_clusters, use_blob=False)
+    analysis = analyze_photo(cropped_bytes, k_clusters=k_clusters,
+                             use_blob=False, skip_posture=True)
     if not analysis or not analysis.get("ok"):
         return analysis or {"ok": False, "error": "Region analysis failed"}
 
@@ -1167,6 +1272,33 @@ def extract_frames_from_video(
     return frames
 
 
+# ============================================================
+# VIDEO: PASS 2 REGIONAL FALLBACK
+# ============================================================
+
+def _frame_regions_clean(regions: dict, shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    clean: dict[str, np.ndarray] = {}
+    H, W = shape
+    b = EDGE_MARGIN_PX
+
+    for name in ("head", "body", "tail", "dorsal", "anal"):
+        rmask = regions.get(f"{name}_mask")
+        if rmask is None:
+            continue
+        if rmask.sum() < MIN_REGION_PIXELS:
+            continue
+        ys, xs = np.where(rmask)
+        if len(xs) == 0:
+            continue
+        if (xs.min() <= b or ys.min() <= b
+                or xs.max() >= W - 1 - b or ys.max() >= H - 1 - b):
+            continue
+        if name in ("dorsal", "anal", "tail") and rmask.sum() < 40:
+            continue
+        clean[name] = rmask
+    return clean
+
+
 def analyze_video(
     video_bytes: bytes,
     sample_every: int = 5,
@@ -1174,12 +1306,15 @@ def analyze_video(
     k_clusters: int = 5,
 ) -> dict:
     """
-    Video pipeline with tiered posture strategy.
+    Two-pass video pipeline.
 
-    Tier 1: collect only strict-pass frames.
-    If Tier 1 yields ≥3 frames, use them.
-    If Tier 1 yields <3, fall back to Tier 2 (region-level) frames.
-    If neither yields ≥3, reject.
+    Pass 1 (strict): keep only frames where posture pass == 1.
+    If >= MIN_STRICT_FRAMES and same-side majority → mode="strict".
+
+    Pass 2 (regional fallback): per-frame region-only analysis.
+    Merge per-region across frames → mode="regional".
+
+    Else reject.
     """
     try:
         frames = extract_frames_from_video(
@@ -1193,70 +1328,163 @@ def analyze_video(
     if not frames:
         return {"ok": False, "error": "No frames could be extracted"}
 
-    tier1_analyses = []
-    tier1_indices = []
-    tier2_analyses = []
-    tier2_indices = []
+    # ---------- PASS 1 ----------
+    strict_analyses = []
+    strict_indices = []
 
     for fi, fbytes in enumerate(frames):
         try:
             a = analyze_photo(fbytes, k_clusters=k_clusters, use_blob=True)
             if not a or not a.get("ok"):
                 continue
-            tier = a.get("tier", 3)
-            if tier == 1 and a.get("coverage_pct", 0) >= 2.0:
-                tier1_analyses.append(a)
-                tier1_indices.append(fi)
-            elif tier == 2 and a.get("coverage_pct", 0) >= 2.0:
-                tier2_analyses.append(a)
-                tier2_indices.append(fi)
+            if a.get("pass", 3) != 1:
+                continue
+            strict_analyses.append(a)
+            strict_indices.append(fi)
         except Exception:
             continue
 
-    # Choose tier
-    if len(tier1_analyses) >= 3:
-        chosen = tier1_analyses
-        chosen_indices = tier1_indices
-        used_tier = 1
-    elif len(tier2_analyses) >= 3:
-        chosen = tier2_analyses
-        chosen_indices = tier2_indices
-        used_tier = 2
-    else:
+    if len(strict_analyses) >= MIN_STRICT_FRAMES:
+        sides = [a.get("side_label", "?") for a in strict_analyses]
+        a_count = sides.count("A")
+        b_count = sides.count("B")
+        if a_count >= b_count:
+            majority = "A"
+        else:
+            majority = "B"
+
+        kept = [a for a in strict_analyses if a.get("side_label") == majority]
+        if len(kept) >= MIN_STRICT_FRAMES:
+            consensus = merge_analyses(kept)
+            best_idx = max(
+                range(len(kept)),
+                key=lambda i: (kept[i].get("quality", {}) or {}).get("score", 0),
+            )
+            best_frame_idx = strict_indices[best_idx]
+            best_frame_bytes = frames[best_frame_idx]
+
+            return {
+                "ok": True,
+                "mode": "strict",
+                "frames_analyzed": len(kept),
+                "analyses": kept,
+                "consensus": consensus,
+                "best_frame_idx": best_frame_idx,
+                "best_frame_bytes": best_frame_bytes,
+                "side_a_count": sum(1 for a in kept if a.get("side_label") == "A"),
+                "side_b_count": sum(1 for a in kept if a.get("side_label") == "B"),
+                "majority_side": majority,
+                "discarded_minority_frames": len(strict_analyses) - len(kept),
+            }
+
+    # ---------- PASS 2: regional fallback ----------
+    regional_contributors = 0
+    region_samples: dict[str, list[dict[str, float]]] = {
+        "head": [], "body": [], "tail": [], "dorsal": [], "anal": []
+    }
+
+    for fi, fbytes in enumerate(frames):
+        try:
+            img = _load_image_rgb(fbytes)
+            if img is None:
+                continue
+            img.thumbnail((640, 640), Image.LANCZOS)
+
+            rgb = np.asarray(img).astype(np.float32)
+            rgb = _normalize_white_balance(rgb)
+            rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+            hsv = _rgb_to_hsv_numpy(rgb_u8)
+
+            water_tint = _detect_water_tint(hsv)
+            bg_color = _detect_background_color_cluster(rgb_u8)
+
+            mask = _mask_fish_region(hsv, rgb_u8,
+                                     water_tint=water_tint, bg_color=bg_color)
+            if mask.sum() < 50:
+                continue
+            mask = _isolate_largest_blob(mask, rgb_u8, min_size_pct=0.5)
+            if mask.sum() < 50:
+                continue
+
+            coverage_pct = float(mask.sum() / mask.size * 100)
+            if coverage_pct < MIN_COVERAGE_PCT:
+                continue
+
+            orientation_full = _compute_orientation(mask)
+            aspect = orientation_full.get("aspect", 0)
+            if aspect < 1.15:
+                continue
+
+            regions = _split_blob_into_regions(mask, orientation=orientation_full)
+            if not regions:
+                continue
+
+            clean = _frame_regions_clean(regions, mask.shape)
+            if not clean:
+                continue
+
+            contributed = False
+            for name, rmask in clean.items():
+                pal = _palette_for_mask(rgb_u8, rmask, k_clusters=4)
+                if pal:
+                    region_samples[name].append(pal)
+                    contributed = True
+
+            if contributed:
+                regional_contributors += 1
+        except Exception:
+            continue
+
+    merged_region_palettes: dict[str, dict[str, float]] = {}
+    for name, samples in region_samples.items():
+        if not samples:
+            continue
+        keys = set()
+        for s in samples:
+            keys.update(s.keys())
+        avg: dict[str, float] = {}
+        for k in keys:
+            avg[k] = round(sum(s.get(k, 0.0) for s in samples) / len(samples), 1)
+        avg = {k: v for k, v in avg.items() if v >= 3.0}
+        if avg:
+            merged_region_palettes[name] = avg
+
+    if regional_contributors >= MIN_PARTIAL_REGION_FRAMES and merged_region_palettes:
+        merged = _merge_region_palettes(merged_region_palettes)
+        pattern = _classify_pattern(merged)
+        keys = list(merged.keys())
+        primary = keys[0] if keys else None
+        secondary = keys[1] if len(keys) > 1 else None
+
         return {
-            "ok": False,
-            "error": (
-                f"Only {len(tier1_analyses)} strict frames and "
-                f"{len(tier2_analyses)} partial frames found. "
-                "Try again with side-profile + fins flared, closer to fish."
-            ),
+            "ok": True,
+            "mode": "regional",
+            "frames_analyzed": regional_contributors,
+            "region_samples": {k: len(v) for k, v in region_samples.items()},
+            "merged_region_palettes": merged_region_palettes,
+            "consensus": {
+                "ok": True,
+                "palette": merged,
+                "primary": primary,
+                "secondary": secondary,
+                "pattern_hint": pattern,
+                "shot_count": regional_contributors,
+            },
+            "best_frame_idx": 0,
+            "best_frame_bytes": frames[0] if frames else None,
+            "side_a_count": 0,
+            "side_b_count": 0,
         }
 
-    consensus = merge_analyses(chosen)
-
-    best_analysis_idx = max(
-        range(len(chosen)),
-        key=lambda i: (chosen[i].get("quality", {}) or {}).get("score", 0),
-    )
-    best_frame_idx = chosen_indices[best_analysis_idx] if best_analysis_idx < len(chosen_indices) else 0
-    best_frame_bytes = frames[best_frame_idx] if 0 <= best_frame_idx < len(frames) else None
-
-    # Side A/B counts
-    side_a = sum(1 for a in chosen if a.get("side_label") == "A")
-    side_b = sum(1 for a in chosen if a.get("side_label") == "B")
-
+    # ---------- BOTH FAILED ----------
     return {
-        "ok": True,
-        "frames_analyzed": len(chosen),
-        "analyses": chosen,
-        "consensus": consensus,
-        "best_frame_idx": best_frame_idx,
-        "best_frame_bytes": best_frame_bytes,
-        "tier_used": used_tier,
-        "side_a_count": side_a,
-        "side_b_count": side_b,
-        "strict_frames_found": len(tier1_analyses),
-        "partial_frames_found": len(tier2_analyses),
+        "ok": False,
+        "error": (
+            "Could not find a clear side view. "
+            "Try again with fish side-on and fins flared."
+        ),
+        "strict_frames_found": len(strict_analyses),
+        "regional_contributors": regional_contributors,
     }
 
 
@@ -1284,15 +1512,7 @@ def merge_analyses(analyses: list[dict]) -> dict:
     keys = list(merged.keys())
     primary = keys[0] if keys else None
     secondary = keys[1] if len(keys) > 1 else None
-
-    if not keys:
-        pattern = "unknown"
-    elif len(keys) == 1 or merged[keys[0]] >= 60:
-        pattern = "solid"
-    elif len(keys) == 2 and sum(merged.values()) >= 70:
-        pattern = "bi-color"
-    else:
-        pattern = "multicolor"
+    pattern = _classify_pattern(merged)
 
     iri_scores = [a.get("iridescence_score", 0) for a in valid]
     max_score = max(iri_scores)
@@ -1306,11 +1526,9 @@ def merge_analyses(analyses: list[dict]) -> dict:
     else:
         iri_level = "strong"
 
-    # Region confidence (average)
     region_confs = [a.get("region_confidence", 0) for a in valid]
     avg_region_conf = round(sum(region_confs) / len(region_confs), 2) if region_confs else 0.0
 
-    # Side labels seen
     sides_seen = sorted(set(a.get("side_label", "?") for a in valid))
 
     return {
