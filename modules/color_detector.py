@@ -12,7 +12,7 @@
 #   • Pass 2 (lenient + regional): per-frame regional fallback
 #   • IBC body ratio uses interquartile depth (excludes fin tips)
 #   • Candidate picker: split merged blob, pick best IBC side view
-#     (real fish wins because reflection is typically partial/broken)
+#   • Connectivity + anal-slope discriminators reject broken reflections
 #   • Regions aligned to HMPK anatomy: head 20% / body 45% / tail 35%
 #   • Side A = head-left, Side B = head-right
 #   • tap-to-select crops bypass posture via skip_posture=True
@@ -70,7 +70,7 @@ COLOR_CATEGORIES = [
 # ============================================================
 
 MIN_ASPECT_RATIO = 1.05
-MIN_BODY_RATIO_SIDE = 2.0
+MIN_BODY_RATIO_SIDE = 1.8
 MIN_BODY_RATIO_PARTIAL = 1.6
 MIN_COVERAGE_PCT = 1.0
 
@@ -708,17 +708,16 @@ def validate_fish_posture(blob_mask: np.ndarray, rgb: np.ndarray,
 
 
 # ============================================================
-# CANDIDATE SPLIT + PICK (Session 26E, best-IBC-view)
+# CANDIDATE SPLIT + PICK
 # ============================================================
 
 def _split_into_candidates(blob_mask: np.ndarray,
                             rgb_u8: np.ndarray) -> list[np.ndarray]:
     """
-    Return a list of candidate fish masks from the blob.
+    Return a list of candidate fish masks.
 
-    If the blob is roughly square (aspect < 1.25), it likely contains
-    two fish (real + reflection). Split at the min-density column in
-    the middle 30% and return [left, right]. Otherwise return [blob].
+    If blob is roughly square (<1.20 aspect) → split at min-density
+    column and return [left, right]. Otherwise return [blob].
     """
     try:
         if blob_mask.sum() < 200:
@@ -739,7 +738,7 @@ def _split_into_candidates(blob_mask: np.ndarray,
             return [blob_mask]
 
         bbox_aspect = max(width, height) / max(1, min(width, height))
-        if bbox_aspect >= 1.25:
+        if bbox_aspect >= 1.20:
             return [blob_mask]
 
         col_counts = np.bincount(xs - x_min, minlength=width)
@@ -775,9 +774,11 @@ def _split_into_candidates(blob_mask: np.ndarray,
 
 def _score_candidate(mask: np.ndarray, rgb_u8: np.ndarray) -> dict:
     """
-    Score a candidate fish mask against IBC side-view criteria.
+    Score a candidate mask against IBC side-view criteria.
 
-    Returns dict with all check results + a single composite score.
+    Additional discriminators vs real HMPK side view:
+      • Connectivity — one solid component, not a broken reflection
+      • Anal slope   — bottom edge slopes down toward tail
     """
     coverage_pct = float(mask.sum() / mask.size * 100)
 
@@ -798,11 +799,50 @@ def _score_candidate(mask: np.ndarray, rgb_u8: np.ndarray) -> dict:
 
     coverage_ok = coverage_pct >= MIN_COVERAGE_PCT
 
+    # --- Silhouette connectivity ---
+    connectivity_ok = True
+    largest_component_frac = 1.0
+    if _SCIPY_AVAILABLE:
+        try:
+            labeled, num = _ndimage.label(mask)
+            if num > 1:
+                sizes = _ndimage.sum(mask, labeled, index=range(1, num + 1))
+                largest = float(max(sizes))
+                largest_component_frac = largest / float(mask.sum())
+                if largest_component_frac < 0.85:
+                    connectivity_ok = False
+        except Exception:
+            connectivity_ok = True
+
+    # --- Anal fin slope (front-to-back trapezoid) ---
+    anal_slope_ok = True
+    try:
+        proj_major_c = orientation.get("proj_major")
+        proj_minor_c = orientation.get("proj_minor")
+        if proj_major_c is not None and proj_minor_c is not None:
+            anal_band = proj_minor_c > 0
+            if anal_band.sum() > 30:
+                anal_major = proj_major_c[anal_band]
+                anal_minor = proj_minor_c[anal_band]
+                a_min = float(anal_major.min())
+                a_max = float(anal_major.max())
+                a_span = max(1e-6, a_max - a_min)
+                front_mask = anal_major <= (a_min + a_span * 0.20)
+                back_mask = anal_major >= (a_min + a_span * 0.80)
+                if front_mask.sum() > 3 and back_mask.sum() > 3:
+                    front_depth = float(anal_minor[front_mask].max())
+                    back_depth = float(anal_minor[back_mask].max())
+                    if front_depth > 0 and back_depth < front_depth * 1.15:
+                        anal_slope_ok = False
+    except Exception:
+        anal_slope_ok = True
+
     if (coverage_ok and aspect_ok and body_ratio_ok and is_flared
-            and flare_conf >= 0.5 and (is_complete or is_partial_ok)):
+            and flare_conf >= 0.5 and (is_complete or is_partial_ok)
+            and connectivity_ok and anal_slope_ok):
         pass_level = 1
     elif (coverage_ok and aspect >= 1.0 and body_ratio >= MIN_BODY_RATIO_PARTIAL
-            and is_partial_ok):
+            and is_partial_ok and connectivity_ok):
         pass_level = 2
     else:
         pass_level = 3
@@ -812,6 +852,9 @@ def _score_candidate(mask: np.ndarray, rgb_u8: np.ndarray) -> dict:
         "coverage_pct": round(coverage_pct, 2),
         "aspect": aspect,
         "body_ratio": round(body_ratio, 2),
+        "connectivity_ok": connectivity_ok,
+        "largest_component_frac": round(largest_component_frac, 3),
+        "anal_slope_ok": anal_slope_ok,
         "flared": is_flared,
         "flare_conf": flare_conf,
         "complete": is_complete,
@@ -827,19 +870,26 @@ def _score_candidate(mask: np.ndarray, rgb_u8: np.ndarray) -> dict:
 def _pick_best_candidate(candidates: list[np.ndarray],
                           rgb_u8: np.ndarray) -> Optional[dict]:
     """
-    Evaluate each candidate and return the one with the best IBC
-    side-view score.
+    Return the candidate with the best IBC side-view score.
 
     Priority:
-      1. Lowest pass level (1 = strict, 2 = regional, 3 = reject)
-      2. Highest body_ratio
-      3. Largest coverage
+      1. Pass level (1 strict > 2 regional > 3 reject)
+      2. Connectivity (solid silhouette > broken)
+      3. Anal slope   (trapezoid > flat)
+      4. Body ratio   (longer body > shorter)
+      5. Coverage     (bigger > smaller)
     """
     if not candidates:
         return None
 
     scored = [_score_candidate(m, rgb_u8) for m in candidates]
-    scored.sort(key=lambda s: (s["pass"], -s["body_ratio"], -s["coverage_pct"]))
+    scored.sort(key=lambda s: (
+        s["pass"],
+        not s.get("connectivity_ok", True),
+        not s.get("anal_slope_ok", True),
+        -s["body_ratio"],
+        -s["coverage_pct"],
+    ))
     return scored[0]
 
 
