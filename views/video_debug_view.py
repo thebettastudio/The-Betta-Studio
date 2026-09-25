@@ -2,6 +2,7 @@
 # Betta Farm Management System
 # Session 26E — TEMPORARY video diagnostic page.
 # Session 26F — Gemini AI frame judge panel added.
+# Session 26G — Supports new dict return format + best frame + crop.
 # Delete this file when done (also remove the nav entry in app.py).
 
 from __future__ import annotations
@@ -77,7 +78,6 @@ def _render_trajectory_overlay(img_pil: Image.Image,
 
 def _render_trajectory_map(frames_shape: tuple[int, int],
                              track: list) -> bytes:
-    """Small map showing all tracked centroids + bboxes across frames."""
     try:
         H, W = frames_shape
         canvas = Image.new("RGB", (W, H), (240, 244, 248))
@@ -197,7 +197,7 @@ def _analyze_one_frame(fbytes: bytes, traj_mask=None, head_override=None,
         posture = validate_fish_posture(blob, rgb_u8, result["coverage_pct"])
         if pass_override is not None and pass_override in (1, 2):
             result["pass"] = pass_override
-            result["posture_reason"] = "AI-approved frame"
+            result["posture_reason"] = "AI-approved frame (Gemini)"
         else:
             result["pass"] = posture.get("pass", 3)
             result["posture_reason"] = posture.get("reason", "")
@@ -280,7 +280,6 @@ def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None):
             )
 
         with col_gates:
-            # AI verdict strip at the top
             if ai_verdict is not None:
                 ai_ok = ai_verdict.get("pass", False)
                 ai_color = "#16A34A" if ai_ok else "#DC2626"
@@ -443,15 +442,19 @@ def render_video_debug_page():
 
     # ---- Gemini AI verdicts ----
     ai_verdicts = None
+    ai_best = None
     ai_map = {}
     if ai_available:
-        with st.spinner("🤖 Asking Gemini to judge frames… this may take 5–15s"):
+        with st.spinner("🤖 Asking Gemini to judge frames… this may take 10–20s"):
             try:
                 from modules.ai_frame_judge import judge_frames
-                ai_verdicts = judge_frames(
+                ai_result = judge_frames(
                     frames_bytes=frames,
                     frame_indices=list(range(len(frames))),
                 )
+                if ai_result:
+                    ai_verdicts = ai_result.get("frames", [])
+                    ai_best = ai_result.get("best", None)
             except Exception as e:
                 st.error(f"Gemini judge failed: {e}")
                 ai_verdicts = None
@@ -463,6 +466,32 @@ def render_video_debug_page():
             f"🤖 Gemini AI: **{ai_passed}/{len(ai_verdicts)}** frames passed "
             f"side-view + flared + full-body check"
         )
+
+        # --- Best frame + crop ---
+        if ai_best:
+            with st.expander("🏆 Gemini's best frame + suggested crop", expanded=True):
+                bidx = ai_best.get("frame_index", -1)
+                if 0 <= bidx < len(frames):
+                    col_orig, col_crop = st.columns(2)
+                    with col_orig:
+                        st.caption(f"**Original — frame {bidx}**")
+                        try:
+                            orig_img = _load_image_rgb(frames[bidx])
+                            if orig_img is not None:
+                                st.image(orig_img, use_container_width=True)
+                        except Exception:
+                            pass
+                    with col_crop:
+                        st.caption("**Suggested crop (profile photo)**")
+                        try:
+                            from modules.ai_frame_judge import crop_frame
+                            cropped_bytes = crop_frame(frames, ai_best)
+                            if cropped_bytes:
+                                st.image(cropped_bytes, use_container_width=True)
+                        except Exception as e:
+                            st.caption(f"Crop failed: {e}")
+                    st.caption(f"_{ai_best.get('reason', '')}_")
+
         with st.expander("🤖 AI verdicts per frame", expanded=False):
             for v in ai_verdicts:
                 icon = "✅" if v.get("pass") else "❌"
@@ -476,7 +505,7 @@ def render_video_debug_page():
                     f"   _{v.get('reason', '')}_"
                 )
 
-    # ---- Classical tracking (for comparison / fallback) ----
+    # ---- Classical tracking (comparison / fallback) ----
     with st.spinner("Tracking the real fish (classical)…"):
         blobs_per_frame = _per_frame_motion_blobs(frames_rgb)
         track = _track_largest_blob(blobs_per_frame)
@@ -502,22 +531,22 @@ def render_video_debug_page():
     for i, fbytes in enumerate(frames):
         traj_mask = _build_trajectory_mask(frames_rgb[i].shape[:2], track, i)
 
-        # If AI approved this frame, use AI head_direction + pass override
         ai_v = ai_map.get(i) if ai_map else None
         head_override = None
         pass_override = None
 
         if ai_v is not None:
-            head_override = ai_v.get("head_direction") if ai_v.get("head_direction") in ("left", "right", "up", "down") else None
+            hd = ai_v.get("head_direction")
+            if hd in ("left", "right", "up", "down"):
+                head_override = hd
             if ai_v.get("pass"):
                 pass_override = 1
 
-        # Classical head fallback if no AI
         if head_override is None and track[i] is not None:
             tmp_orient = {"major_axis_angle_deg": 0, "head_direction": "unknown"}
-            head_override = _head_direction_from_track(track, i, tmp_orient)
-            if head_override == "unknown":
-                head_override = None
+            h = _head_direction_from_track(track, i, tmp_orient)
+            if h != "unknown":
+                head_override = h
 
         results.append(_analyze_one_frame(
             fbytes,
@@ -539,12 +568,12 @@ def render_video_debug_page():
     c3.metric("⚠️ Pass 2 (regional)", pass2)
     c4.metric("❌ Reject", reject)
 
-    if pass1 >= 3:
+    if pass1 >= 1:
         st.success("Video would be accepted in STRICT mode.")
-    elif pass2 >= 3:
+    elif pass2 >= 1:
         st.warning("Video would be accepted in REGIONAL mode (Pass 2).")
     else:
-        st.error("Video would be REJECTED — not enough good frames in either pass.")
+        st.error("Video would be REJECTED — not enough good frames.")
 
     st.markdown("---")
     st.markdown("#### Per-frame breakdown")
@@ -567,5 +596,6 @@ def render_video_debug_page():
             },
             "track_coverage_pct": round(coverage_pct, 1),
             "ai_verdicts": ai_verdicts,
+            "ai_best": ai_best,
             "results": clean,
         })
