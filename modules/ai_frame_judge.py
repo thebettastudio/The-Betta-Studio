@@ -2,14 +2,20 @@
 # Betta Farm Management System
 # Session 26F — Gemini AI frame judge.
 # Session 26G — 15 frames, best-frame + crop box, retry with backoff.
+# Session 26H — Reference silhouettes + match_score + flare_score +
+#                posture_class + real_fish_bbox per frame.
 #
-# Sends sampled video frames to Gemini (free tier) and asks which
-# show a clean side view of the betta with fins flared.
+# Sends:
+#   1. Reference silhouettes (4 HMPK variants) — "this is ideal HMPK"
+#   2. Candidate frames — "score each against the references"
 #
-# Also returns the single best frame + a suggested crop box around
-# just the fish (for use as the profile photo).
-#
-# Retry logic: 3 attempts with backoff on transient errors (503, 429).
+# Returns per frame:
+#   {
+#     frame_index, match_score, flare_score, matched_reference,
+#     posture_class, head_direction, bbox, deviations,
+#     confidence, reason
+#   }
+# Plus best frame + crop.
 
 from __future__ import annotations
 
@@ -32,7 +38,6 @@ except ImportError:
 # CONFIG
 # ============================================================
 
-# Try these models in order — first one that works wins
 GEMINI_MODEL_FALLBACKS = [
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
@@ -40,87 +45,113 @@ GEMINI_MODEL_FALLBACKS = [
 ]
 GEMINI_MODEL = GEMINI_MODEL_FALLBACKS[0]
 
-# Max frames sent to Gemini per video (free tier: 15 req/min)
 MAX_FRAMES_TO_JUDGE = 15
 
-# Retry behavior on 503 / 429 / timeouts
 MAX_RETRY_ATTEMPTS = 3
-RETRY_BACKOFF_SECONDS = [5, 15]   # wait before retry 2, retry 3
+RETRY_BACKOFF_SECONDS = [5, 15]
 
-# Threshold for "AI is available at all"
-_GENAI_TIMEOUT_SECONDS = 60
+
+# Posture class priority (higher = better) — used by caller
+POSTURE_CLASS_RANK = {
+    "fully_flared": 5,
+    "mostly_flared": 4,
+    "partially_flared": 3,
+    "clamped": 2,
+    "unusable": 1,
+}
 
 
 # ============================================================
 # PROMPT
 # ============================================================
 
-JUDGE_PROMPT = """You are analyzing frames from a video of a betta fish.
-The video is filmed in a tank, and there may be a mirror reflection of
-the fish visible in some frames.
+JUDGE_PROMPT = """You are analyzing frames from a video of a betta fish (HMPK / Halfmoon Plakat variant).
 
-For EACH frame I send you, analyze it carefully and answer:
+You will receive REFERENCE SILHOUETTES first, then candidate frames.
 
-1. Is this a clean SIDE VIEW of the fish?
-   - Side view = head facing LEFT or RIGHT (not head-on, not top-down)
-   - The fish's body profile must be clearly visible
+The reference silhouettes show what an ideal HMPK side view looks like:
+- Traditional Show Plakat
+- Symmetrical Show Plakat
+- Asymmetrical Show Plakat
+- Pet-grade baseline (relaxed pose)
 
-2. Are the fins FLARED open? (not clamped flat against the body)
+These are the archetypes. Real fish may not match perfectly — that is
+expected. Your job is to score how close each frame is.
 
-3. Is the FULL FISH visible in the frame?
-   - Head, body, AND caudal (tail) all inside the frame
-   - Not cut off by frame edges
+For EACH candidate frame, evaluate:
 
-4. Which direction is the head pointing?
-   - "left", "right", "up", or "down"
+1. match_score (float 0..1) — how closely does this frame's fish silhouette
+   match ANY of the reference silhouettes?
+   1.0 = essentially perfect match to a reference anatomy
+   0.7-0.9 = very good, minor deviations
+   0.5-0.7 = recognizable HMPK but noticeable deviations
+   0.3-0.5 = only loosely resembles the reference anatomy
+   <0.3 = does not look like an HMPK side view
 
-5. Is the visible fish the REAL fish, or only a MIRROR REFLECTION?
-   - Real fish: crisp edges, brighter, full shape
-   - Reflection: softer, dimmer, may be clipped by tank walls
+2. flare_score (float 0..1) — how flared/open are the fins?
+   1.0 = fully flared, maximum spread
+   0.7-0.9 = well flared
+   0.4-0.7 = partially flared
+   0.2-0.4 = mostly clamped
+   <0.2 = fully clamped / fins tight against body
 
-Return ONLY a JSON object. No prose. No markdown fences.
+3. matched_reference (string) — which reference matches best:
+   "hmpk_traditional_show" | "hmpk_symmetrical_show" |
+   "hmpk_asymmetrical_show" | "hmpk_pet_grade" | "none"
 
-The object must have TWO keys: "frames" and "best".
+4. posture_class (string) — one of:
+   "fully_flared" | "mostly_flared" | "partially_flared" |
+   "clamped" | "unusable"
+   NOTE: "unusable" only if the fish is head-on/top-down, or only a
+   mirror reflection is visible, or the fish is not identifiable.
 
-"frames" is an array, one element per frame, in the same order I sent them:
+5. head_direction (string) — "left" | "right" | "up" | "down" | "unknown"
+
+6. bbox (object) — tight bounding box around the REAL fish ONLY,
+   excluding any mirror reflection. Use normalized 0..1 coords:
+   {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+   (x,y = top-left corner; w,h = width,height as fractions)
+
+7. deviations (list of strings) — specific visual differences from
+   the matched reference. Example:
+   ["dorsal fin base narrower than ideal",
+    "caudal spread approximately 170 degrees"]
+
+8. confidence (float 0..1) — your confidence in the assessment
+
+9. reason (string) — one short sentence summarizing the frame
+
+RULES:
+- Do NOT reject a frame just because fins are clamped — set flare_score
+  and posture_class accordingly.
+- If the fish is in profile but relaxed, still score it.
+- Only mark "unusable" if the frame truly cannot be analyzed.
+- Prefer the frame with highest (flare_score, match_score) for "best".
+- If only a mirror reflection is visible (no real fish), mark as unusable.
+
+Return ONLY JSON. No prose. No markdown fences:
 
 {
   "frames": [
     {
       "frame_index": 0,
-      "pass": true,
+      "match_score": 0.85,
+      "flare_score": 0.90,
+      "matched_reference": "hmpk_symmetrical_show",
+      "posture_class": "fully_flared",
       "head_direction": "left",
-      "is_reflection_only": false,
-      "fins_flared": true,
-      "full_body_visible": true,
-      "confidence": 0.9,
-      "reason": "Clean side profile, head left, fins flared, full body visible"
-    },
-    ...
+      "bbox": {"x": 0.10, "y": 0.20, "w": 0.70, "h": 0.60},
+      "deviations": ["dorsal fin base slightly narrow"],
+      "confidence": 0.85,
+      "reason": "Clean side profile with good flare"
+    }
   ],
   "best": {
-    "frame_index": 8,
-    "crop_box": {
-      "x": 0.18,
-      "y": 0.30,
-      "width": 0.55,
-      "height": 0.45
-    },
-    "reason": "Clearest side profile with full flared fins"
+    "frame_index": 0,
+    "bbox": {"x": 0.10, "y": 0.20, "w": 0.70, "h": 0.60},
+    "reason": "Highest flare + match score"
   }
 }
-
-Rules for "frames":
-- "pass" is true ONLY if: side view AND fins flared AND full body visible AND not reflection-only
-- confidence is a float 0.0-1.0
-- reason must be a short single sentence
-
-Rules for "best":
-- frame_index must be one of the frames that PASS
-- crop_box uses normalized coordinates 0..1 relative to the frame
-  (x = left edge, y = top edge, width, height)
-- crop_box should tightly frame JUST the fish, with a small margin
-- If NO frame passes, set "best" to null
 """
 
 
@@ -144,12 +175,10 @@ def _get_client():
 
 
 def is_ai_available() -> bool:
-    """Quick check whether Gemini is configured and usable."""
     return _get_client() is not None
 
 
 def get_diagnostic() -> dict:
-    """Return diagnostic info for the debug page."""
     import streamlit as _st
     diag = {
         "genai_sdk_available": _GENAI_AVAILABLE,
@@ -174,39 +203,51 @@ def get_diagnostic() -> dict:
 def judge_frames(frames_bytes: list[bytes],
                   frame_indices: Optional[list[int]] = None) -> Optional[dict]:
     """
-    Send frames to Gemini and get per-frame verdicts + best frame.
-
-    Args:
-        frames_bytes: list of JPEG bytes to analyze
-        frame_indices: optional list mapping each frame_bytes[i] to
-                       its original index in the video.
-
-    Returns:
-        {
-            "frames": [ {frame_index, pass, head_direction, ...}, ... ],
-            "best": {frame_index, crop_box, reason} | None,
-        }
-        Or None if Gemini is unavailable or errored.
+    Send reference silhouettes + frames to Gemini.
+    Returns {"frames": [...], "best": {...}, "reference_used": [...]}.
     """
     client = _get_client()
-    if client is None:
-        return None
-
-    if not frames_bytes:
+    if client is None or not frames_bytes:
         return None
 
     if frame_indices is None:
         frame_indices = list(range(len(frames_bytes)))
 
-    # Cap to avoid burning free tier
+    # Cap
     if len(frames_bytes) > MAX_FRAMES_TO_JUDGE:
         step = len(frames_bytes) / MAX_FRAMES_TO_JUDGE
         keep = [int(i * step) for i in range(MAX_FRAMES_TO_JUDGE)]
         frames_bytes = [frames_bytes[i] for i in keep]
         frame_indices = [frame_indices[i] for i in keep]
 
+    # Load references
+    try:
+        from modules.reference_shapes import load_reference_images
+        refs = load_reference_images()
+    except Exception:
+        refs = []
+
     # Build contents
     contents: list = [JUDGE_PROMPT]
+
+    if refs:
+        contents.append("=== REFERENCE SILHOUETTES ===")
+        for ref in refs:
+            contents.append(f"Reference: {ref['name']}")
+            try:
+                contents.append(
+                    types.Part.from_bytes(data=ref["bytes"],
+                                            mime_type=ref["mime_type"])
+                )
+            except Exception:
+                contents.append(
+                    types.Part.from_data(data=ref["bytes"],
+                                           mime_type=ref["mime_type"])
+                )
+    else:
+        contents.append("(No reference images available. Use your knowledge of HMPK anatomy.)")
+
+    contents.append("=== CANDIDATE FRAMES ===")
     for orig_idx, fb in zip(frame_indices, frames_bytes):
         contents.append(f"Frame index {orig_idx}:")
         try:
@@ -218,7 +259,7 @@ def judge_frames(frames_bytes: list[bytes],
                 types.Part.from_data(data=fb, mime_type="image/jpeg")
             )
 
-    # Call API with retry + model fallback
+    # Call with retry
     response = None
     last_error = None
 
@@ -226,7 +267,6 @@ def judge_frames(frames_bytes: list[bytes],
         model_to_try = GEMINI_MODEL_FALLBACKS[
             min(attempt, len(GEMINI_MODEL_FALLBACKS) - 1)
         ]
-
         try:
             response = client.models.generate_content(
                 model=model_to_try,
@@ -237,18 +277,14 @@ def judge_frames(frames_bytes: list[bytes],
                     max_output_tokens=8192,
                 ),
             )
-            break   # success
+            break
         except Exception as e:
             last_error = e
             err_str = str(e)
-
             transient = any(code in err_str for code in [
-                "503", "UNAVAILABLE",
-                "429", "RESOURCE_EXHAUSTED",
-                "500", "INTERNAL",
-                "DEADLINE_EXCEEDED", "TIMEOUT",
+                "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+                "500", "INTERNAL", "DEADLINE_EXCEEDED", "TIMEOUT",
             ])
-
             if transient and attempt < MAX_RETRY_ATTEMPTS - 1:
                 wait = RETRY_BACKOFF_SECONDS[
                     min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)
@@ -262,8 +298,6 @@ def judge_frames(frames_bytes: list[bytes],
                 )
                 time.sleep(wait)
                 continue
-
-            # Not transient or out of retries
             st.warning(
                 f"Gemini API call failed after {attempt + 1} attempt(s): "
                 f"{last_error}"
@@ -278,14 +312,11 @@ def judge_frames(frames_bytes: list[bytes],
     if not raw_text.strip():
         return None
 
-    # Parse JSON
     parsed = _parse_json_response(raw_text)
     if parsed is None:
         return None
 
-    # Normalize: object with "frames" and "best"
     if isinstance(parsed, list):
-        # Old format — treat as frames array only
         frames_raw = parsed
         best_raw = None
     elif isinstance(parsed, dict):
@@ -299,45 +330,62 @@ def judge_frames(frames_bytes: list[bytes],
     for entry in frames_raw:
         if not isinstance(entry, dict):
             continue
+        bbox_raw = entry.get("bbox", {}) or {}
+        bbox = _normalize_bbox(bbox_raw)
         normalized_frames.append({
             "frame_index": int(entry.get("frame_index", -1)),
-            "pass": bool(entry.get("pass", False)),
+            "match_score": float(entry.get("match_score", 0.0)),
+            "flare_score": float(entry.get("flare_score", 0.0)),
+            "matched_reference": str(entry.get("matched_reference", "none")).lower(),
+            "posture_class": str(entry.get("posture_class", "unusable")).lower(),
             "head_direction": str(entry.get("head_direction", "unknown")).lower(),
-            "is_reflection_only": bool(entry.get("is_reflection_only", False)),
-            "fins_flared": bool(entry.get("fins_flared", False)),
-            "full_body_visible": bool(entry.get("full_body_visible", False)),
+            "bbox": bbox,
+            "deviations": list(entry.get("deviations", []) or [])[:8],
             "confidence": float(entry.get("confidence", 0.5)),
-            "reason": str(entry.get("reason", ""))[:200],
+            "reason": str(entry.get("reason", ""))[:250],
         })
 
     # Normalize best
     normalized_best = None
     if best_raw and isinstance(best_raw, dict):
-        crop = best_raw.get("crop_box", {}) or {}
-        try:
-            cx = float(crop.get("x", 0.0))
-            cy = float(crop.get("y", 0.0))
-            cw = float(crop.get("width", 0.0))
-            ch = float(crop.get("height", 0.0))
-            if 0.0 <= cx < 1.0 and 0.0 <= cy < 1.0 and 0.01 < cw <= 1.0 and 0.01 < ch <= 1.0:
-                normalized_best = {
-                    "frame_index": int(best_raw.get("frame_index", -1)),
-                    "crop_box": {"x": cx, "y": cy, "width": cw, "height": ch},
-                    "reason": str(best_raw.get("reason", ""))[:200],
-                }
-        except Exception:
-            normalized_best = None
+        bbox_raw = best_raw.get("bbox", {}) or best_raw.get("crop_box", {}) or {}
+        bbox = _normalize_bbox(bbox_raw)
+        if bbox:
+            normalized_best = {
+                "frame_index": int(best_raw.get("frame_index", -1)),
+                "bbox": bbox,
+                "crop_box": bbox,   # alias for backward compat
+                "reason": str(best_raw.get("reason", ""))[:250],
+            }
 
     return {
         "frames": normalized_frames,
         "best": normalized_best,
+        "reference_used": [r["name"] for r in refs],
     }
 
 
-def _parse_json_response(text: str):
-    """Extract JSON from Gemini's response (handles fences + arrays/objects)."""
-    t = text.strip()
+def _normalize_bbox(raw: dict) -> Optional[dict]:
+    """Validate and clamp a bbox dict {x,y,w,h} 0..1."""
+    try:
+        x = float(raw.get("x", 0.0))
+        y = float(raw.get("y", 0.0))
+        w = float(raw.get("width", raw.get("w", 0.0)))
+        h = float(raw.get("height", raw.get("h", 0.0)))
+        # Clamp
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+        w = max(0.02, min(1.0 - x, w))
+        h = max(0.02, min(1.0 - y, h))
+        if w < 0.05 or h < 0.05:
+            return None
+        return {"x": x, "y": y, "w": w, "h": h}
+    except Exception:
+        return None
 
+
+def _parse_json_response(text: str):
+    t = text.strip()
     if t.startswith("```"):
         first_nl = t.find("\n")
         if first_nl != -1:
@@ -345,13 +393,11 @@ def _parse_json_response(text: str):
         if t.endswith("```"):
             t = t[:-3].rstrip()
 
-    # Try direct
     try:
         return json.loads(t)
     except Exception:
         pass
 
-    # Try to find first { ... last } (object)
     if "{" in t and "}" in t:
         start = t.find("{")
         end = t.rfind("}")
@@ -361,7 +407,6 @@ def _parse_json_response(text: str):
             except Exception:
                 pass
 
-    # Try to find first [ ... last ] (array)
     if "[" in t and "]" in t:
         start = t.find("[")
         end = t.rfind("]")
@@ -375,21 +420,45 @@ def _parse_json_response(text: str):
 
 
 # ============================================================
-# CROP HELPER (used by callers to crop the best frame)
+# HELPERS
 # ============================================================
 
-def crop_frame(frames_bytes: list[bytes], best: dict) -> Optional[bytes]:
+def bbox_to_mask(shape: tuple[int, int], bbox: dict,
+                  pad: float = 0.08) -> Optional["np.ndarray"]:
     """
-    Given the frames list and the "best" object from judge_frames(),
-    crop the selected frame using the crop_box. Returns JPEG bytes.
+    Convert a normalized bbox {x,y,w,h} to a bool mask of the given
+    (H, W) shape. Adds padding (fraction of bbox size) as safety margin.
     """
+    try:
+        import numpy as np
+        H, W = shape
+        x = max(0.0, bbox["x"] - bbox["w"] * pad)
+        y = max(0.0, bbox["y"] - bbox["h"] * pad)
+        w = min(1.0 - x, bbox["w"] * (1 + 2 * pad))
+        h = min(1.0 - y, bbox["h"] * (1 + 2 * pad))
+
+        px0 = int(x * W)
+        py0 = int(y * H)
+        px1 = int((x + w) * W)
+        py1 = int((y + h) * H)
+
+        mask = np.zeros((H, W), dtype=bool)
+        mask[max(0, py0):min(H, py1), max(0, px0):min(W, px1)] = True
+        return mask
+    except Exception:
+        return None
+
+
+def crop_frame_to_bbox(frames_bytes: list[bytes], best: dict) -> Optional[bytes]:
+    """Crop the best frame using its bbox. Returns JPEG bytes."""
     if not best or not frames_bytes:
         return None
     idx = best.get("frame_index", -1)
     if idx < 0 or idx >= len(frames_bytes):
         return None
-    box = best.get("crop_box")
-    if not box:
+
+    bbox = best.get("bbox") or best.get("crop_box")
+    if not bbox:
         return frames_bytes[idx]
 
     try:
@@ -399,21 +468,23 @@ def crop_frame(frames_bytes: list[bytes], best: dict) -> Optional[bytes]:
             img = img.convert("RGB")
         W, H = img.size
 
-        x = int(round(box["x"] * W))
-        y = int(round(box["y"] * H))
-        w = int(round(box["width"] * W))
-        h = int(round(box["height"] * H))
+        x = int(round(bbox["x"] * W))
+        y = int(round(bbox["y"] * H))
+        w = int(round(bbox["w"] * W))
+        h = int(round(bbox["h"] * H))
 
-        # Clamp
         x = max(0, min(x, W - 1))
         y = max(0, min(y, H - 1))
         w = max(10, min(w, W - x))
         h = max(10, min(h, H - y))
 
         cropped = img.crop((x, y, x + w, y + h))
-
         buf = io.BytesIO()
         cropped.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
     except Exception:
         return None
+
+
+# Backward-compat alias
+crop_frame = crop_frame_to_bbox
