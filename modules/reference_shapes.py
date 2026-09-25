@@ -1,12 +1,10 @@
 # modules/reference_shapes.py
 # Betta Farm Management System
 # Session 26H — Load reference silhouettes for Gemini matching.
+# Session 26H.5 — Use svglib (pure Python) to render SVG previews.
 #
-# Loads the 4 reference SVGs from modules/reference_shapes/ and
-# caches them as PNG bytes (rendered on white) for API use.
-#
-# Falls back to sending raw SVG bytes if cairosvg isn't available —
-# Gemini can read SVG directly.
+# Prefers PNG if present, falls back to SVG via svglib, last resort
+# sends raw SVG bytes to Gemini.
 
 from __future__ import annotations
 
@@ -28,52 +26,72 @@ REFERENCE_NAMES = [
 _cache: dict = {}
 
 
+def _svg_to_png_bytes(svg_path: Path) -> Optional[bytes]:
+    """
+    Render an SVG file to PNG bytes using svglib (pure Python).
+    Returns None if svglib isn't available or fails.
+    """
+    try:
+        from svglib.svglib import svg2rlg
+        from reportlab.graphics import renderPM
+        drawing = svg2rlg(str(svg_path))
+        if drawing is None:
+            return None
+        # Render on a white background
+        png_bytes = renderPM.drawToString(drawing, fmt="PNG", bg=0xFFFFFF)
+        return png_bytes
+    except Exception:
+        return None
+
+
 def _load_one(name: str) -> Optional[dict]:
-    svg_path = REFERENCE_DIR / f"{name}.svg"
+    """
+    Load one reference as {name, bytes, mime_type}.
+    Prefers .png; falls back to .svg rendered via svglib;
+    last resort sends raw SVG bytes to Gemini.
+    """
     png_path = REFERENCE_DIR / f"{name}.png"
+    svg_path = REFERENCE_DIR / f"{name}.svg"
 
     try:
+        # 1. Prefer pre-rendered PNG
+        if png_path.exists():
+            img = Image.open(png_path).convert("RGB")
+            img.thumbnail((400, 300), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            return {
+                "name": name,
+                "bytes": buf.getvalue(),
+                "mime_type": "image/png",
+            }
+
+        # 2. Render SVG via svglib (pure Python, no native deps)
         if svg_path.exists():
-            # Try to render SVG → PNG via cairosvg (if installed)
-            try:
-                import cairosvg
-                png_bytes = cairosvg.svg2png(
-                    url=str(svg_path),
-                    output_width=400,
-                    output_height=300,
-                    background_color="white",
-                )
-                buf = io.BytesIO(png_bytes)
-                img = Image.open(buf).convert("RGB")
-            except Exception:
-                # Fallback: send raw SVG bytes to Gemini
-                raw = svg_path.read_bytes()
-                return {
-                    "name": name,
-                    "bytes": raw,
-                    "mime_type": "image/svg+xml",
-                }
-        elif png_path.exists():
-            img = Image.open(png_path)
-            if img.mode != "RGB":
-                bg = Image.new("RGB", img.size, (255, 255, 255))
-                if img.mode == "RGBA":
-                    bg.paste(img, mask=img.split()[3])
-                else:
-                    bg.paste(img)
-                img = bg
-        else:
-            return None
+            png_bytes = _svg_to_png_bytes(svg_path)
+            if png_bytes:
+                try:
+                    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+                    img.thumbnail((400, 300), Image.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG", optimize=True)
+                    return {
+                        "name": name,
+                        "bytes": buf.getvalue(),
+                        "mime_type": "image/png",
+                    }
+                except Exception:
+                    pass
 
-        img.thumbnail((400, 300), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
+            # 3. Last resort: send raw SVG to Gemini
+            raw = svg_path.read_bytes()
+            return {
+                "name": name,
+                "bytes": raw,
+                "mime_type": "image/svg+xml",
+            }
 
-        return {
-            "name": name,
-            "bytes": buf.getvalue(),
-            "mime_type": "image/png",
-        }
+        return None
     except Exception:
         return None
 
@@ -103,7 +121,8 @@ def get_reference_by_name(name: str) -> Optional[dict]:
 
 def has_all_references() -> bool:
     return all(
-        (REFERENCE_DIR / f"{n}.svg").exists() or (REFERENCE_DIR / f"{n}.png").exists()
+        (REFERENCE_DIR / f"{n}.png").exists()
+        or (REFERENCE_DIR / f"{n}.svg").exists()
         for n in REFERENCE_NAMES
     )
 
@@ -111,6 +130,6 @@ def has_all_references() -> bool:
 def missing_references() -> list[str]:
     return [
         n for n in REFERENCE_NAMES
-        if not (REFERENCE_DIR / f"{n}.svg").exists()
-        and not (REFERENCE_DIR / f"{n}.png").exists()
+        if not (REFERENCE_DIR / f"{n}.png").exists()
+        and not (REFERENCE_DIR / f"{n}.svg").exists()
     ]
