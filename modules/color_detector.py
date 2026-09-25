@@ -8,16 +8,14 @@
 # Session 26D round 2 — Reject low-saturation blobs.
 # Session 26D round 3 — Suppress silver glass noise.
 # Session 26E — Two-pass posture strategy + 5-region split + Side A/B.
-#   • Pass 1 (strict): clean side profile + fully flared + complete
-#   • Pass 2 (lenient + regional): per-frame regional fallback
-#   • Motion map: pixels that moved at least once (fish region).
-#   • Persistence map: pixels that moved in most frames (real fish only,
-#     reflection excluded since it appears only intermittently).
-#   • IBC body ratio uses interquartile depth (excludes fin tips)
-#   • Candidate picker: split merged blob, pick best IBC side view
-#   • Connectivity + anal-slope discriminators reject broken reflections
-#   • Regions aligned to HMPK anatomy: head 20% / body 45% / tail 35%
-#   • Side A = head-left, Side B = head-right
+#   • Motion + largest-blob tracking (real fish wins over reflection).
+#   • Per-frame tracker constrains analysis to where the fish actually is.
+#   • Head direction from motion vector.
+#   • Pass 1 (strict) / Pass 2 (regional) / Reject.
+#   • IBC body ratio via interquartile depth (excludes fin tips).
+#   • Candidate splitter + IBC view scoring on merged blobs.
+#   • Regions aligned to HMPK anatomy: head 20% / body 45% / tail 35%.
+#   • Side A = head-left, Side B = head-right.
 
 from __future__ import annotations
 
@@ -99,22 +97,23 @@ EDGE_MARGIN_PX = 2
 
 
 # ============================================================
-# MOTION + PERSISTENCE CONSTANTS
+# TRACKING CONSTANTS
 # ============================================================
 
 # Pixel diff threshold (0-255 mean across RGB) to count as "changed"
 MOTION_DIFF_THRESHOLD = 18
 
-# A pixel is "motion region" if it moved in at least this % of transitions
-MOTION_PCT_THRESHOLD = 0.15
+# Min blob area (px) in the motion mask to be considered a candidate fish
+MIN_TRACK_BLOB_AREA = 150
 
-# A pixel is "persistence region" (real fish) if it moved in at least
-# this % of transitions. Reflection appears only intermittently →
-# falls below this cutoff.
-PERSISTENCE_PCT_THRESHOLD = 0.55
+# Max centroid jump between consecutive frames to link as same track
+TRACK_MAX_JUMP_PX = 250
 
-# Dilate motion region slightly so we don't clip fish tails
-MOTION_DILATE_ITER = 3
+# Track must span at least this fraction of frames to be trusted
+TRACK_MIN_COVERAGE = 0.40
+
+# Padding multiplier around tracked bbox (1.6 = 60% padding)
+TRACK_BBOX_PAD = 1.6
 
 
 # ============================================================
@@ -310,102 +309,231 @@ def _mask_fish_region(
 
 
 # ============================================================
-# MOTION + PERSISTENCE MAPS
+# MOTION TRACKING (John tracker)
 # ============================================================
 
-def _build_motion_map(frames_rgb: list[np.ndarray]) -> np.ndarray:
+def _per_frame_motion_blobs(frames_rgb: list[np.ndarray]) -> list[list[dict]]:
     """
-    Accumulate motion across the video.
+    For each frame index, return a list of motion blobs (candidates).
 
-    For each consecutive frame pair, compute pixel-wise absolute
-    difference in RGB. A pixel "moved" if the mean diff > threshold.
+    A blob = connected region where the pixel changed vs the previous
+    frame. Each blob entry: {"centroid": (cx, cy), "bbox": (x0,y0,x1,y1),
+    "area": int}.
 
-    Returns uint16 array where value = number of transitions the
-    pixel changed. Background (0) = never moved.
+    Frame 0 gets blobs from diff with frame 1 (so it has candidates too).
     """
-    if len(frames_rgb) < 2:
-        return np.zeros(frames_rgb[0].shape[:2], dtype=np.uint16)
+    n = len(frames_rgb)
+    blobs_per_frame: list[list[dict]] = [[] for _ in range(n)]
+
+    if n < 2 or not _SCIPY_AVAILABLE:
+        return blobs_per_frame
 
     H, W = frames_rgb[0].shape[:2]
-    motion = np.zeros((H, W), dtype=np.uint16)
 
-    prev = frames_rgb[0].astype(np.int16)
-    for t in range(1, len(frames_rgb)):
+    for t in range(1, n):
+        prev = frames_rgb[t - 1].astype(np.int16)
         curr = frames_rgb[t].astype(np.int16)
-        if curr.shape[:2] != (H, W):
-            prev = curr
+        if curr.shape[:2] != (H, W) or prev.shape[:2] != (H, W):
             continue
+
         diff = np.abs(curr - prev).mean(axis=-1)
-        motion += (diff > MOTION_DIFF_THRESHOLD).astype(np.uint16)
-        prev = curr
+        motion_mask = diff > MOTION_DIFF_THRESHOLD
 
-    return motion
-
-
-def _motion_region_mask(motion_map: np.ndarray,
-                          pct_threshold: float = MOTION_PCT_THRESHOLD,
-                          dilate_iter: int = MOTION_DILATE_ITER) -> np.ndarray:
-    """
-    Pixels that moved in >= pct_threshold of transitions.
-
-    Returns bool mask. If video had no motion, returns all-True
-    (graceful fallback).
-    """
-    if motion_map.max() == 0:
-        return np.ones_like(motion_map, dtype=bool)
-
-    thresh = motion_map.max() * pct_threshold
-    region = motion_map >= thresh
-
-    if _SCIPY_AVAILABLE and dilate_iter > 0:
+        # Slight dilation to join fragmented fish body parts
         try:
-            region = _ndimage.binary_dilation(region, iterations=dilate_iter)
+            motion_mask = _ndimage.binary_dilation(motion_mask, iterations=2)
         except Exception:
             pass
 
-    if region.sum() < 0.01 * region.size:
-        return np.ones_like(region, dtype=bool)
+        labeled, num = _ndimage.label(motion_mask)
+        if num == 0:
+            continue
 
-    return region
+        blobs: list[dict] = []
+        for comp_id in range(1, num + 1):
+            ys, xs = np.where(labeled == comp_id)
+            area = len(xs)
+            if area < MIN_TRACK_BLOB_AREA:
+                continue
+            cx = float(xs.mean())
+            cy = float(ys.mean())
+            bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+            blobs.append({"centroid": (cx, cy), "bbox": bbox, "area": area})
+
+        # Attach to both t-1 and t (frame t-1 didn't have its own diff yet)
+        blobs_per_frame[t].extend(blobs)
+        blobs_per_frame[t - 1].extend(blobs)
+
+    # Deduplicate frame 0 and frame 0 appended duplicates
+    for t in range(n):
+        seen = []
+        unique = []
+        for b in blobs_per_frame[t]:
+            key = (round(b["centroid"][0]), round(b["centroid"][1]), b["area"])
+            if key in seen:
+                continue
+            seen.append(key)
+            unique.append(b)
+        blobs_per_frame[t] = unique
+
+    return blobs_per_frame
 
 
-def _persistence_region_mask(motion_map: np.ndarray,
-                               pct_threshold: float = PERSISTENCE_PCT_THRESHOLD) -> np.ndarray:
+def _track_largest_blob(blobs_per_frame: list[list[dict]]) -> list[Optional[dict]]:
     """
-    Pixels that moved in >= pct_threshold of transitions.
+    Follow the largest moving blob across frames (the real fish).
 
-    This is the "real fish" region: because the real fish is visible
-    in every frame, its motion is present in every transition. The
-    mirror reflection appears only intermittently and falls below
-    the persistence threshold.
-
-    Falls back to motion region if persistence is tiny.
+    Returns a list indexed by frame: each entry is the tracked blob dict
+    for that frame, or None if the track is missing at that frame.
     """
-    if motion_map.max() == 0:
-        return np.ones_like(motion_map, dtype=bool)
+    n = len(blobs_per_frame)
+    track: list[Optional[dict]] = [None] * n
 
-    thresh = motion_map.max() * pct_threshold
-    region = motion_map >= thresh
+    if n == 0:
+        return track
 
-    # If persistence is <1% of frame, fall back to all-True
-    if region.sum() < 0.01 * region.size:
-        return np.ones_like(region, dtype=bool)
+    # Pick seed: largest blob in the first half of the video (fish usually
+    # enters the frame early and gets big)
+    seed_frame = None
+    seed_blob = None
+    for t in range(min(n, max(1, n // 3))):
+        if not blobs_per_frame[t]:
+            continue
+        biggest = max(blobs_per_frame[t], key=lambda b: b["area"])
+        if seed_blob is None or biggest["area"] > seed_blob["area"]:
+            seed_blob = biggest
+            seed_frame = t
 
-    # Clean up: keep only largest connected component + dilate
-    if _SCIPY_AVAILABLE:
-        try:
-            labeled, num = _ndimage.label(region)
-            if num > 1:
-                sizes = _ndimage.sum(region, labeled, index=range(1, num + 1))
-                largest = int(np.argmax(sizes)) + 1
-                region = (labeled == largest)
+    if seed_blob is None:
+        return track
 
-            # Dilate generously — persistence is narrower than motion
-            region = _ndimage.binary_dilation(region, iterations=6)
-        except Exception:
-            pass
+    track[seed_frame] = seed_blob
 
-    return region
+    # Forward pass
+    prev_centroid = seed_blob["centroid"]
+    for t in range(seed_frame + 1, n):
+        candidates = blobs_per_frame[t]
+        if not candidates:
+            continue
+        # Nearest by centroid distance, tiebreak by area (bigger = real fish)
+        def score(b):
+            dx = b["centroid"][0] - prev_centroid[0]
+            dy = b["centroid"][1] - prev_centroid[1]
+            dist = math.hypot(dx, dy)
+            return (dist, -b["area"])
+        best = min(candidates, key=score)
+        dist = math.hypot(best["centroid"][0] - prev_centroid[0],
+                            best["centroid"][1] - prev_centroid[1])
+        if dist > TRACK_MAX_JUMP_PX:
+            continue
+        track[t] = best
+        prev_centroid = best["centroid"]
+
+    # Backward pass (fill frames before seed)
+    prev_centroid = seed_blob["centroid"]
+    for t in range(seed_frame - 1, -1, -1):
+        candidates = blobs_per_frame[t]
+        if not candidates:
+            continue
+        def score_b(b):
+            dx = b["centroid"][0] - prev_centroid[0]
+            dy = b["centroid"][1] - prev_centroid[1]
+            dist = math.hypot(dx, dy)
+            return (dist, -b["area"])
+        best = min(candidates, key=score_b)
+        dist = math.hypot(best["centroid"][0] - prev_centroid[0],
+                            best["centroid"][1] - prev_centroid[1])
+        if dist > TRACK_MAX_JUMP_PX:
+            continue
+        track[t] = best
+        prev_centroid = best["centroid"]
+
+    # Interpolate gaps: if two consecutive known frames sandwich a gap of
+    # <=5 frames, fill linearly. Improves coverage.
+    known = [i for i, b in enumerate(track) if b is not None]
+    for a, b in zip(known[:-1], known[1:]):
+        if b - a <= 1 or b - a > 6:
+            continue
+        for k in range(a + 1, b):
+            alpha = (k - a) / (b - a)
+            cxa, cya = track[a]["centroid"]
+            cxb, cyb = track[b]["centroid"]
+            track[k] = {
+                "centroid": (cxa + alpha * (cxb - cxa), cya + alpha * (cyb - cya)),
+                "bbox": track[a]["bbox"],  # use previous bbox as approximation
+                "area": int((track[a]["area"] + track[b]["area"]) / 2),
+            }
+
+    return track
+
+
+def _build_trajectory_mask(shape: tuple[int, int],
+                             track: list[Optional[dict]],
+                             frame_idx: int,
+                             pad: float = TRACK_BBOX_PAD) -> Optional[np.ndarray]:
+    """
+    Build a bool mask for one frame showing where the fish is allowed
+    to be, based on the tracked bbox + padding. Returns None if no
+    track for this frame.
+    """
+    if frame_idx < 0 or frame_idx >= len(track):
+        return None
+    blob = track[frame_idx]
+    if blob is None:
+        return None
+
+    H, W = shape
+    x0, y0, x1, y1 = blob["bbox"]
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    w = (x1 - x0) * pad / 2.0
+    h = (y1 - y0) * pad / 2.0
+
+    mask = np.zeros((H, W), dtype=bool)
+    rx0 = max(0, int(cx - w))
+    ry0 = max(0, int(cy - h))
+    rx1 = min(W, int(cx + w))
+    ry1 = min(H, int(cy + h))
+    if rx1 <= rx0 or ry1 <= ry0:
+        return None
+    mask[ry0:ry1, rx0:rx1] = True
+    return mask
+
+
+def _head_direction_from_track(track: list[Optional[dict]],
+                                 frame_idx: int,
+                                 orientation: dict) -> str:
+    """
+    Determine head direction from the fish's motion vector and the
+    orientation's major axis. Falls back to orientation-based head
+    direction if no motion info.
+    """
+    default = orientation.get("head_direction", "unknown")
+
+    if frame_idx is None or frame_idx <= 0 or frame_idx >= len(track):
+        return default
+    curr = track[frame_idx]
+    prev = track[frame_idx - 1]
+    if curr is None or prev is None:
+        return default
+
+    dx = curr["centroid"][0] - prev["centroid"][0]
+    dy = curr["centroid"][1] - prev["centroid"][1]
+    if abs(dx) < 1.0 and abs(dy) < 1.0:
+        return default
+
+    angle_deg = orientation.get("major_axis_angle_deg", 0)
+    vertical = 60 <= angle_deg <= 120
+
+    if vertical:
+        if abs(dy) >= abs(dx):
+            return "down" if dy > 0 else "up"
+        return "right" if dx > 0 else "left"
+
+    # Horizontal (or diagonal): prefer motion x direction
+    if abs(dx) >= 1.0:
+        return "right" if dx > 0 else "left"
+    return "down" if dy > 0 else "up"
 
 
 # ============================================================
@@ -554,7 +682,7 @@ def _compute_orientation(blob_mask: np.ndarray) -> dict:
 
 
 # ============================================================
-# BODY RATIO (IQR-based)
+# BODY RATIO
 # ============================================================
 
 def _compute_body_ratio(blob_mask: np.ndarray, orientation: dict) -> float:
@@ -1024,11 +1152,12 @@ def _isolate_largest_blob(mask: np.ndarray, rgb: np.ndarray,
 
 
 # ============================================================
-# 5-REGION SPLIT (HMPK-aligned)
+# 5-REGION SPLIT
 # ============================================================
 
 def _split_blob_into_regions(blob_mask: np.ndarray,
-                              orientation: Optional[dict] = None) -> dict:
+                              orientation: Optional[dict] = None,
+                              head_override: Optional[str] = None) -> dict:
     try:
         if orientation is None:
             orientation = _compute_orientation(blob_mask)
@@ -1049,7 +1178,7 @@ def _split_blob_into_regions(blob_mask: np.ndarray,
         span = max(1e-6, maj_max - maj_min)
         norm_major = (proj_major - maj_min) / span
 
-        hd = orientation.get("head_direction", "left")
+        hd = head_override or orientation.get("head_direction", "left")
 
         if hd in ("left", "up", "unknown"):
             canon = norm_major
@@ -1385,7 +1514,8 @@ def _classify_pattern(palette: dict[str, float]) -> str:
 
 def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
                   use_blob: bool = True, skip_posture: bool = False,
-                  motion_hint: Optional[np.ndarray] = None) -> Optional[dict]:
+                  motion_hint: Optional[np.ndarray] = None,
+                  head_override: Optional[str] = None) -> Optional[dict]:
     img = _load_image_rgb(raw_bytes)
     if img is None:
         return {"ok": False, "error": "Could not load image"}
@@ -1440,7 +1570,13 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
             }
 
     orientation_full = _compute_orientation(mask)
-    regions = _split_blob_into_regions(mask, orientation=orientation_full)
+
+    # Apply head_override (from motion track) if provided
+    effective_head = head_override or orientation_full.get("head_direction", "unknown")
+    orientation_full["head_direction"] = effective_head
+
+    regions = _split_blob_into_regions(mask, orientation=orientation_full,
+                                       head_override=effective_head)
 
     if not regions:
         regions = {
@@ -1449,7 +1585,7 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
             "tail_mask": np.zeros_like(mask, dtype=bool),
             "dorsal_mask": np.zeros_like(mask, dtype=bool),
             "anal_mask": np.zeros_like(mask, dtype=bool),
-            "head_direction": posture.get("head_direction", "unknown"),
+            "head_direction": effective_head,
         }
 
     region_palettes: dict[str, dict[str, float]] = {}
@@ -1476,7 +1612,7 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
     iri_level, iri_score = _detect_iridescence(hsv, mask)
     quality = _score_quality(img, mask, hsv)
 
-    side_label = posture.get("side_label", "?")
+    side_label = "A" if effective_head == "left" else ("B" if effective_head == "right" else "?")
     regions_used = len(region_palettes)
     region_confidence = round(min(1.0, regions_used / 5.0), 2)
 
@@ -1500,12 +1636,13 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
             "water_tint_detected": water_tint is not None,
             "adaptive_bg_detected": bg_color is not None,
             "motion_hint_applied": motion_hint is not None,
+            "head_override": head_override,
         },
     }
 
 
 # ============================================================
-# REGION ANALYSIS (tap-to-select)
+# REGION ANALYSIS
 # ============================================================
 
 def analyze_region(
@@ -1656,13 +1793,12 @@ def analyze_video(
     k_clusters: int = 5,
 ) -> dict:
     """
-    Video pipeline with motion + persistence background exclusion.
+    Tracking-based video pipeline.
 
-    1. Extract frames
-    2. Motion map (pixels that moved at least once)
-    3. Persistence map (pixels that moved in most frames → real fish)
-    4. Per frame: analyze inside persistence region → real fish only
-    5. Pass 1 (strict) or Pass 2 (regional) consensus
+    Phase 1 — build per-frame motion blobs
+    Phase 2 — track the largest blob across frames (real fish)
+    Phase 3 — per-frame analysis constrained to the tracked location
+    Phase 4 — Pass 1 / Pass 2 consensus
     """
     try:
         frames = extract_frames_from_video(
@@ -1676,7 +1812,7 @@ def analyze_video(
     if not frames:
         return {"ok": False, "error": "No frames could be extracted"}
 
-    # ---------- MOTION + PERSISTENCE MAPS ----------
+    # Decode all frames once (RGB arrays)
     frames_rgb: list[np.ndarray] = []
     for fbytes in frames:
         img = _load_image_rgb(fbytes)
@@ -1686,17 +1822,26 @@ def analyze_video(
         img.thumbnail((640, 640), Image.LANCZOS)
         frames_rgb.append(np.asarray(img.convert("RGB")).astype(np.uint8))
 
-    motion_map = _build_motion_map(frames_rgb)
-    persistence_region = _persistence_region_mask(motion_map)
+    # ------- PHASE 1 + 2: track the real fish -------
+    blobs_per_frame = _per_frame_motion_blobs(frames_rgb)
+    track = _track_largest_blob(blobs_per_frame)
 
-    # ---------- PASS 1 ----------
+    tracked_frames = sum(1 for b in track if b is not None)
+    track_coverage = tracked_frames / max(1, len(frames))
+
+    # ------- PHASE 3: per-frame analysis inside tracked box -------
     strict_analyses = []
     strict_indices = []
 
     for fi, fbytes in enumerate(frames):
+        traj_mask = _build_trajectory_mask(frames_rgb[fi].shape[:2], track, fi)
+        if traj_mask is None:
+            continue
+
         try:
+            # Head direction from motion vector + orientation (done inside analyze_photo)
             a = analyze_photo(fbytes, k_clusters=k_clusters, use_blob=True,
-                              motion_hint=persistence_region)
+                              motion_hint=traj_mask)
             if not a or not a.get("ok"):
                 continue
             if a.get("pass", 3) != 1:
@@ -1737,16 +1882,20 @@ def analyze_video(
                 "side_b_count": sum(1 for a in kept if a.get("side_label") == "B"),
                 "majority_side": majority,
                 "discarded_minority_frames": len(strict_analyses) - len(kept),
-                "persistence_region_pct": round(float(persistence_region.sum() / persistence_region.size * 100), 2),
+                "track_coverage": round(track_coverage, 2),
             }
 
-    # ---------- PASS 2: regional fallback ----------
+    # ------- PASS 2: regional fallback -------
     regional_contributors = 0
     region_samples: dict[str, list[dict[str, float]]] = {
         "head": [], "body": [], "tail": [], "dorsal": [], "anal": []
     }
 
     for fi, fbytes in enumerate(frames):
+        traj_mask = _build_trajectory_mask(frames_rgb[fi].shape[:2], track, fi)
+        if traj_mask is None:
+            continue
+
         try:
             img = _load_image_rgb(fbytes)
             if img is None:
@@ -1763,8 +1912,8 @@ def analyze_video(
 
             mask = _mask_fish_region(hsv, rgb_u8,
                                      water_tint=water_tint, bg_color=bg_color)
-            if persistence_region.shape == mask.shape:
-                mask &= persistence_region
+            if traj_mask.shape == mask.shape:
+                mask &= traj_mask
             if mask.sum() < 50:
                 continue
             mask = _isolate_largest_blob(mask, rgb_u8, min_size_pct=0.5)
@@ -1843,7 +1992,7 @@ def analyze_video(
             "best_frame_bytes": frames[0] if frames else None,
             "side_a_count": 0,
             "side_b_count": 0,
-            "persistence_region_pct": round(float(persistence_region.sum() / persistence_region.size * 100), 2),
+            "track_coverage": round(track_coverage, 2),
         }
 
     return {
@@ -1854,7 +2003,7 @@ def analyze_video(
         ),
         "strict_frames_found": len(strict_analyses),
         "regional_contributors": regional_contributors,
-        "persistence_region_pct": round(float(persistence_region.sum() / persistence_region.size * 100), 2),
+        "track_coverage": round(track_coverage, 2),
     }
 
 
