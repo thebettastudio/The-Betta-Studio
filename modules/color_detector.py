@@ -850,4 +850,936 @@ def _isolate_largest_blob(mask: np.ndarray, rgb: np.ndarray,
 
     try:
         labeled, num = _ndimage.label(mask)
-        if num
+        if num == 0:
+            return mask
+
+        component_sizes = _ndimage.sum(mask, labeled, index=range(1, num + 1))
+        if len(component_sizes) == 0:
+            return mask
+
+        order = np.argsort(-component_sizes) + 1
+
+        for comp_id in order:
+            blob_mask = (labeled == comp_id)
+            if blob_mask.sum() / mask.size < min_size_pct / 100.0:
+                break
+            if _blob_quality_ok(mask, blob_mask, rgb):
+                candidates = _split_into_candidates(blob_mask, rgb)
+                best = _pick_best_candidate(candidates, rgb)
+                return best["mask"] if best else blob_mask
+
+        largest_mask = (labeled == order[0])
+        if largest_mask.sum() / mask.size < min_size_pct / 100.0:
+            return mask
+        candidates = _split_into_candidates(largest_mask, rgb)
+        best = _pick_best_candidate(candidates, rgb)
+        return best["mask"] if best else largest_mask
+    except Exception:
+        return mask
+
+
+# ============================================================
+# 5-REGION SPLIT (HMPK-aligned)
+# ============================================================
+
+def _split_blob_into_regions(blob_mask: np.ndarray,
+                              orientation: Optional[dict] = None) -> dict:
+    try:
+        if orientation is None:
+            orientation = _compute_orientation(blob_mask)
+
+        proj_major = orientation.get("proj_major")
+        proj_minor = orientation.get("proj_minor")
+        mean = orientation.get("mean")
+
+        if proj_major is None or mean is None:
+            return {}
+
+        ys, xs = np.where(blob_mask)
+        if len(xs) < 10:
+            return {}
+
+        maj_min = float(proj_major.min())
+        maj_max = float(proj_major.max())
+        span = max(1e-6, maj_max - maj_min)
+        norm_major = (proj_major - maj_min) / span
+
+        hd = orientation.get("head_direction", "left")
+
+        if hd in ("left", "up", "unknown"):
+            canon = norm_major
+        else:
+            canon = 1.0 - norm_major
+
+        is_head = canon < HEAD_REGION_FRAC
+        is_tail = canon >= (HEAD_REGION_FRAC + BODY_REGION_FRAC)
+        is_body = ~is_head & ~is_tail
+
+        dorsal = proj_minor < 0
+        anal = proj_minor >= 0
+
+        head_mask = np.zeros_like(blob_mask, dtype=bool)
+        body_mask = np.zeros_like(blob_mask, dtype=bool)
+        tail_mask = np.zeros_like(blob_mask, dtype=bool)
+        dorsal_mask = np.zeros_like(blob_mask, dtype=bool)
+        anal_mask = np.zeros_like(blob_mask, dtype=bool)
+
+        head_mask[ys[is_head], xs[is_head]] = True
+        body_mask[ys[is_body], xs[is_body]] = True
+        tail_mask[ys[is_tail], xs[is_tail]] = True
+        dorsal_mask[ys[dorsal], xs[dorsal]] = True
+        anal_mask[ys[anal], xs[anal]] = True
+
+        return {
+            "head_mask": head_mask,
+            "body_mask": body_mask,
+            "tail_mask": tail_mask,
+            "dorsal_mask": dorsal_mask,
+            "anal_mask": anal_mask,
+            "head_direction": hd,
+        }
+    except Exception:
+        return {}
+
+
+# ============================================================
+# PER-REGION PALETTE
+# ============================================================
+
+def _palette_for_mask(
+    rgb_u8: np.ndarray,
+    region_mask: np.ndarray,
+    k_clusters: int = 4,
+) -> dict[str, float]:
+    if region_mask.sum() < MIN_REGION_PIXELS:
+        return {}
+
+    region_pixels = rgb_u8[region_mask]
+    centroids, labels = _kmeans(region_pixels.astype(np.float32), k=k_clusters)
+
+    counts = np.bincount(labels, minlength=len(centroids))
+    total = counts.sum()
+    if total == 0:
+        return {}
+
+    pcts = counts / total * 100
+
+    palette: dict[str, float] = {}
+    for ci, c in enumerate(centroids):
+        c_rgb = np.array([[[c[0], c[1], c[2]]]], dtype=np.uint8)
+        c_hsv = _rgb_to_hsv_numpy(c_rgb)[0, 0]
+        ch, cs, cv = float(c_hsv[0]), float(c_hsv[1]), float(c_hsv[2])
+        cat = _map_hsv_to_category(ch, cs, cv)
+        if cat:
+            palette[cat] = palette.get(cat, 0) + float(pcts[ci])
+
+    return palette
+
+
+# ============================================================
+# K-MEANS
+# ============================================================
+
+def _kmeans(pixels: np.ndarray, k: int = 5, iterations: int = 15) -> tuple[np.ndarray, np.ndarray]:
+    n = pixels.shape[0]
+    if n == 0:
+        return np.zeros((0, 3)), np.zeros(0, dtype=int)
+
+    k = min(k, n)
+    rng = np.random.default_rng(42)
+    idx = rng.choice(n, size=k, replace=False)
+    centroids = pixels[idx].copy()
+
+    labels = np.zeros(n, dtype=int)
+    for _ in range(iterations):
+        dists = np.linalg.norm(pixels[:, None, :] - centroids[None, :, :], axis=-1)
+        labels = np.argmin(dists, axis=1)
+        new_centroids = np.zeros_like(centroids)
+        for ci in range(k):
+            mask = labels == ci
+            if mask.any():
+                new_centroids[ci] = pixels[mask].mean(axis=0)
+            else:
+                new_centroids[ci] = centroids[ci]
+        if np.allclose(new_centroids, centroids, atol=0.5):
+            centroids = new_centroids
+            break
+        centroids = new_centroids
+
+    return centroids, labels
+
+
+# ============================================================
+# CATEGORY MAPPING
+# ============================================================
+
+def _map_hsv_to_category(h: float, s: float, v: float) -> Optional[str]:
+    for name in ("gold_metallic", "copper", "bronze"):
+        for cat in COLOR_CATEGORIES:
+            if cat[0] != name:
+                continue
+            _, hc, hw, smin, vmin, vmax = cat
+            if _hue_distance(h, hc) <= hw and s >= smin and vmin <= v <= vmax:
+                return name
+
+    if s < 40:
+        if v > 200:
+            return "white"
+        if v < 60:
+            return "black"
+        return "silver"
+
+    if s < 60 and v > 200 and (h < 70 or h > 320):
+        return "cream"
+
+    if v < 80 and 200 < h < 250:
+        return "dark_blue"
+
+    best = None
+    best_dist = 999
+    for name, hc, hw, smin, vmin, vmax in COLOR_CATEGORIES:
+        if name in ("white", "silver", "black", "gold_metallic",
+                    "copper", "bronze", "cream", "dark_blue"):
+            continue
+        if s < smin or not (vmin <= v <= vmax):
+            continue
+        d = _hue_distance(h, hc)
+        if d <= hw and d < best_dist:
+            best = name
+            best_dist = d
+
+    return best
+
+
+# ============================================================
+# SILVER NOISE SUPPRESSION
+# ============================================================
+
+def _suppress_silver_noise(palette: dict[str, float]) -> dict[str, float]:
+    try:
+        if not palette:
+            return palette
+
+        if "silver" in palette:
+            silver_pct = palette["silver"]
+            largest_pct = max(palette.values())
+            if silver_pct < 20 and silver_pct < largest_pct:
+                palette["silver"] = round(silver_pct * 0.4, 1)
+
+        if "white" in palette:
+            white_pct = palette["white"]
+            largest_pct = max(palette.values())
+            if white_pct < 15 and white_pct < largest_pct:
+                palette["white"] = round(white_pct * 0.5, 1)
+
+        palette = {k: v for k, v in palette.items() if v >= 3.0}
+        palette = dict(sorted(palette.items(), key=lambda x: -x[1]))
+        return palette
+    except Exception:
+        return palette
+
+
+# ============================================================
+# IRIDESCENCE
+# ============================================================
+
+def _detect_iridescence(hsv: np.ndarray, mask: np.ndarray) -> tuple[str, int]:
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+
+    if mask.sum() < 50:
+        return "none", 0
+
+    sparkle = (v > 160) & (s > 80) & mask
+    sparkle_count = sparkle.sum()
+
+    if sparkle_count < 20:
+        return "none", 0
+
+    sparkle_pct = sparkle_count / mask.sum() * 100
+
+    if _SCIPY_AVAILABLE:
+        try:
+            local_mean = _ndimage.uniform_filter(v, size=7)
+            local_var = _ndimage.uniform_filter((v - local_mean) ** 2, size=7)
+            sparkle_variance = float(np.sqrt(local_var[sparkle]).mean())
+        except Exception:
+            sparkle_variance = float(v[sparkle].std())
+    else:
+        sparkle_variance = float(v[sparkle].std())
+
+    sparkle_hues = h[sparkle]
+    bins = (sparkle_hues // 60).astype(int) % 6
+    unique_bins = len(np.unique(bins))
+
+    pct_factor = min(sparkle_pct / 20.0, 1.0)
+    var_factor = min(sparkle_variance / 40.0, 1.0)
+    diversity_factor = min(unique_bins / 3.0, 1.0)
+
+    score = int(min(pct_factor * var_factor * diversity_factor * 150, 100))
+
+    if score < 10:
+        level = "none"
+    elif score < 30:
+        level = "faint"
+    elif score < 60:
+        level = "moderate"
+    else:
+        level = "strong"
+
+    return level, score
+
+
+# ============================================================
+# QUALITY SCORING
+# ============================================================
+
+def _score_quality(img: Image.Image, mask: np.ndarray, hsv: np.ndarray) -> dict:
+    arr = np.asarray(img.convert("L"), dtype=np.float32)
+
+    if _SCIPY_AVAILABLE:
+        lap = _ndimage.laplace(arr)
+        sharp_var = float(lap.var())
+        sharpness_score = min(sharp_var / 500.0 * 100, 100)
+    else:
+        gx = np.diff(arr, axis=1)
+        gy = np.diff(arr, axis=0)
+        grad = np.sqrt(gx[:-1, :] ** 2 + gy[:, :-1] ** 2)
+        sharpness_score = min(float(grad.mean()) / 20.0 * 100, 100)
+
+    coverage_pct = mask.sum() / mask.size * 100
+    if coverage_pct < 5:
+        coverage_score = coverage_pct * 4
+    elif coverage_pct > 50:
+        coverage_score = max(0, 100 - (coverage_pct - 50) * 2)
+    else:
+        coverage_score = 100.0
+
+    if mask.sum() > 0:
+        avg_v = float(hsv[..., 2][mask].mean())
+        brightness_score = 100 - min(abs(avg_v - 140) * 0.6, 100)
+    else:
+        brightness_score = 0
+
+    if mask.sum() > 0:
+        std_v = float(hsv[..., 2][mask].std())
+        contrast_score = min(std_v / 60.0 * 100, 100)
+    else:
+        contrast_score = 0
+
+    if mask.sum() > 0:
+        ys, xs = np.where(mask)
+        h_span = xs.max() - xs.min()
+        v_span = ys.max() - ys.min()
+        if h_span > v_span * 1.3:
+            orientation_score = 100
+        elif v_span > h_span * 1.3:
+            orientation_score = 40
+        else:
+            orientation_score = 70
+    else:
+        orientation_score = 0
+
+    total = (
+        sharpness_score * 0.30 +
+        coverage_score * 0.25 +
+        brightness_score * 0.15 +
+        contrast_score * 0.15 +
+        orientation_score * 0.15
+    )
+
+    return {
+        "score": int(total),
+        "sharpness": int(sharpness_score),
+        "coverage": int(coverage_score),
+        "brightness": int(brightness_score),
+        "contrast": int(contrast_score),
+        "orientation": int(orientation_score),
+    }
+
+
+# ============================================================
+# REGION MERGE HELPERS
+# ============================================================
+
+def _merge_region_palettes(region_palettes: dict[str, dict[str, float]]) -> dict[str, float]:
+    if not region_palettes:
+        return {}
+
+    merged: dict[str, float] = {}
+    total_weight = 0.0
+    for region_name, pal in region_palettes.items():
+        weight = REGION_WEIGHTS.get(region_name, 0.0)
+        if weight == 0 or not pal:
+            continue
+        total_weight += weight
+        for color, pct in pal.items():
+            merged[color] = merged.get(color, 0) + pct * weight
+
+    if total_weight > 0:
+        merged = {k: round(v / total_weight, 1) for k, v in merged.items()}
+
+    merged = {k: v for k, v in merged.items() if v >= 3.0}
+    merged = _suppress_silver_noise(merged)
+    return dict(sorted(merged.items(), key=lambda x: -x[1]))
+
+
+def _classify_pattern(palette: dict[str, float]) -> str:
+    if not palette:
+        return "unknown"
+    keys = list(palette.keys())
+    if len(keys) == 1 or palette[keys[0]] >= 60:
+        return "solid"
+    if len(keys) == 2 and sum(palette.values()) >= 70:
+        return "bi-color"
+    return "multicolor"
+
+
+# ============================================================
+# MAIN: ANALYZE PHOTO
+# ============================================================
+
+def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
+                  use_blob: bool = True, skip_posture: bool = False) -> Optional[dict]:
+    img = _load_image_rgb(raw_bytes)
+    if img is None:
+        return {"ok": False, "error": "Could not load image"}
+
+    img.thumbnail((640, 640), Image.LANCZOS)
+
+    rgb = np.asarray(img).astype(np.float32)
+    rgb = _normalize_white_balance(rgb)
+    rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+    hsv = _rgb_to_hsv_numpy(rgb_u8)
+
+    water_tint = _detect_water_tint(hsv)
+    bg_color = _detect_background_color_cluster(rgb_u8)
+
+    mask = _mask_fish_region(hsv, rgb_u8, water_tint=water_tint, bg_color=bg_color)
+    if mask.sum() < 50:
+        return {"ok": False, "error": "Too little fish region detected"}
+
+    if use_blob:
+        mask = _isolate_largest_blob(mask, rgb_u8, min_size_pct=0.5)
+        if mask.sum() < 50:
+            return {"ok": False, "error": "No significant fish region found"}
+
+    coverage_pct = float(mask.sum() / mask.size * 100)
+
+    if skip_posture:
+        posture = {
+            "pass": 1,
+            "side_profile": True,
+            "body_ratio": 0.0,
+            "flared": True,
+            "complete": True,
+            "partial_ok": True,
+            "head_direction": "unknown",
+            "side_label": "?",
+            "reason": "Posture validation skipped (region crop)",
+        }
+        pass_num = 1
+    else:
+        posture = validate_fish_posture(mask, rgb_u8, coverage_pct)
+        pass_num = posture.get("pass", 3)
+
+        if pass_num == 3:
+            return {
+                "ok": False,
+                "error": "Fish posture not usable — try a side-profile shot with fins flared",
+                "posture": posture,
+            }
+
+    orientation_full = _compute_orientation(mask)
+    regions = _split_blob_into_regions(mask, orientation=orientation_full)
+
+    if not regions:
+        regions = {
+            "body_mask": mask,
+            "head_mask": np.zeros_like(mask, dtype=bool),
+            "tail_mask": np.zeros_like(mask, dtype=bool),
+            "dorsal_mask": np.zeros_like(mask, dtype=bool),
+            "anal_mask": np.zeros_like(mask, dtype=bool),
+            "head_direction": posture.get("head_direction", "unknown"),
+        }
+
+    region_palettes: dict[str, dict[str, float]] = {}
+    for region_name in ("head", "body", "tail", "dorsal", "anal"):
+        rmask = regions.get(f"{region_name}_mask")
+        if rmask is not None and rmask.sum() >= MIN_REGION_PIXELS:
+            pal = _palette_for_mask(rgb_u8, rmask, k_clusters=4)
+            if pal:
+                region_palettes[region_name] = pal
+
+    merged = _merge_region_palettes(region_palettes)
+
+    if not merged:
+        merged = _palette_for_mask(rgb_u8, mask, k_clusters=k_clusters)
+        merged = {k: v for k, v in merged.items() if v >= 3.0}
+        merged = _suppress_silver_noise(merged)
+        merged = dict(sorted(merged.items(), key=lambda x: -x[1]))
+
+    keys = list(merged.keys())
+    primary = keys[0] if keys else None
+    secondary = keys[1] if len(keys) > 1 else None
+    pattern = _classify_pattern(merged)
+
+    iri_level, iri_score = _detect_iridescence(hsv, mask)
+    quality = _score_quality(img, mask, hsv)
+
+    side_label = posture.get("side_label", "?")
+    regions_used = len(region_palettes)
+    region_confidence = round(min(1.0, regions_used / 5.0), 2)
+
+    return {
+        "ok": True,
+        "palette": merged,
+        "primary": primary,
+        "secondary": secondary,
+        "pattern_hint": pattern,
+        "iridescence_level": iri_level,
+        "iridescence_score": iri_score,
+        "quality": quality,
+        "coverage_pct": round(coverage_pct, 1),
+        "posture": posture,
+        "regions_used": list(region_palettes.keys()),
+        "region_palettes": region_palettes,
+        "region_confidence": region_confidence,
+        "side_label": side_label,
+        "pass": pass_num,
+        "debug": {
+            "water_tint_detected": water_tint is not None,
+            "adaptive_bg_detected": bg_color is not None,
+        },
+    }
+
+
+# ============================================================
+# REGION ANALYSIS (tap-to-select)
+# ============================================================
+
+def analyze_region(
+    raw_bytes: bytes,
+    tap_x: float,
+    tap_y: float,
+    display_w: float,
+    display_h: float,
+    region_size: int = 150,
+    k_clusters: int = 5,
+) -> Optional[dict]:
+    img = _load_image_rgb(raw_bytes)
+    if img is None:
+        return {"ok": False, "error": "Could not load image"}
+
+    actual_w, actual_h = img.size
+    if display_w <= 0 or display_h <= 0:
+        return {"ok": False, "error": "Invalid display dimensions"}
+
+    scale_x = actual_w / display_w
+    scale_y = actual_h / display_h
+
+    cx = tap_x * scale_x
+    cy = tap_y * scale_y
+    r = (region_size / 2) * ((scale_x + scale_y) / 2)
+
+    left = max(0, int(cx - r))
+    top = max(0, int(cy - r))
+    right = min(actual_w, int(cx + r))
+    bottom = min(actual_h, int(cy + r))
+
+    if right - left < 20 or bottom - top < 20:
+        return {"ok": False, "error": "Region too small after scaling"}
+
+    cropped = img.crop((left, top, right, bottom))
+
+    buf = io.BytesIO()
+    cropped.save(buf, format="JPEG", quality=90)
+    cropped_bytes = buf.getvalue()
+
+    analysis = analyze_photo(cropped_bytes, k_clusters=k_clusters,
+                             use_blob=False, skip_posture=True)
+    if not analysis or not analysis.get("ok"):
+        return analysis or {"ok": False, "error": "Region analysis failed"}
+
+    analysis["region"] = {
+        "tap_x": tap_x,
+        "tap_y": tap_y,
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "region_size": region_size,
+    }
+    return analysis
+
+
+# ============================================================
+# VIDEO
+# ============================================================
+
+def extract_frames_from_video(
+    video_bytes: bytes,
+    sample_every: int = 5,
+    max_frames: int = 30,
+    target_width: int = 640,
+) -> list[bytes]:
+    if not _AV_AVAILABLE:
+        raise RuntimeError("PyAV (av) not installed. Run: `py -m pip install av`")
+
+    frames: list[bytes] = []
+    stream = io.BytesIO(video_bytes)
+
+    try:
+        container = av.open(stream)
+    except Exception as e:
+        raise RuntimeError(f"Could not open video: {e}")
+
+    try:
+        video_stream = next(
+            (s for s in container.streams if s.type == "video"),
+            None,
+        )
+        if video_stream is None:
+            raise RuntimeError("No video stream found in file")
+
+        idx = 0
+        for frame in container.decode(video_stream):
+            if idx % sample_every == 0:
+                try:
+                    img = frame.to_image()
+                    w, h = img.size
+                    if w > target_width:
+                        ratio = target_width / w
+                        img = img.resize((target_width, int(h * ratio)), Image.LANCZOS)
+                    if img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
+
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    frames.append(buf.getvalue())
+
+                    if len(frames) >= max_frames:
+                        break
+                except Exception:
+                    pass
+            idx += 1
+    finally:
+        try:
+            container.close()
+        except Exception:
+            pass
+
+    return frames
+
+
+# ============================================================
+# VIDEO: PASS 2 REGIONAL FALLBACK
+# ============================================================
+
+def _frame_regions_clean(regions: dict, shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    clean: dict[str, np.ndarray] = {}
+    H, W = shape
+    b = EDGE_MARGIN_PX
+
+    for name in ("head", "body", "tail", "dorsal", "anal"):
+        rmask = regions.get(f"{name}_mask")
+        if rmask is None:
+            continue
+        if rmask.sum() < MIN_REGION_PIXELS:
+            continue
+        ys, xs = np.where(rmask)
+        if len(xs) == 0:
+            continue
+        if (xs.min() <= b or ys.min() <= b
+                or xs.max() >= W - 1 - b or ys.max() >= H - 1 - b):
+            continue
+        if name in ("dorsal", "anal", "tail") and rmask.sum() < 40:
+            continue
+        clean[name] = rmask
+    return clean
+
+
+def analyze_video(
+    video_bytes: bytes,
+    sample_every: int = 5,
+    max_frames: int = 30,
+    k_clusters: int = 5,
+) -> dict:
+    try:
+        frames = extract_frames_from_video(
+            video_bytes,
+            sample_every=sample_every,
+            max_frames=max_frames,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    if not frames:
+        return {"ok": False, "error": "No frames could be extracted"}
+
+    # ---------- PASS 1 ----------
+    strict_analyses = []
+    strict_indices = []
+
+    for fi, fbytes in enumerate(frames):
+        try:
+            a = analyze_photo(fbytes, k_clusters=k_clusters, use_blob=True)
+            if not a or not a.get("ok"):
+                continue
+            if a.get("pass", 3) != 1:
+                continue
+            strict_analyses.append(a)
+            strict_indices.append(fi)
+        except Exception:
+            continue
+
+    if len(strict_analyses) >= MIN_STRICT_FRAMES:
+        sides = [a.get("side_label", "?") for a in strict_analyses]
+        a_count = sides.count("A")
+        b_count = sides.count("B")
+        if a_count >= b_count:
+            majority = "A"
+        else:
+            majority = "B"
+
+        kept = [a for a in strict_analyses if a.get("side_label") == majority]
+        if len(kept) >= MIN_STRICT_FRAMES:
+            consensus = merge_analyses(kept)
+            best_idx = max(
+                range(len(kept)),
+                key=lambda i: (kept[i].get("quality", {}) or {}).get("score", 0),
+            )
+            best_frame_idx = strict_indices[best_idx]
+            best_frame_bytes = frames[best_frame_idx]
+
+            return {
+                "ok": True,
+                "mode": "strict",
+                "frames_analyzed": len(kept),
+                "analyses": kept,
+                "consensus": consensus,
+                "best_frame_idx": best_frame_idx,
+                "best_frame_bytes": best_frame_bytes,
+                "side_a_count": sum(1 for a in kept if a.get("side_label") == "A"),
+                "side_b_count": sum(1 for a in kept if a.get("side_label") == "B"),
+                "majority_side": majority,
+                "discarded_minority_frames": len(strict_analyses) - len(kept),
+            }
+
+    # ---------- PASS 2: regional fallback ----------
+    regional_contributors = 0
+    region_samples: dict[str, list[dict[str, float]]] = {
+        "head": [], "body": [], "tail": [], "dorsal": [], "anal": []
+    }
+
+    for fi, fbytes in enumerate(frames):
+        try:
+            img = _load_image_rgb(fbytes)
+            if img is None:
+                continue
+            img.thumbnail((640, 640), Image.LANCZOS)
+
+            rgb = np.asarray(img).astype(np.float32)
+            rgb = _normalize_white_balance(rgb)
+            rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+            hsv = _rgb_to_hsv_numpy(rgb_u8)
+
+            water_tint = _detect_water_tint(hsv)
+            bg_color = _detect_background_color_cluster(rgb_u8)
+
+            mask = _mask_fish_region(hsv, rgb_u8,
+                                     water_tint=water_tint, bg_color=bg_color)
+            if mask.sum() < 50:
+                continue
+            mask = _isolate_largest_blob(mask, rgb_u8, min_size_pct=0.5)
+            if mask.sum() < 50:
+                continue
+
+            coverage_pct = float(mask.sum() / mask.size * 100)
+            if coverage_pct < MIN_COVERAGE_PCT:
+                continue
+
+            orientation_full = _compute_orientation(mask)
+            aspect = orientation_full.get("aspect", 0)
+            if aspect < 1.0:
+                continue
+
+            body_ratio = _compute_body_ratio(mask, orientation_full)
+            if body_ratio < MIN_BODY_RATIO_PARTIAL:
+                continue
+
+            regions = _split_blob_into_regions(mask, orientation=orientation_full)
+            if not regions:
+                continue
+
+            clean = _frame_regions_clean(regions, mask.shape)
+            if not clean:
+                continue
+
+            contributed = False
+            for name, rmask in clean.items():
+                pal = _palette_for_mask(rgb_u8, rmask, k_clusters=4)
+                if pal:
+                    region_samples[name].append(pal)
+                    contributed = True
+
+            if contributed:
+                regional_contributors += 1
+        except Exception:
+            continue
+
+    merged_region_palettes: dict[str, dict[str, float]] = {}
+    for name, samples in region_samples.items():
+        if not samples:
+            continue
+        keys = set()
+        for s in samples:
+            keys.update(s.keys())
+        avg: dict[str, float] = {}
+        for k in keys:
+            avg[k] = round(sum(s.get(k, 0.0) for s in samples) / len(samples), 1)
+        avg = {k: v for k, v in avg.items() if v >= 3.0}
+        if avg:
+            merged_region_palettes[name] = avg
+
+    if regional_contributors >= MIN_PARTIAL_REGION_FRAMES and merged_region_palettes:
+        merged = _merge_region_palettes(merged_region_palettes)
+        pattern = _classify_pattern(merged)
+        keys = list(merged.keys())
+        primary = keys[0] if keys else None
+        secondary = keys[1] if len(keys) > 1 else None
+
+        return {
+            "ok": True,
+            "mode": "regional",
+            "frames_analyzed": regional_contributors,
+            "region_samples": {k: len(v) for k, v in region_samples.items()},
+            "merged_region_palettes": merged_region_palettes,
+            "consensus": {
+                "ok": True,
+                "palette": merged,
+                "primary": primary,
+                "secondary": secondary,
+                "pattern_hint": pattern,
+                "shot_count": regional_contributors,
+            },
+            "best_frame_idx": 0,
+            "best_frame_bytes": frames[0] if frames else None,
+            "side_a_count": 0,
+            "side_b_count": 0,
+        }
+
+    return {
+        "ok": False,
+        "error": (
+            "Could not find a clear side view. "
+            "Try again with fish side-on and fins flared."
+        ),
+        "strict_frames_found": len(strict_analyses),
+        "regional_contributors": regional_contributors,
+    }
+
+
+# ============================================================
+# MULTI-SHOT CONSENSUS
+# ============================================================
+
+def merge_analyses(analyses: list[dict]) -> dict:
+    valid = [a for a in analyses if a and a.get("ok")]
+    if not valid:
+        return {"ok": False, "error": "No valid shots"}
+
+    all_keys = set()
+    for a in valid:
+        all_keys.update(a["palette"].keys())
+
+    merged: dict[str, float] = {}
+    for key in all_keys:
+        vals = [a["palette"].get(key, 0) for a in valid]
+        merged[key] = round(sum(vals) / len(vals), 1)
+
+    merged = {k: v for k, v in merged.items() if v >= 3.0}
+    merged = dict(sorted(merged.items(), key=lambda x: -x[1]))
+
+    keys = list(merged.keys())
+    primary = keys[0] if keys else None
+    secondary = keys[1] if len(keys) > 1 else None
+    pattern = _classify_pattern(merged)
+
+    iri_scores = [a.get("iridescence_score", 0) for a in valid]
+    max_score = max(iri_scores)
+
+    if max_score < 10:
+        iri_level = "none"
+    elif max_score < 30:
+        iri_level = "faint"
+    elif max_score < 60:
+        iri_level = "moderate"
+    else:
+        iri_level = "strong"
+
+    region_confs = [a.get("region_confidence", 0) for a in valid]
+    avg_region_conf = round(sum(region_confs) / len(region_confs), 2) if region_confs else 0.0
+
+    sides_seen = sorted(set(a.get("side_label", "?") for a in valid))
+
+    return {
+        "ok": True,
+        "palette": merged,
+        "primary": primary,
+        "secondary": secondary,
+        "pattern_hint": pattern,
+        "iridescence_level": iri_level,
+        "iridescence_score": max_score,
+        "shot_count": len(valid),
+        "best_shot_index": max(
+            range(len(analyses)),
+            key=lambda i: (analyses[i] or {}).get("quality", {}).get("score", 0),
+        ),
+        "region_confidence": avg_region_conf,
+        "sides_seen": sides_seen,
+    }
+
+
+# ============================================================
+# DISPLAY HELPERS
+# ============================================================
+
+COLOR_SWATCHES = {
+    "red": "#DC2626",
+    "orange": "#EA580C",
+    "yellow": "#EAB308",
+    "cream": "#FEF3C7",
+    "green": "#16A34A",
+    "teal": "#14B8A6",
+    "cyan": "#06B6D4",
+    "blue": "#2563EB",
+    "dark_blue": "#1E3A8A",
+    "purple": "#7C3AED",
+    "violet": "#8B5CF6",
+    "pink": "#DB2777",
+    "white": "#F3F4F6",
+    "black": "#1F2937",
+    "silver": "#9CA3AF",
+    "gold_metallic": "#D4AF37",
+    "copper": "#B87333",
+    "bronze": "#92400E",
+}
+
+
+def color_swatch_html(color: str, size: int = 16) -> str:
+    hex_color = COLOR_SWATCHES.get(color, "#E5E7EB")
+    border = "border:1px solid #D1D5DB;" if color in ("white", "silver", "cream") else ""
+    return (
+        f'<span style="display:inline-block;width:{size}px;height:{size}px;'
+        f'background:{hex_color};border-radius:4px;vertical-align:middle;{border}'
+        f'margin-right:4px;"></span>'
+    )
+
+
+def palette_html(palette: dict, max_items: int = 5) -> str:
+    if not palette:
+        return "—"
+    parts = []
+    for i, (color, pct) in enumerate(sorted(palette.items(), key=lambda x: -x[1])[:max_items]):
+        parts.append(f"{color_swatch_html(color)}{color} {pct:.0f}%")
+    return " &nbsp; ".join(parts)
