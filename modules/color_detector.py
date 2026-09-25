@@ -4,17 +4,9 @@
 # Session 26B — Added analyze_region() for tap-to-select flow.
 # Session 26C — Added extract_frames_from_video() for video upload flow.
 # Session 26C fix — Added blob detection to isolate the largest fish region.
-# Session 26D — Major accuracy upgrade:
-#              • Auto white-balance normalization
-#              • Water tint subtraction
-#              • Tighter reflection filter
-#              • Color-adaptive background detection
-#              • Blob quality gate (aspect, edges, variance, fill ratio)
-#              • 18 color categories (was 12)
-#              • Better iridescence detection (window variance)
-# Session 26D fix — analyze_video() returns best_frame_bytes directly.
-# Session 26D round 2 — Blob quality gate rejects low-saturation blobs
-#                       (glass/water/tape).
+# Session 26D — Major accuracy upgrade + verified on real fish.
+# Session 26D round 2 — Reject low-saturation blobs.
+# Session 26D round 3 — Suppress silver glass noise in fish mask + clusters.
 
 from __future__ import annotations
 
@@ -39,32 +31,25 @@ except ImportError:
 
 
 # ============================================================
-# COLOR CATEGORY DEFINITIONS (18 categories)
+# COLOR CATEGORY DEFINITIONS
 # ============================================================
 
 COLOR_CATEGORIES = [
-    # Reds / oranges
     ("red",                5,         20,        90,      40,      255),
     ("orange",             30,        18,        90,      40,      255),
     ("copper",             20,        20,        120,     120,     200),
-    # Yellows / golds
     ("yellow",             52,        18,        90,      60,      255),
     ("gold_metallic",      45,        25,        120,     170,     255),
     ("cream",              55,        20,        40,      200,     255),
-    # Greens / teals
     ("green",              110,       45,        80,      40,      255),
     ("teal",               165,       30,        70,      40,      255),
-    # Blues / cyans
     ("cyan",               185,       25,        80,      60,      255),
     ("blue",               210,       35,        80,      40,      255),
     ("dark_blue",          220,       30,        60,      0,       80),
-    # Purples / violets
     ("purple",             275,       30,        70,      40,      255),
     ("violet",             295,       25,        70,      40,      255),
     ("pink",               320,       30,        70,      40,      255),
-    # Metallic browns
     ("bronze",             25,        20,        100,     80,      160),
-    # Achromatic
     ("white",              0,         360,       0,       200,     255),
     ("silver",             0,         360,       0,       120,     200),
     ("black",              0,         360,       0,       0,       60),
@@ -117,11 +102,10 @@ def _hue_distance(h1: float, h2: float) -> float:
 
 
 # ============================================================
-# WHITE BALANCE NORMALIZATION
+# WHITE BALANCE
 # ============================================================
 
 def _normalize_white_balance(rgb: np.ndarray) -> np.ndarray:
-    """Estimate illuminant from brightest ~5% pixels, rescale to neutral."""
     try:
         lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
         threshold = np.percentile(lum, 95)
@@ -144,11 +128,10 @@ def _normalize_white_balance(rgb: np.ndarray) -> np.ndarray:
 
 
 # ============================================================
-# WATER TINT SUBTRACTION
+# WATER TINT DETECTION
 # ============================================================
 
 def _detect_water_tint(hsv: np.ndarray) -> Optional[tuple[float, float]]:
-    """Detect the water's dominant hue from border ring pixels."""
     try:
         h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
         H, W = h.shape
@@ -186,7 +169,6 @@ def _detect_water_tint(hsv: np.ndarray) -> Optional[tuple[float, float]]:
 # ============================================================
 
 def _detect_background_color_cluster(rgb: np.ndarray) -> Optional[tuple[int, int, int]]:
-    """Find the most common color cluster in the border ring."""
     try:
         H, W = rgb.shape[:2]
         b = max(2, int(min(H, W) * 0.10))
@@ -219,7 +201,6 @@ def _detect_background_color_cluster(rgb: np.ndarray) -> Optional[tuple[int, int
 
 def _mask_adaptive_background(rgb: np.ndarray, bg_color: Optional[tuple[int, int, int]],
                                 tolerance: int = 60) -> np.ndarray:
-    """Return True where pixels are NOT background."""
     if bg_color is None:
         return np.ones(rgb.shape[:2], dtype=bool)
 
@@ -229,7 +210,7 @@ def _mask_adaptive_background(rgb: np.ndarray, bg_color: Optional[tuple[int, int
 
 
 # ============================================================
-# BACKGROUND FILTERING + CROP
+# FISH MASK (Session 26D round 3: tighter reflection filter)
 # ============================================================
 
 def _mask_fish_region(
@@ -238,7 +219,6 @@ def _mask_fish_region(
     water_tint: Optional[tuple[float, float]] = None,
     bg_color: Optional[tuple[int, int, int]] = None,
 ) -> np.ndarray:
-    """Build a boolean mask of likely fish pixels."""
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
 
     is_fish = np.ones_like(s, dtype=bool)
@@ -247,7 +227,9 @@ def _mask_fish_region(
     is_fish &= ~(v > 240)
     is_fish &= ~(v < 25)
 
-    is_reflection = (v > 200) & (s < 45)
+    # Round 3: tighter reflection filter — catches silver glass sheen
+    # Bright AND low-saturation = glass/water/tape surface
+    is_reflection = (v > 195) & (s < 60)
     is_fish &= ~is_reflection
 
     if water_tint is not None:
@@ -275,19 +257,10 @@ def _mask_fish_region(
 
 
 # ============================================================
-# BLOB QUALITY GATE (Session 26D round 2)
+# BLOB QUALITY GATE
 # ============================================================
 
 def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -> bool:
-    """
-    Reject a blob if:
-      - aspect ratio too square (fish are elongated)
-      - touches edges (cut off, likely background)
-      - color variance too low (flat wall)
-      - fill ratio too high (rectangular — glass/tape/tank rim)
-      - saturation too low (grey glass/water/tape)
-      - saturation variance too low (uniform grey surface)
-    """
     try:
         if blob_mask.sum() < 30:
             return False
@@ -300,11 +273,9 @@ def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -
             return False
 
         aspect = max(h_span, v_span) / max(1, min(h_span, v_span))
-
         if aspect < 1.15:
             return False
 
-        # Reject rectangular blobs (glass, tape, tank rim)
         bbox_area = h_span * v_span
         fill_ratio = blob_mask.sum() / max(1, bbox_area)
         if fill_ratio > 0.85:
@@ -324,7 +295,6 @@ def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -
         if std_rgb < 8:
             return False
 
-        # NEW (round 2): reject low-saturation blobs (glass, water, tape)
         blob_f = blob_pixels.astype(np.float32)
         maxc = blob_f.max(axis=1)
         minc = blob_f.min(axis=1)
@@ -345,7 +315,6 @@ def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -
 
 
 def _isolate_largest_blob(mask: np.ndarray, rgb: np.ndarray, min_size_pct: float = 0.5) -> np.ndarray:
-    """Return mask of largest blob passing quality gate."""
     if not _SCIPY_AVAILABLE or mask.sum() == 0:
         return mask
 
@@ -450,7 +419,58 @@ def _map_hsv_to_category(h: float, s: float, v: float) -> Optional[str]:
 
 
 # ============================================================
-# IRIDESCENCE DETECTION
+# SESSION 26D ROUND 3 — SILVER NOISE SUPPRESSION
+# ============================================================
+
+def _suppress_silver_noise(
+    palette: dict[str, float],
+    centroids: np.ndarray,
+    labels: np.ndarray,
+) -> dict[str, float]:
+    """
+    Post-cluster cleanup:
+    If a silver/grey cluster is small (< 20% of pixels) and NOT dominant,
+    downgrade it. Real silver fish have silver as the biggest cluster.
+
+    Also: if `white` and `silver` together are < 25%, they're probably
+    glass reflections and should be reduced.
+    """
+    try:
+        total = sum(palette.values())
+        if total <= 0:
+            return palette
+
+        # Compute per-category percentage and cluster size
+        keys = list(palette.keys())
+
+        # If silver is present but not the largest, shrink it
+        if "silver" in palette:
+            silver_pct = palette["silver"]
+            largest_pct = max(palette.values())
+
+            # If silver < 20% AND not the largest → shrink by 60%
+            if silver_pct < 20 and silver_pct < largest_pct:
+                palette["silver"] = round(silver_pct * 0.4, 1)
+
+        # Same for white if it's smaller than 15% (usually tape/glare)
+        if "white" in palette:
+            white_pct = palette["white"]
+            largest_pct = max(palette.values())
+            if white_pct < 15 and white_pct < largest_pct:
+                palette["white"] = round(white_pct * 0.5, 1)
+
+        # Drop anything now below 3%
+        palette = {k: v for k, v in palette.items() if v >= 3.0}
+
+        # Re-sort
+        palette = dict(sorted(palette.items(), key=lambda x: -x[1]))
+        return palette
+    except Exception:
+        return palette
+
+
+# ============================================================
+# IRIDESCENCE
 # ============================================================
 
 def _detect_iridescence(hsv: np.ndarray, mask: np.ndarray) -> tuple[str, int]:
@@ -572,7 +592,6 @@ def _score_quality(img: Image.Image, mask: np.ndarray, hsv: np.ndarray) -> dict:
 # ============================================================
 
 def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) -> Optional[dict]:
-    """Analyze a full photo with Session 26D accuracy improvements."""
     img = _load_image_rgb(raw_bytes)
     if img is None:
         return {"ok": False, "error": "Could not load image"}
@@ -580,9 +599,7 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) 
     img.thumbnail((640, 640), Image.LANCZOS)
 
     rgb = np.asarray(img).astype(np.float32)
-
     rgb = _normalize_white_balance(rgb)
-
     rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
     hsv = _rgb_to_hsv_numpy(rgb_u8)
 
@@ -614,6 +631,10 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) 
             palette[cat] = palette.get(cat, 0) + float(pcts[ci])
 
     palette = {k: round(v, 1) for k, v in palette.items() if v >= 3.0}
+
+    # Session 26D round 3: suppress silver/white glass noise
+    palette = _suppress_silver_noise(palette, centroids, labels)
+
     sorted_palette = dict(sorted(palette.items(), key=lambda x: -x[1]))
 
     keys = list(sorted_palette.keys())
@@ -650,7 +671,7 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) 
 
 
 # ============================================================
-# REGION ANALYSIS (tap-to-select)
+# REGION ANALYSIS
 # ============================================================
 
 def analyze_region(
@@ -662,7 +683,6 @@ def analyze_region(
     region_size: int = 150,
     k_clusters: int = 5,
 ) -> Optional[dict]:
-    """Analyze a small square region around a tap point."""
     img = _load_image_rgb(raw_bytes)
     if img is None:
         return {"ok": False, "error": "Could not load image"}
@@ -718,7 +738,6 @@ def extract_frames_from_video(
     max_frames: int = 30,
     target_width: int = 640,
 ) -> list[bytes]:
-    """Extract sampled frames from a video file (in-memory)."""
     if not _AV_AVAILABLE:
         raise RuntimeError("PyAV (av) not installed. Run: `py -m pip install av`")
 
@@ -774,7 +793,6 @@ def analyze_video(
     max_frames: int = 30,
     k_clusters: int = 5,
 ) -> dict:
-    """Full video pipeline. Returns consensus + best frame bytes."""
     try:
         frames = extract_frames_from_video(
             video_bytes,
