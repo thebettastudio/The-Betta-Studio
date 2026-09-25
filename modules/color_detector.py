@@ -11,6 +11,7 @@
 #   • Pass 1 (strict): clean side profile + fully flared + complete
 #   • Pass 2 (lenient + regional): per-frame regional fallback
 #   • IBC body ratio uses interquartile depth (excludes fin tips)
+#   • Blob splitter removes mirror/reflection duplicate fish
 #   • Regions aligned to HMPK anatomy: head 20% / body 45% / tail 35%
 #   • Side A = head-left, Side B = head-right
 #   • tap-to-select crops bypass posture via skip_posture=True
@@ -67,22 +68,13 @@ COLOR_CATEGORIES = [
 # POSTURE VALIDATION CONSTANTS (Session 26E, tuned)
 # ============================================================
 
-# Side profile: elongated blob. Flared bettas are WIDE — lower threshold.
 MIN_ASPECT_RATIO = 1.05
-
-# IBC body ratio: side views have a long thin body, head-on is square.
-# From ibc_standards.MEASURABLE_CRITERIA["body_length_depth_ratio"]
-MIN_BODY_RATIO_SIDE = 2.0       # strict side view
-MIN_BODY_RATIO_PARTIAL = 1.6    # lenient regional fallback
-
-# Coverage: blob must be >=1% of frame (tank shots are farther away)
+MIN_BODY_RATIO_SIDE = 2.0
+MIN_BODY_RATIO_PARTIAL = 1.6
 MIN_COVERAGE_PCT = 1.0
 
-# Flare: solidity below this = distinct fin extensions
 MAX_SOLIDITY_FLARED = 0.92
-# Minimum fin-extension pixels outside core-body ellipse
 MIN_FLARE_PIXELS = 100
-# Tail width vs mid-body width (only meaningful when near-horizontal)
 MIN_TAIL_SPREAD_RATIO = 1.1
 
 # Region split fractions — HMPK anatomy-aligned
@@ -90,7 +82,6 @@ HEAD_REGION_FRAC = 0.20
 BODY_REGION_FRAC = 0.45
 TAIL_REGION_FRAC = 0.35
 
-# Region weights for palette merge
 REGION_WEIGHTS = {
     "head":   0.15,
     "body":   0.35,
@@ -99,7 +90,6 @@ REGION_WEIGHTS = {
     "anal":   0.15,
 }
 
-# Pass thresholds
 MIN_STRICT_FRAMES = 3
 MIN_PARTIAL_REGION_FRAMES = 3
 MIN_REGION_PIXELS = 30
@@ -355,6 +345,88 @@ def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -
         return True
 
 
+def _split_merged_blob_horizontal(blob_mask: np.ndarray,
+                                    rgb_u8: np.ndarray) -> np.ndarray:
+    """
+    If the isolated blob actually contains two fish side-by-side
+    (real fish + mirror reflection merged into one component),
+    split it at the emptiest column and keep the better half.
+
+    Winner = higher mean colour saturation (real fish beats reflection
+    through glass).
+    """
+    try:
+        if blob_mask.sum() < 200:
+            return blob_mask
+
+        ys, xs = np.where(blob_mask)
+        if len(xs) < 200:
+            return blob_mask
+
+        x_min = int(xs.min())
+        x_max = int(xs.max())
+        width = x_max - x_min + 1
+
+        if width < 40:
+            return blob_mask
+
+        col_counts = np.bincount(xs - x_min, minlength=width)
+
+        lo = int(width * 0.30)
+        hi = int(width * 0.70)
+        if hi - lo < 5:
+            return blob_mask
+
+        mid_band = col_counts[lo:hi]
+        if len(mid_band) == 0:
+            return blob_mask
+
+        median_count = float(np.median(col_counts))
+        if median_count < 1.0:
+            return blob_mask
+
+        min_col_offset = int(np.argmin(mid_band))
+        min_col_count = float(mid_band[min_col_offset])
+
+        if min_col_count > median_count * 0.40:
+            return blob_mask
+
+        split_x = x_min + lo + min_col_offset
+
+        left_mask = blob_mask.copy()
+        left_mask[:, split_x:] = False
+
+        right_mask = blob_mask.copy()
+        right_mask[:, :split_x] = False
+
+        left_px = int(left_mask.sum())
+        right_px = int(right_mask.sum())
+
+        if left_px < 100 or right_px < 100:
+            return blob_mask
+
+        def _mean_sat(m):
+            if m.sum() == 0:
+                return 0.0
+            px = rgb_u8[m].astype(np.float32)
+            maxc = px.max(axis=1)
+            minc = px.min(axis=1)
+            sat = np.where(maxc > 1e-3, (maxc - minc) / np.maximum(maxc, 1e-3), 0.0)
+            return float(sat.mean())
+
+        left_score = _mean_sat(left_mask) * (1.0 + left_px / max(1, left_px + right_px))
+        right_score = _mean_sat(right_mask) * (1.0 + right_px / max(1, left_px + right_px))
+
+        if left_score > right_score * 1.10:
+            return left_mask
+        if right_score > left_score * 1.10:
+            return right_mask
+
+        return left_mask if left_px >= right_px else right_mask
+    except Exception:
+        return blob_mask
+
+
 def _isolate_largest_blob(mask: np.ndarray, rgb: np.ndarray, min_size_pct: float = 0.5) -> np.ndarray:
     if not _SCIPY_AVAILABLE or mask.sum() == 0:
         return mask
@@ -375,12 +447,12 @@ def _isolate_largest_blob(mask: np.ndarray, rgb: np.ndarray, min_size_pct: float
             if blob_mask.sum() / mask.size < min_size_pct / 100.0:
                 break
             if _blob_quality_ok(mask, blob_mask, rgb):
-                return blob_mask
+                return _split_merged_blob_horizontal(blob_mask, rgb)
 
         largest_mask = (labeled == order[0])
         if largest_mask.sum() / mask.size < min_size_pct / 100.0:
             return mask
-        return largest_mask
+        return _split_merged_blob_horizontal(largest_mask, rgb)
     except Exception:
         return mask
 
@@ -482,14 +554,9 @@ def _compute_body_ratio(blob_mask: np.ndarray, orientation: dict) -> float:
     Compute IBC body_length_depth_ratio from the BODY CORE only
     (excluding long dorsal/anal fin extensions).
 
-    Strategy:
-      • Length = span of the middle 40% band along the major axis.
-      • Depth  = interquartile perpendicular spread (25–75 pct) of that
-                 band. This trims fin tips which stick out far from the
-                 body centerline.
-
+    Length = span of the middle 40% band along the major axis.
+    Depth  = interquartile perpendicular spread (25–75 pct).
     Head-on fish → ~0.8–1.8.  Side-view fish → 2.5–4.5.
-    Returns 0.0 if the ratio cannot be computed.
     """
     try:
         proj_major = orientation.get("proj_major")
@@ -503,7 +570,6 @@ def _compute_body_ratio(blob_mask: np.ndarray, orientation: dict) -> float:
         maj_max = float(proj_major.max())
         span = max(1e-6, maj_max - maj_min)
 
-        # Middle 40% band along the major axis
         body_lo = maj_min + span * 0.30
         body_hi = maj_min + span * 0.70
         body_band = (proj_major >= body_lo) & (proj_major <= body_hi)
@@ -514,12 +580,8 @@ def _compute_body_ratio(blob_mask: np.ndarray, orientation: dict) -> float:
         body_major = proj_major[body_band]
         body_minor = proj_minor[body_band]
 
-        # Length = span of the band along the major axis
         body_length = float(body_major.max() - body_major.min())
 
-        # Depth = interquartile perpendicular spread (25th–75th pct)
-        # This trims the outer 25% on each side — dorsal fin tips above
-        # and anal fin tips below get cut off.
         p25 = float(np.percentile(body_minor, 25))
         p75 = float(np.percentile(body_minor, 75))
         body_depth = p75 - p25
@@ -533,18 +595,10 @@ def _compute_body_ratio(blob_mask: np.ndarray, orientation: dict) -> float:
 
 
 # ============================================================
-# FLARE DETECTION (Session 26E, tuned)
+# FLARE DETECTION
 # ============================================================
 
 def _detect_flare(blob_mask: np.ndarray, orientation: dict) -> dict:
-    """
-    Detect fin flare using:
-      1. Solidity (blob area / convex hull area)
-      2. Fin-extension pixel count outside core-body ellipse
-      3. Tail spread ratio (only counted when near-horizontal)
-
-    Flared if >= 1 signal. Hard-reject if aspect > 3.5 (tube).
-    """
     try:
         if blob_mask.sum() < 30:
             return {"is_flared": False, "confidence": 0.0,
@@ -696,7 +750,7 @@ def _check_completeness(blob_mask: np.ndarray, orientation: dict) -> dict:
 
 
 # ============================================================
-# POSTURE VALIDATION (Session 26E)
+# POSTURE VALIDATION
 # ============================================================
 
 def validate_fish_posture(blob_mask: np.ndarray, rgb: np.ndarray,
@@ -708,8 +762,6 @@ def validate_fish_posture(blob_mask: np.ndarray, rgb: np.ndarray,
     aspect = orientation.get("aspect", 0)
     aspect_ok = aspect >= MIN_ASPECT_RATIO
 
-    # IBC body ratio: side views have a long thin body (2.0–4.5),
-    # head-on views have a squarish body (0.8–1.8).
     body_ratio = _compute_body_ratio(blob_mask, orientation)
     body_ratio_ok = body_ratio >= MIN_BODY_RATIO_SIDE
 
@@ -779,7 +831,7 @@ def validate_fish_posture(blob_mask: np.ndarray, rgb: np.ndarray,
 
 
 # ============================================================
-# 5-REGION SPLIT (Session 26E, vectorized, HMPK-aligned)
+# 5-REGION SPLIT (HMPK-aligned, vectorized)
 # ============================================================
 
 def _split_blob_into_regions(blob_mask: np.ndarray,
@@ -811,10 +863,6 @@ def _split_blob_into_regions(blob_mask: np.ndarray,
         else:
             canon = 1.0 - norm_major
 
-        # HMPK anatomy-aligned bands:
-        #   head = 0.00 .. 0.20 (eye + gill)
-        #   body = 0.20 .. 0.65 (torso)
-        #   tail = 0.65 .. 1.00 (caudal fin)
         is_head = canon < HEAD_REGION_FRAC
         is_tail = canon >= (HEAD_REGION_FRAC + BODY_REGION_FRAC)
         is_body = ~is_head & ~is_tail
@@ -1139,17 +1187,11 @@ def _classify_pattern(palette: dict[str, float]) -> str:
 
 
 # ============================================================
-# MAIN: ANALYZE PHOTO (Session 26E two-pass)
+# MAIN: ANALYZE PHOTO
 # ============================================================
 
 def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
                   use_blob: bool = True, skip_posture: bool = False) -> Optional[dict]:
-    """
-    Analyze a photo using 5-region full-fish split + posture validation.
-
-    skip_posture=True bypasses posture validation — used by analyze_region()
-    for tap-to-select crops that aren't full-fish silhouettes.
-    """
     img = _load_image_rgb(raw_bytes)
     if img is None:
         return {"ok": False, "error": "Could not load image"}
@@ -1414,17 +1456,6 @@ def analyze_video(
     max_frames: int = 30,
     k_clusters: int = 5,
 ) -> dict:
-    """
-    Two-pass video pipeline.
-
-    Pass 1 (strict): keep only frames where posture pass == 1.
-    If >= MIN_STRICT_FRAMES and same-side majority → mode="strict".
-
-    Pass 2 (regional fallback): per-frame region-only analysis.
-    Merge per-region across frames → mode="regional".
-
-    Else reject.
-    """
     try:
         frames = extract_frames_from_video(
             video_bytes,
@@ -1589,7 +1620,6 @@ def analyze_video(
             "side_b_count": 0,
         }
 
-    # ---------- BOTH FAILED ----------
     return {
         "ok": False,
         "error": (
