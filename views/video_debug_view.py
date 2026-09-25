@@ -22,6 +22,7 @@ from modules.color_detector import (
     _mask_fish_region,
     _isolate_largest_blob,
     _compute_orientation,
+    _compute_body_ratio,
     _detect_flare,
     _check_completeness,
     validate_fish_posture,
@@ -30,6 +31,7 @@ from modules.color_detector import (
     MAX_SOLIDITY_FLARED,
     MIN_FLARE_PIXELS,
     MIN_TAIL_SPREAD_RATIO,
+    MIN_BODY_RATIO_SIDE,
 )
 
 
@@ -89,6 +91,7 @@ def _analyze_one_frame(fbytes: bytes) -> dict:
         completeness = _check_completeness(blob, orientation)
 
         result["aspect"] = orientation.get("aspect", 0)
+        result["body_ratio"] = round(_compute_body_ratio(blob, orientation), 2)
         result["length"] = orientation.get("length", 0)
         result["height"] = orientation.get("height", 0)
         result["angle_deg"] = orientation.get("major_axis_angle_deg", 0)
@@ -175,9 +178,12 @@ def _render_frame_card(idx: int, r: dict):
             aspect = r.get("aspect", 0)
             side_ok = aspect >= MIN_ASPECT_RATIO
 
+            body_ratio = r.get("body_ratio", 0.0)
+            body_ok = body_ratio >= MIN_BODY_RATIO_SIDE
+
             flared = r.get("flared", False)
             flare_conf = r.get("flare_conf", 0.0)
-            flare_ok = flared and flare_conf >= 0.66
+            flare_ok = flared and flare_conf >= 0.5
 
             complete = r.get("complete", False)
             partial_ok = r.get("partial_ok", False)
@@ -187,8 +193,10 @@ def _render_frame_card(idx: int, r: dict):
                 _pill("Coverage", cov_ok, f"{cov:.1f}% / min {MIN_COVERAGE_PCT}%")
                 + _pill("Side profile", side_ok,
                         f"aspect {aspect:.2f} / min {MIN_ASPECT_RATIO}")
+                + _pill("Body ratio", body_ok,
+                        f"{body_ratio:.2f} / min {MIN_BODY_RATIO_SIDE}")
                 + _pill("Flared", flare_ok,
-                        f"conf {flare_conf:.2f} / min 0.66")
+                        f"conf {flare_conf:.2f} / min 0.50")
                 + _pill("Completeness", complete_ok,
                         "full" if complete else ("partial OK" if partial_ok else "cut off"))
             )
@@ -199,6 +207,7 @@ def _render_frame_card(idx: int, r: dict):
                 <b>Blob:</b> {r.get('blob_px', 0):,} px &nbsp;·&nbsp;
                 <b>Size:</b> {r.get('length', 0):.0f}×{r.get('height', 0):.0f} px &nbsp;·&nbsp;
                 <b>Angle:</b> {r.get('angle_deg', 0):.1f}°<br>
+                <b>Body ratio (IBC):</b> {body_ratio:.2f} (side view needs ≥{MIN_BODY_RATIO_SIDE})<br>
                 <b>Flare:</b> solidity {r.get('solidity', 1.0):.2f} (≤{MAX_SOLIDITY_FLARED}) &nbsp;·&nbsp;
                 ext {r.get('ext_px', 0)} px (≥{MIN_FLARE_PIXELS}) &nbsp;·&nbsp;
                 tail ratio {r.get('tail_ratio', 1.0):.2f} (≥{MIN_TAIL_SPREAD_RATIO})<br>
@@ -234,6 +243,7 @@ def render_video_debug_page():
             f"""<div style="font-size:12px;color:#4A5568;margin-top:28px;line-height:1.5;">
             <b>Thresholds in use:</b><br>
             aspect ≥ {MIN_ASPECT_RATIO} · coverage ≥ {MIN_COVERAGE_PCT}%<br>
+            body ratio ≥ {MIN_BODY_RATIO_SIDE} (IBC side view)<br>
             solidity ≤ {MAX_SOLIDITY_FLARED} · ext ≥ {MIN_FLARE_PIXELS} px<br>
             tail ratio ≥ {MIN_TAIL_SPREAD_RATIO}
             </div>""",
@@ -311,6 +321,7 @@ def render_video_debug_page():
             "thresholds": {
                 "MIN_ASPECT_RATIO": MIN_ASPECT_RATIO,
                 "MIN_COVERAGE_PCT": MIN_COVERAGE_PCT,
+                "MIN_BODY_RATIO_SIDE": MIN_BODY_RATIO_SIDE,
                 "MAX_SOLIDITY_FLARED": MAX_SOLIDITY_FLARED,
                 "MIN_FLARE_PIXELS": MIN_FLARE_PIXELS,
                 "MIN_TAIL_SPREAD_RATIO": MIN_TAIL_SPREAD_RATIO,
