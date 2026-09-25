@@ -4,6 +4,7 @@
 # Session 21 — Added Lines & Varieties page.
 # Session 25 — Added Inheritance Analysis page.
 # Session 26B — WebRTC test page removed from production (kept local for dev).
+# Session 26E — Temp video debug panel in sidebar (System Diagnostics).
 
 import datetime
 
@@ -141,8 +142,18 @@ def run_supabase_diagnostic():
                 status.update(label="All services operational!", state="complete")
 
         st.divider()
+
+        # ---------- TEMP VIDEO DEBUG (remove when done) ----------
+        try:
+            from modules.color_debug import render_video_debug_sidebar
+            with st.expander("🐛 Video Debug (temp)", expanded=False):
+                render_video_debug_sidebar()
+        except Exception as e:
+            st.caption(f"Debug panel unavailable: {e}")
+        # ---------- END TEMP VIDEO DEBUG ----------
+
         st.caption(
-            f"Session: 26B · Build: {datetime.date.today().isoformat()}"
+            f"Session: 26E · Build: {datetime.date.today().isoformat()}"
         )
 
 
