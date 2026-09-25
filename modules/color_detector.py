@@ -77,7 +77,6 @@ MAX_SOLIDITY_FLARED = 0.92
 MIN_FLARE_PIXELS = 100
 MIN_TAIL_SPREAD_RATIO = 1.1
 
-# Region split fractions — HMPK anatomy-aligned
 HEAD_REGION_FRAC = 0.20
 BODY_REGION_FRAC = 0.45
 TAIL_REGION_FRAC = 0.35
@@ -348,12 +347,16 @@ def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -
 def _split_merged_blob_horizontal(blob_mask: np.ndarray,
                                     rgb_u8: np.ndarray) -> np.ndarray:
     """
-    If the isolated blob actually contains two fish side-by-side
-    (real fish + mirror reflection merged into one component),
-    split it at the emptiest column and keep the better half.
+    If the isolated blob contains two fish side-by-side (real fish +
+    mirror reflection merged into one component), split it and keep
+    the better half.
 
-    Winner = higher mean colour saturation (real fish beats reflection
-    through glass).
+    Triggers whenever the blob's bounding box is close to square
+    (aspect < 1.35) — a real side-view fish is much wider than tall.
+
+    Splits at the column of minimum density within the middle 30% of
+    the blob's width. Keeps the half with higher mean colour saturation
+    (real fish beats reflection through glass).
     """
     try:
         if blob_mask.sum() < 200:
@@ -365,32 +368,33 @@ def _split_merged_blob_horizontal(blob_mask: np.ndarray,
 
         x_min = int(xs.min())
         x_max = int(xs.max())
-        width = x_max - x_min + 1
+        y_min = int(ys.min())
+        y_max = int(ys.max())
 
-        if width < 40:
+        width = x_max - x_min + 1
+        height = y_max - y_min + 1
+
+        if width < 40 or height < 40:
             return blob_mask
 
+        bbox_aspect = max(width, height) / max(1, min(width, height))
+
+        # Only split if the blob is roughly square (likely two fish).
+        # A real single-fish side view has aspect well above 1.35.
+        if bbox_aspect >= 1.35:
+            return blob_mask
+
+        # Column density histogram within the blob's x-range
         col_counts = np.bincount(xs - x_min, minlength=width)
 
-        lo = int(width * 0.30)
-        hi = int(width * 0.70)
+        # Look for minimum in the middle 30% of the width
+        lo = int(width * 0.35)
+        hi = int(width * 0.65)
         if hi - lo < 5:
             return blob_mask
 
         mid_band = col_counts[lo:hi]
-        if len(mid_band) == 0:
-            return blob_mask
-
-        median_count = float(np.median(col_counts))
-        if median_count < 1.0:
-            return blob_mask
-
         min_col_offset = int(np.argmin(mid_band))
-        min_col_count = float(mid_band[min_col_offset])
-
-        if min_col_count > median_count * 0.40:
-            return blob_mask
-
         split_x = x_min + lo + min_col_offset
 
         left_mask = blob_mask.copy()
@@ -405,6 +409,14 @@ def _split_merged_blob_horizontal(blob_mask: np.ndarray,
         if left_px < 100 or right_px < 100:
             return blob_mask
 
+        # Both halves must be substantial (real fish + reflection
+        # are each ~30%+ of the merged blob). If one half is tiny,
+        # this isn't two fish — skip.
+        min_frac = 0.30
+        total_px = left_px + right_px
+        if (left_px / total_px) < min_frac or (right_px / total_px) < min_frac:
+            return blob_mask
+
         def _mean_sat(m):
             if m.sum() == 0:
                 return 0.0
@@ -417,9 +429,9 @@ def _split_merged_blob_horizontal(blob_mask: np.ndarray,
         left_score = _mean_sat(left_mask) * (1.0 + left_px / max(1, left_px + right_px))
         right_score = _mean_sat(right_mask) * (1.0 + right_px / max(1, left_px + right_px))
 
-        if left_score > right_score * 1.10:
+        if left_score > right_score * 1.05:
             return left_mask
-        if right_score > left_score * 1.10:
+        if right_score > left_score * 1.05:
             return right_mask
 
         return left_mask if left_px >= right_px else right_mask
@@ -550,14 +562,6 @@ def _compute_orientation(blob_mask: np.ndarray) -> dict:
 # ============================================================
 
 def _compute_body_ratio(blob_mask: np.ndarray, orientation: dict) -> float:
-    """
-    Compute IBC body_length_depth_ratio from the BODY CORE only
-    (excluding long dorsal/anal fin extensions).
-
-    Length = span of the middle 40% band along the major axis.
-    Depth  = interquartile perpendicular spread (25–75 pct).
-    Head-on fish → ~0.8–1.8.  Side-view fish → 2.5–4.5.
-    """
     try:
         proj_major = orientation.get("proj_major")
         proj_minor = orientation.get("proj_minor")
