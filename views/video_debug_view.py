@@ -36,6 +36,27 @@ from modules.color_detector import (
 
 
 # ============================================================
+# MASK OVERLAY
+# ============================================================
+
+def _render_blob_overlay(img_pil: Image.Image, blob_mask: np.ndarray) -> bytes:
+    """Draw the blob mask as a red tint over the frame. Returns JPEG bytes."""
+    try:
+        base = np.asarray(img_pil.convert("RGB")).copy()
+        # Red tint where blob is
+        base[blob_mask] = (
+            base[blob_mask] * 0.4 + np.array([255, 0, 0]) * 0.6
+        ).astype(np.uint8)
+        out = Image.fromarray(base)
+        out.thumbnail((360, 360), Image.LANCZOS)
+        buf = io.BytesIO()
+        out.save(buf, format="JPEG", quality=80)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+# ============================================================
 # FRAME ANALYSIS
 # ============================================================
 
@@ -80,6 +101,11 @@ def _analyze_one_frame(fbytes: bytes) -> dict:
         blob = _isolate_largest_blob(mask, rgb_u8, min_size_pct=0.5)
         result["blob_px"] = int(blob.sum())
         result["coverage_pct"] = round(float(blob.sum() / blob.size * 100), 2)
+
+        # Mask overlay for visual debugging
+        overlay_bytes = _render_blob_overlay(img, blob)
+        if overlay_bytes:
+            result["overlay"] = overlay_bytes
 
         if blob.sum() < 50:
             result["reject"] = "Blob too small after isolation"
@@ -156,10 +182,20 @@ def _render_frame_card(idx: int, r: dict):
         col_img, col_gates = st.columns([1, 2])
 
         with col_img:
-            try:
-                st.image(r.get("preview"), use_container_width=True)
-            except Exception:
-                st.caption("preview failed")
+            tab_orig, tab_mask = st.tabs(["Original", "Blob mask"])
+            with tab_orig:
+                try:
+                    st.image(r.get("preview"), use_container_width=True)
+                except Exception:
+                    st.caption("preview failed")
+            with tab_mask:
+                if r.get("overlay"):
+                    try:
+                        st.image(r.get("overlay"), use_container_width=True)
+                    except Exception:
+                        st.caption("overlay failed")
+                else:
+                    st.caption("No mask available")
             st.caption(
                 f"**Frame {idx}** · head: `{r.get('head_dir', '?')}` · "
                 f"side: `{r.get('side_label', '?')}`"
@@ -316,7 +352,7 @@ def render_video_debug_page():
             _render_frame_card(i, r)
 
     with st.expander("📋 Raw JSON (developer)"):
-        clean = [{k: v for k, v in r.items() if k != "preview"} for r in results]
+        clean = [{k: v for k, v in r.items() if k not in ("preview", "overlay")} for r in results]
         st.json({
             "thresholds": {
                 "MIN_ASPECT_RATIO": MIN_ASPECT_RATIO,
