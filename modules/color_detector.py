@@ -13,6 +13,8 @@
 #              • 18 color categories (was 12)
 #              • Better iridescence detection (window variance)
 # Session 26D fix — analyze_video() returns best_frame_bytes directly.
+# Session 26D round 2 — Blob quality gate rejects low-saturation blobs
+#                       (glass/water/tape).
 
 from __future__ import annotations
 
@@ -37,7 +39,7 @@ except ImportError:
 
 
 # ============================================================
-# COLOR CATEGORY DEFINITIONS (Session 26D — 18 categories)
+# COLOR CATEGORY DEFINITIONS (18 categories)
 # ============================================================
 
 COLOR_CATEGORIES = [
@@ -273,7 +275,7 @@ def _mask_fish_region(
 
 
 # ============================================================
-# BLOB QUALITY GATE
+# BLOB QUALITY GATE (Session 26D round 2)
 # ============================================================
 
 def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -> bool:
@@ -283,6 +285,8 @@ def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -
       - touches edges (cut off, likely background)
       - color variance too low (flat wall)
       - fill ratio too high (rectangular — glass/tape/tank rim)
+      - saturation too low (grey glass/water/tape)
+      - saturation variance too low (uniform grey surface)
     """
     try:
         if blob_mask.sum() < 30:
@@ -300,7 +304,7 @@ def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -
         if aspect < 1.15:
             return False
 
-        # Session 26D fix: reject rectangular blobs (glass, tape, tank rim)
+        # Reject rectangular blobs (glass, tape, tank rim)
         bbox_area = h_span * v_span
         fill_ratio = blob_mask.sum() / max(1, bbox_area)
         if fill_ratio > 0.85:
@@ -318,6 +322,21 @@ def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -
 
         std_rgb = blob_pixels.std(axis=0).mean()
         if std_rgb < 8:
+            return False
+
+        # NEW (round 2): reject low-saturation blobs (glass, water, tape)
+        blob_f = blob_pixels.astype(np.float32)
+        maxc = blob_f.max(axis=1)
+        minc = blob_f.min(axis=1)
+        sat = np.where(maxc > 1e-3, (maxc - minc) / np.maximum(maxc, 1e-3), 0.0)
+
+        avg_sat = float(sat.mean())
+        std_sat = float(sat.std())
+
+        if avg_sat < 0.15:
+            return False
+
+        if avg_sat < 0.25 and std_sat < 0.08:
             return False
 
         return True
@@ -755,9 +774,7 @@ def analyze_video(
     max_frames: int = 30,
     k_clusters: int = 5,
 ) -> dict:
-    """
-    Full video pipeline. Returns consensus + best frame bytes.
-    """
+    """Full video pipeline. Returns consensus + best frame bytes."""
     try:
         frames = extract_frames_from_video(
             video_bytes,
