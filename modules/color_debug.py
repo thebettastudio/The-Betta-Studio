@@ -1,14 +1,16 @@
 # modules/color_debug.py
 # Betta Farm Management System
 # Session 26E — TEMPORARY diagnostic tool.
-# Not used by the app. Delete this file when no longer needed.
+# Not used by the production flow. Delete this file when done.
 #
-# Purpose: given a video, print per-frame gate results so we can see
-# exactly which posture check is rejecting each frame.
+# Two entry points:
+#   • debug_analyze_video(video_bytes) — programmatic, per-frame gate report
+#   • render_video_debug_sidebar()     — Streamlit sidebar UI (upload + run)
 
 from __future__ import annotations
 
 import numpy as np
+import streamlit as st
 from PIL import Image
 
 from modules.color_detector import (
@@ -33,25 +35,15 @@ from modules.color_detector import (
 )
 
 
+# ============================================================
+# CORE DIAGNOSTIC
+# ============================================================
+
 def debug_analyze_video(video_bytes: bytes,
                         sample_every: int = 5,
                         max_frames: int = 30) -> dict:
     """
-    Verbose video diagnosis. Returns per-frame gate results.
-
-    Output JSON shape:
-      {
-        ok, frames_total,
-        pass1_count, pass2_count, reject_count,
-        thresholds: {...},
-        report: [
-          { frame, mask_px_raw, blob_px, coverage_pct, aspect,
-            head_dir, length, height, solidity, ext_px, tail_ratio,
-            flared, flare_conf, complete, partial_ok, pass,
-            posture_reason, region_sizes, reject/error? },
-          ...
-        ]
-      }
+    Per-frame gate report. Returns JSON-serializable dict.
     """
     try:
         frames = extract_frames_from_video(
@@ -128,12 +120,12 @@ def debug_analyze_video(video_bytes: bytes,
             row["side_label"] = posture.get("side_label", "?")
             row["posture_reason"] = posture.get("reason", "")
 
-            # Region sizes (only if posture not hard-rejected)
             if row["pass"] in (1, 2):
                 regions = _split_blob_into_regions(blob, orientation=orientation)
                 if regions:
                     row["region_sizes"] = {
-                        name: int(regions.get(f"{name}_mask", np.zeros(1, dtype=bool)).sum())
+                        name: int(regions.get(f"{name}_mask",
+                                              np.zeros(1, dtype=bool)).sum())
                         for name in ("head", "body", "tail", "dorsal", "anal")
                     }
         except Exception as e:
@@ -159,3 +151,37 @@ def debug_analyze_video(video_bytes: bytes,
         },
         "report": report,
     }
+
+
+# ============================================================
+# SIDEBAR UI
+# ============================================================
+
+def render_video_debug_sidebar():
+    """
+    Renders inside an existing st.expander in the sidebar.
+    Upload a video, click Run, get the JSON dump.
+    """
+    st.caption("Temp tool — diagnose why a video was rejected.")
+
+    dbg_file = st.file_uploader(
+        "Debug video",
+        type=["mp4", "mov", "webm", "m4v", "avi"],
+        accept_multiple_files=False,
+        key="sidebar_debug_video",
+        label_visibility="collapsed",
+    )
+
+    if dbg_file is None:
+        st.caption("⬆ Upload a video above to run the diagnostic.")
+        return
+
+    if st.button("🐛 Run diagnostic", use_container_width=True,
+                 key="sidebar_debug_run"):
+        with st.spinner("Diagnosing frames..."):
+            dbg = debug_analyze_video(
+                dbg_file.getvalue(),
+                sample_every=5,
+                max_frames=30,
+            )
+        st.json(dbg)
