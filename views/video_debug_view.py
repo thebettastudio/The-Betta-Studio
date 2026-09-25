@@ -1,8 +1,8 @@
 # views/video_debug_view.py
 # Betta Farm Management System
 # Session 26E — TEMPORARY video diagnostic page.
-# Session 26F — Gemini AI frame judge panel added.
-# Session 26G — Supports new dict return format + best frame + crop.
+# Session 26H — Reference silhouettes + match_score + flare_score +
+#                posture_class + IBC grading panel.
 # Delete this file when done (also remove the nav entry in app.py).
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ from modules.color_detector import (
     _track_largest_blob,
     _build_trajectory_mask,
     _head_direction_from_track,
+    compute_ibc_score,
+    POSTURE_CLASS_RANK,
     MIN_ASPECT_RATIO,
     MIN_COVERAGE_PCT,
     MAX_SOLIDITY_FLARED,
@@ -51,6 +53,27 @@ def _render_blob_overlay(img_pil: Image.Image, blob_mask: np.ndarray) -> bytes:
             base[blob_mask] * 0.4 + np.array([255, 0, 0]) * 0.6
         ).astype(np.uint8)
         out = Image.fromarray(base)
+        out.thumbnail((360, 360), Image.LANCZOS)
+        buf = io.BytesIO()
+        out.save(buf, format="JPEG", quality=80)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def _render_bbox_overlay(img_pil: Image.Image, bbox: dict) -> bytes:
+    """Draw a green rectangle on the image using a normalized bbox."""
+    try:
+        if not bbox:
+            return None
+        out = img_pil.copy().convert("RGB")
+        W, H = out.size
+        x = int(bbox["x"] * W)
+        y = int(bbox["y"] * H)
+        w = int(bbox["w"] * W)
+        h = int(bbox["h"] * H)
+        draw = ImageDraw.Draw(out)
+        draw.rectangle([x, y, x + w, y + h], outline=(0, 220, 0), width=4)
         out.thumbnail((360, 360), Image.LANCZOS)
         buf = io.BytesIO()
         out.save(buf, format="JPEG", quality=80)
@@ -116,7 +139,7 @@ def _render_trajectory_map(frames_shape: tuple[int, int],
 # ============================================================
 
 def _analyze_one_frame(fbytes: bytes, traj_mask=None, head_override=None,
-                         pass_override=None) -> dict:
+                         pass_override=None, real_fish_bbox=None) -> dict:
     result: dict = {"preview": fbytes}
 
     try:
@@ -133,6 +156,11 @@ def _analyze_one_frame(fbytes: bytes, traj_mask=None, head_override=None,
         preview.save(buf, format="JPEG", quality=80)
         result["preview"] = buf.getvalue()
 
+        if real_fish_bbox:
+            bo = _render_bbox_overlay(img, real_fish_bbox)
+            if bo:
+                result["bbox_overlay"] = bo
+
         if traj_mask is not None:
             to = _render_trajectory_overlay(img, traj_mask)
             if to:
@@ -148,12 +176,25 @@ def _analyze_one_frame(fbytes: bytes, traj_mask=None, head_override=None,
 
         mask = _mask_fish_region(hsv, rgb_u8,
                                  water_tint=water_tint, bg_color=bg_color)
+
+        # Apply AI bbox
+        if real_fish_bbox:
+            try:
+                from modules.ai_frame_judge import bbox_to_mask
+                bb = bbox_to_mask(mask.shape, real_fish_bbox)
+                if bb is not None:
+                    mask &= bb
+            except Exception:
+                pass
+
+        # Then trajectory mask
         if traj_mask is not None and traj_mask.shape == mask.shape:
             mask &= traj_mask
 
         result["mask_px_raw"] = int(mask.sum())
         result["water_tint"] = water_tint is not None
         result["bg_color"] = bg_color is not None
+        result["bbox_applied"] = real_fish_bbox is not None
 
         if mask.sum() < 50:
             result["reject"] = "No fish region found (mask < 50 px)"
@@ -247,55 +288,91 @@ def _verdict_banner(pass_num: int, reason: str = "") -> str:
     )
 
 
-def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None):
+def _posture_color(posture_class: str) -> tuple[str, str]:
+    mapping = {
+        "fully_flared":     ("#DCFCE7", "#166534"),
+        "mostly_flared":    ("#ECFCCB", "#3F6212"),
+        "partially_flared": ("#FEF3C7", "#92400E"),
+        "clamped":          ("#FEE2E2", "#991B1B"),
+        "unusable":         ("#E5E7EB", "#374151"),
+    }
+    return mapping.get(posture_class, ("#E5E7EB", "#374151"))
+
+
+def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None,
+                         rank: int = None):
     with st.container(border=True):
         col_img, col_gates = st.columns([1, 2])
 
         with col_img:
-            tabs = st.tabs(["Original", "Blob mask", "Trajectory"])
+            # Tabs: Original, Bbox, Blob, Trajectory
+            tab_labels = ["Original"]
+            tab_contents = []
+
+            if r.get("bbox_overlay"):
+                tab_labels.append("AI bbox")
+                tab_contents.append(r.get("bbox_overlay"))
+            if r.get("overlay"):
+                tab_labels.append("Blob mask")
+                tab_contents.append(r.get("overlay"))
+            if r.get("traj_overlay"):
+                tab_labels.append("Trajectory")
+                tab_contents.append(r.get("traj_overlay"))
+
+            tabs = st.tabs(tab_labels)
+
             with tabs[0]:
                 try:
                     st.image(r.get("preview"), use_container_width=True)
                 except Exception:
                     st.caption("preview failed")
-            with tabs[1]:
-                if r.get("overlay"):
+
+            for i, content in enumerate(tab_contents, start=1):
+                with tabs[i]:
                     try:
-                        st.image(r.get("overlay"), use_container_width=True)
+                        st.image(content, use_container_width=True)
                     except Exception:
                         st.caption("overlay failed")
-                else:
-                    st.caption("No blob mask")
-            with tabs[2]:
-                if r.get("traj_overlay"):
-                    try:
-                        st.image(r.get("traj_overlay"), use_container_width=True)
-                    except Exception:
-                        st.caption("trajectory overlay failed")
-                else:
-                    st.caption("No tracked region for this frame")
-            st.caption(
+
+            caption = (
                 f"**Frame {idx}** · head: `{r.get('head_dir', '?')}` · "
                 f"side: `{r.get('side_label', '?')}`"
             )
+            if rank is not None:
+                caption = f"**#{rank}** · " + caption
+            st.caption(caption)
 
         with col_gates:
+            # AI verdict strip
             if ai_verdict is not None:
-                ai_ok = ai_verdict.get("pass", False)
-                ai_color = "#16A34A" if ai_ok else "#DC2626"
-                ai_bg = "#DCFCE7" if ai_ok else "#FEE2E2"
-                ai_icon = "✅" if ai_ok else "❌"
+                posture_class = ai_verdict.get("posture_class", "unusable")
+                pc_bg, pc_fg = _posture_color(posture_class)
+                match_score = ai_verdict.get("match_score", 0.0)
+                flare_score = ai_verdict.get("flare_score", 0.0)
+                matched_ref = ai_verdict.get("matched_reference", "none")
+                confidence = ai_verdict.get("confidence", 0.0)
+                reason = ai_verdict.get("reason", "")
+
                 st.markdown(
-                    f'<div style="background:{ai_bg};color:{ai_color};'
-                    f'border-radius:6px;padding:6px 10px;font-size:13px;'
+                    f'<div style="background:{pc_bg};color:{pc_fg};'
+                    f'border-radius:6px;padding:8px 12px;font-size:13px;'
                     f'font-weight:600;margin-bottom:6px;">'
-                    f'🤖 Gemini: {ai_icon} '
-                    f'head={ai_verdict.get("head_direction", "?")} · '
-                    f'conf={ai_verdict.get("confidence", 0):.2f} — '
-                    f'<span style="font-weight:400;">{ai_verdict.get("reason", "")}</span>'
+                    f'🤖 <b>{posture_class.replace("_", " ").title()}</b> · '
+                    f'match <b>{match_score:.2f}</b> · '
+                    f'flare <b>{flare_score:.2f}</b> · '
+                    f'ref <code>{matched_ref}</code> · '
+                    f'conf <b>{confidence:.2f}</b>'
+                    f'<div style="font-weight:400;margin-top:4px;">{reason}</div>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+
+                # Deviations
+                deviations = ai_verdict.get("deviations", []) or []
+                if deviations:
+                    with st.expander(f"Deviations ({len(deviations)})", expanded=False):
+                        for dev in deviations:
+                            st.markdown(f"- {dev}")
 
             if r.get("reject") or r.get("error"):
                 msg = r.get("reject") or r.get("error")
@@ -331,6 +408,9 @@ def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None):
                 + _pill("Completeness", complete_ok,
                         "full" if complete else ("partial OK" if partial_ok else "cut off"))
             )
+            if r.get("bbox_applied"):
+                pills += _pill("AI bbox applied", True, "")
+
             st.markdown(pills, unsafe_allow_html=True)
 
             st.markdown(
@@ -354,14 +434,48 @@ def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None):
 
 
 # ============================================================
+# REFERENCE SILHOUETTES PANEL
+# ============================================================
+
+def _render_references_panel():
+    try:
+        from modules.reference_shapes import (
+            load_reference_images, has_all_references, missing_references,
+        )
+    except Exception:
+        st.caption("Reference module unavailable.")
+        return
+
+    if not has_all_references():
+        st.warning(
+            f"⚠️ Some reference silhouettes are missing: "
+            f"`{', '.join(missing_references())}`. "
+            f"Run `python tools/generate_reference_shapes.py` to create them."
+        )
+        return
+
+    with st.expander("🎯 Reference silhouettes used for matching", expanded=False):
+        refs = load_reference_images()
+        cols = st.columns(len(refs))
+        for i, ref in enumerate(refs):
+            with cols[i]:
+                st.caption(f"`{ref['name']}`")
+                try:
+                    img = Image.open(io.BytesIO(ref["bytes"]))
+                    st.image(img, use_container_width=True)
+                except Exception:
+                    st.caption("(cannot preview)")
+
+
+# ============================================================
 # PAGE
 # ============================================================
 
 def render_video_debug_page():
     st.header("🐛 Video Debug (temp)")
     st.caption(
-        "Upload a video to see the per-frame posture gate breakdown + Gemini AI verdicts. "
-        "Delete this page when tuning is done."
+        "Upload a video to see the per-frame posture gates + Gemini AI "
+        "matching against HMPK reference silhouettes."
     )
 
     col_t, col_s, col_m = st.columns(3)
@@ -380,7 +494,7 @@ def render_video_debug_page():
             unsafe_allow_html=True,
         )
 
-    # ---- AI availability check ----
+    # AI availability
     ai_available = False
     try:
         from modules.ai_frame_judge import is_ai_available
@@ -389,12 +503,12 @@ def render_video_debug_page():
         ai_available = False
 
     if ai_available:
-        st.success("🤖 **Gemini AI judge is active.** Frames will be sent to Gemini for side-view detection.")
+        st.success("🤖 **Gemini AI judge is active.** Frames sent to Gemini with reference silhouettes.")
+        _render_references_panel()
     else:
         st.warning(
             "⚠️ **Gemini AI not configured.** Add `GOOGLE_API_KEY` to Streamlit "
-            "secrets (`.streamlit/secrets.toml`) for AI-assisted frame selection. "
-            "Falling back to classical pipeline."
+            "secrets. Falling back to classical pipeline."
         )
 
     video_file = st.file_uploader(
@@ -429,7 +543,7 @@ def render_video_debug_page():
 
     st.success(f"Extracted {len(frames)} frames.")
 
-    # Decode all frames
+    # Decode frames
     with st.spinner("Decoding frames…"):
         frames_rgb = []
         for fbytes in frames:
@@ -440,12 +554,14 @@ def render_video_debug_page():
             img.thumbnail((640, 640), Image.LANCZOS)
             frames_rgb.append(np.asarray(img.convert("RGB")).astype(np.uint8))
 
-    # ---- Gemini AI verdicts ----
+    # ---------- Gemini ----------
     ai_verdicts = None
     ai_best = None
     ai_map = {}
+    ai_rank = {}
+
     if ai_available:
-        with st.spinner("🤖 Asking Gemini to judge frames… this may take 10–20s"):
+        with st.spinner("🤖 Asking Gemini to match frames against HMPK references… may take 20–30s"):
             try:
                 from modules.ai_frame_judge import judge_frames
                 ai_result = judge_frames(
@@ -460,14 +576,42 @@ def render_video_debug_page():
                 ai_verdicts = None
 
     if ai_verdicts:
-        ai_map = {v["frame_index"]: v for v in ai_verdicts}
-        ai_passed = sum(1 for v in ai_verdicts if v.get("pass"))
-        st.success(
-            f"🤖 Gemini AI: **{ai_passed}/{len(ai_verdicts)}** frames passed "
-            f"side-view + flared + full-body check"
+        # Rank by (posture_class, flare_score, match_score)
+        ranked = sorted(
+            ai_verdicts,
+            key=lambda v: (
+                -POSTURE_CLASS_RANK.get(v.get("posture_class", "unusable"), 1),
+                -v.get("flare_score", 0.0),
+                -v.get("match_score", 0.0),
+            ),
         )
+        ai_map = {v["frame_index"]: v for v in ai_verdicts}
+        for i, v in enumerate(ranked):
+            ai_rank[v["frame_index"]] = i + 1
 
-        # --- Best frame + crop ---
+        usable = [v for v in ai_verdicts if v.get("posture_class") != "unusable"]
+
+        # Summary tiles
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total frames", len(ai_verdicts))
+        c2.metric("✅ Fully flared", sum(1 for v in ai_verdicts
+                                          if v.get("posture_class") == "fully_flared"))
+        c3.metric("👍 Mostly flared", sum(1 for v in ai_verdicts
+                                            if v.get("posture_class") == "mostly_flared"))
+        c4.metric("❌ Unusable", sum(1 for v in ai_verdicts
+                                       if v.get("posture_class") == "unusable"))
+
+        top_posture = ranked[0].get("posture_class", "unusable") if ranked else "unusable"
+        if top_posture == "unusable":
+            st.error("No usable frames found — video rejected.")
+        else:
+            st.success(
+                f"**Best available posture:** `{top_posture.replace('_', ' ')}` "
+                f"(flare {ranked[0].get('flare_score', 0):.2f}, "
+                f"match {ranked[0].get('match_score', 0):.2f})"
+            )
+
+        # Best frame + crop
         if ai_best:
             with st.expander("🏆 Gemini's best frame + suggested crop", expanded=True):
                 bidx = ai_best.get("frame_index", -1)
@@ -476,37 +620,45 @@ def render_video_debug_page():
                     with col_orig:
                         st.caption(f"**Original — frame {bidx}**")
                         try:
-                            orig_img = _load_image_rgb(frames[bidx])
-                            if orig_img is not None:
-                                st.image(orig_img, use_container_width=True)
+                            oi = _load_image_rgb(frames[bidx])
+                            if oi is not None:
+                                st.image(oi, use_container_width=True)
                         except Exception:
                             pass
                     with col_crop:
                         st.caption("**Suggested crop (profile photo)**")
                         try:
-                            from modules.ai_frame_judge import crop_frame
-                            cropped_bytes = crop_frame(frames, ai_best)
-                            if cropped_bytes:
-                                st.image(cropped_bytes, use_container_width=True)
+                            from modules.ai_frame_judge import crop_frame_to_bbox
+                            cb = crop_frame_to_bbox(frames, ai_best)
+                            if cb:
+                                st.image(cb, use_container_width=True)
                         except Exception as e:
                             st.caption(f"Crop failed: {e}")
                     st.caption(f"_{ai_best.get('reason', '')}_")
 
-        with st.expander("🤖 AI verdicts per frame", expanded=False):
-            for v in ai_verdicts:
-                icon = "✅" if v.get("pass") else "❌"
+        # All verdicts
+        with st.expander(f"🤖 All {len(ai_verdicts)} AI verdicts", expanded=False):
+            for v in ranked:
+                pc = v.get("posture_class", "unusable")
+                pc_bg, pc_fg = _posture_color(pc)
                 st.markdown(
-                    f"{icon} **Frame {v['frame_index']}** — "
-                    f"head: `{v.get('head_direction', '?')}` · "
-                    f"reflection: `{v.get('is_reflection_only')}` · "
-                    f"fins flared: `{v.get('fins_flared')}` · "
-                    f"full body: `{v.get('full_body_visible')}` · "
-                    f"conf: `{v.get('confidence', 0):.2f}`  \n"
-                    f"   _{v.get('reason', '')}_"
+                    f'<div style="background:{pc_bg};color:{pc_fg};'
+                    f'border-radius:6px;padding:6px 10px;font-size:13px;'
+                    f'margin:4px 0;">'
+                    f'<b>#{ai_rank[v["frame_index"]]}</b> · frame {v["frame_index"]} · '
+                    f'<b>{pc.replace("_", " ")}</b> · '
+                    f'match {v.get("match_score", 0):.2f} · '
+                    f'flare {v.get("flare_score", 0):.2f} · '
+                    f'head {v.get("head_direction", "?")} · '
+                    f'ref {v.get("matched_reference", "none")} · '
+                    f'conf {v.get("confidence", 0):.2f}<br>'
+                    f'<span style="font-weight:400;">{v.get("reason", "")}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
                 )
 
-    # ---- Classical tracking (comparison / fallback) ----
-    with st.spinner("Tracking the real fish (classical)…"):
+    # ---------- Classical tracking (comparison) ----------
+    with st.spinner("Classical tracking (comparison)…"):
         blobs_per_frame = _per_frame_motion_blobs(frames_rgb)
         track = _track_largest_blob(blobs_per_frame)
 
@@ -514,33 +666,48 @@ def render_video_debug_page():
     coverage_pct = tracked_n / max(1, len(frames)) * 100
 
     st.info(
-        f"Classical tracking: **{tracked_n}/{len(frames)} frames** ({coverage_pct:.0f}%) "
-        f"have a confirmed fish location."
+        f"Classical tracking: **{tracked_n}/{len(frames)} frames** "
+        f"({coverage_pct:.0f}%) with confirmed fish location."
     )
 
     with st.expander("🗺️ Fish trajectory map (classical)", expanded=False):
-        traj_map = _render_trajectory_map(frames_rgb[0].shape[:2], track)
-        if traj_map:
-            st.image(traj_map, caption="Tracked fish path (classical algorithm)")
+        tm = _render_trajectory_map(frames_rgb[0].shape[:2], track)
+        if tm:
+            st.image(tm, caption="Tracked fish path")
         else:
-            st.caption("No trajectory to display.")
+            st.caption("No trajectory")
 
-    # ---- Analyze each frame ----
+    # ---------- Per-frame analysis (AI-ranked) ----------
+    # Order: AI-ranked by quality, then the rest
+    if ai_verdicts:
+        ordered_indices = [v["frame_index"] for v in sorted(
+            ai_verdicts,
+            key=lambda v: ai_rank.get(v["frame_index"], 9999),
+        )]
+        # Append any frames not covered by AI
+        for i in range(len(frames)):
+            if i not in ordered_indices:
+                ordered_indices.append(i)
+    else:
+        ordered_indices = list(range(len(frames)))
+
     results = []
     progress = st.progress(0.0, text="Analyzing frames…")
-    for i, fbytes in enumerate(frames):
-        traj_mask = _build_trajectory_mask(frames_rgb[i].shape[:2], track, i)
-
+    for step, i in enumerate(ordered_indices):
         ai_v = ai_map.get(i) if ai_map else None
+
         head_override = None
         pass_override = None
+        bbox = None
 
         if ai_v is not None:
             hd = ai_v.get("head_direction")
             if hd in ("left", "right", "up", "down"):
                 head_override = hd
-            if ai_v.get("pass"):
+            if ai_v.get("posture_class") != "unusable":
                 pass_override = 1
+            if isinstance(ai_v.get("bbox"), dict):
+                bbox = ai_v["bbox"]
 
         if head_override is None and track[i] is not None:
             tmp_orient = {"major_axis_angle_deg": 0, "head_direction": "unknown"}
@@ -548,14 +715,19 @@ def render_video_debug_page():
             if h != "unknown":
                 head_override = h
 
-        results.append(_analyze_one_frame(
-            fbytes,
+        traj_mask = _build_trajectory_mask(frames_rgb[i].shape[:2], track, i)
+
+        r = _analyze_one_frame(
+            frames[i],
             traj_mask=traj_mask,
             head_override=head_override,
             pass_override=pass_override,
-        ))
-        progress.progress((i + 1) / len(frames),
-                          text=f"Frame {i + 1}/{len(frames)}")
+            real_fish_bbox=bbox,
+        )
+        r["_frame_index"] = i
+        results.append(r)
+        progress.progress((step + 1) / len(ordered_indices),
+                          text=f"Frame {step + 1}/{len(ordered_indices)}")
     progress.empty()
 
     pass1 = sum(1 for r in results if r.get("pass") == 1)
@@ -564,27 +736,65 @@ def render_video_debug_page():
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Frames", len(results))
-    c2.metric("✅ Pass 1 (strict)", pass1)
-    c3.metric("⚠️ Pass 2 (regional)", pass2)
+    c2.metric("✅ Pass 1", pass1)
+    c3.metric("⚠️ Pass 2", pass2)
     c4.metric("❌ Reject", reject)
 
     if pass1 >= 1:
         st.success("Video would be accepted in STRICT mode.")
     elif pass2 >= 1:
-        st.warning("Video would be accepted in REGIONAL mode (Pass 2).")
+        st.warning("Video would be accepted in REGIONAL mode.")
     else:
-        st.error("Video would be REJECTED — not enough good frames.")
+        st.error("Video would be REJECTED.")
 
+    # ---------- IBC Score card ----------
+    if ai_verdicts:
+        top_verdict = sorted(
+            ai_verdicts,
+            key=lambda v: ai_rank.get(v["frame_index"], 9999),
+        )[0]
+
+        # Compute preliminary IBC from top verdict alone
+        dummy_consensus = {"body_length_depth_ratio": None}
+        ibc = compute_ibc_score(top_verdict, dummy_consensus)
+
+        st.markdown("---")
+        st.markdown("#### 🏆 IBC Form Grade (preliminary)")
+        ic1, ic2, ic3 = st.columns(3)
+        ic1.metric("Score", ibc.get("score", "—"))
+        ic2.metric("Grade", ibc.get("grade", "—"))
+        ic3.metric("Deviations", len(ibc.get("deviations", [])))
+
+        faults = ibc.get("faults_applied", [])
+        if faults:
+            with st.expander(f"Faults applied ({len(faults)})", expanded=False):
+                for f in faults:
+                    st.markdown(
+                        f"- **{f['level'].title()}** (−{f['points']}) — "
+                        f"{f['reason']}  \n"
+                        f"  _source: {f['source']}_"
+                    )
+
+    # ---------- Per-frame cards (ordered by rank) ----------
     st.markdown("---")
-    st.markdown("#### Per-frame breakdown")
+    st.markdown("#### Per-frame breakdown (AI-ranked)")
 
     cols = st.columns(2)
     for i, r in enumerate(results):
+        fi = r.get("_frame_index", i)
         with cols[i % 2]:
-            _render_frame_card(i, r, ai_verdict=ai_map.get(i))
+            _render_frame_card(
+                fi, r,
+                ai_verdict=ai_map.get(fi),
+                rank=ai_rank.get(fi) if ai_map else None,
+            )
 
+    # Raw JSON
     with st.expander("📋 Raw JSON (developer)"):
-        clean = [{k: v for k, v in r.items() if k not in ("preview", "overlay", "traj_overlay")} for r in results]
+        clean = [{
+            k: v for k, v in r.items()
+            if k not in ("preview", "overlay", "bbox_overlay", "traj_overlay")
+        } for r in results]
         st.json({
             "thresholds": {
                 "MIN_ASPECT_RATIO": MIN_ASPECT_RATIO,
@@ -594,7 +804,6 @@ def render_video_debug_page():
                 "MIN_FLARE_PIXELS": MIN_FLARE_PIXELS,
                 "MIN_TAIL_SPREAD_RATIO": MIN_TAIL_SPREAD_RATIO,
             },
-            "track_coverage_pct": round(coverage_pct, 1),
             "ai_verdicts": ai_verdicts,
             "ai_best": ai_best,
             "results": clean,
