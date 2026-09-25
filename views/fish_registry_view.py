@@ -13,6 +13,7 @@
 # Session 26C — Added video upload (auto frame scan).
 # Session 26D fix — Better video UX + best frame handling.
 # Session 26D round 2 — Stronger framing warning banner.
+# Session 26E — Temp debug block for video posture diagnosis.
 
 import io
 import datetime
@@ -444,6 +445,19 @@ def _render_color_capture_ui(version_key: str):
 
                     st.success(f"✓ Analyzed {len(analyses)} frames from video.")
                     st.rerun()
+
+            # ---------- TEMP DEBUG (remove when done) ----------
+            with st.expander("🐛 Debug this video (temp)", expanded=False):
+                if st.button("Run diagnostic", key=f"debug_video_{version_key}"):
+                    from modules.color_debug import debug_analyze_video
+                    with st.spinner("Diagnosing frames..."):
+                        dbg = debug_analyze_video(
+                            video_bytes,
+                            sample_every=VIDEO_SAMPLE_EVERY,
+                            max_frames=VIDEO_MAX_FRAMES,
+                        )
+                    st.json(dbg)
+            # ---------- END TEMP DEBUG ----------
 
     # ---- Samples taken so far ----
     if samples:
