@@ -22,7 +22,9 @@ from views.lineage_view         import render_lineage_page
 from views.lines_view           import render_lines_page
 from views.inheritance_view     import render_inheritance_page
 from modules.dashboard          import render_dashboard
-from views.video_debug_view     import render_video_debug_page   # TEMP
+
+# TEMP — remove this import + nav entry + routing when done tuning
+from views.video_debug_view     import render_video_debug_page
 
 
 # ============================================================
@@ -43,22 +45,30 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+  /* 1. Base App Light Background & Dark Text */
   .stApp {
     background-color: #FFFFFF;
     color: #1E2022;
   }
+
   .stApp p, .stApp span, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6 {
     color: #1E2022 !important;
   }
+
+  /* 2. Sidebar Customization */
   section[data-testid="stSidebar"] {
     background-color: #F8F9FA !important;
     border-right: 1px solid #E2E8F0;
   }
+
+  /* 3. Global Cards / Expanders / Containers */
   div[data-testid="stExpander"], div.stCard, div[data-testid="stVerticalBlock"] > div[style*="background-color"] {
     background: #FFFFFF !important;
     border: 1px solid #E2E8F0 !important;
     border-radius: 12px;
   }
+
+  /* 4. Global Spawn / Breeder Card Component */
   .spawn-card {
       background-color: #F8F9FA;
       border: 1px solid #E2E8F0;
@@ -69,6 +79,8 @@ st.markdown("""
       gap: 12px;
       margin-bottom: 12px;
   }
+
+  /* 5. Betta Image Styling */
   .spawn-card-img {
       width: 44px;
       height: 44px;
@@ -78,15 +90,18 @@ st.markdown("""
       box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
       transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
   }
+
   .spawn-card-img:hover {
       transform: scale(1.08);
       box-shadow: 0 4px 12px rgba(0, 150, 255, 0.25);
       border-color: #0072FF;
   }
+
   .spawn-details h4 {
       margin: 0 0 4px 0;
       color: #0072FF !important;
   }
+
   .spawn-details p {
       margin: 1px 0;
       color: #4A5568 !important;
@@ -105,6 +120,7 @@ def run_supabase_diagnostic():
     with st.sidebar.expander("🩺 System Diagnostics"):
         if st.button("Test Supabase Connection", use_container_width=True):
             with st.status("Testing services...", expanded=True) as status:
+                # 1. Supabase
                 try:
                     st.write("🗄️ Connecting to Supabase...")
                     from database import get_all_fish
@@ -115,6 +131,7 @@ def run_supabase_diagnostic():
                     st.error(f"Supabase error: {e}")
                     return
 
+                # 2. Google Drive
                 try:
                     st.write("📁 Testing Google Drive auth...")
                     from modules.drive_service import get_google_services
