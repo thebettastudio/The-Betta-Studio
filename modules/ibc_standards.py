@@ -1,13 +1,13 @@
 # modules/ibc_standards.py
 # Betta Farm Management System
 # Session 26E — IBC standards extracted as reference rules.
+# Session 26H — 5-tier grade list (added Material Grade).
 #
 # Source: International Betta Congress (IBC) Exhibition Standards.
 # This module is DATA + pure functions — no app dependencies.
 #
 # Used by:
-#   modules/fish_grader.py (future Session 26F) — applies rules
-#   to measurements from color_detector.py
+#   modules/color_detector.py — compute_ibc_score() reads the rubric
 #
 # Nothing in here talks to Supabase, Streamlit, or the color detector.
 # It's a portable reference.
@@ -32,37 +32,36 @@ FAULT_DEDUCTIONS = {
 
 GRADE_THRESHOLDS = [
     # (minimum_score, grade_name)
-    (95, "Show Grade"),
-    (85, "High Grade"),
-    (70, "Breeder Grade"),
-    (0,  "Pet Grade"),
+    (95, "Show Grade"),        # competition quality
+    (85, "High Grade"),        # top breeding stock
+    (70, "Breeder Grade"),     # solid breeding form
+    (55, "Material Grade"),    # usable form, breeding material
+    (0,  "Pet Grade"),         # form too weak even for breeding
 ]
 
 
 # ============================================================
 # MEASURABLE CRITERIA — shared across form types
 # ============================================================
-# These ranges define acceptable values for measurable properties.
-# App-side measurements come from the 5-region color_detector split.
 
 MEASURABLE_CRITERIA = {
     "body_length_depth_ratio": {
         "ideal_min": 3.0,
         "ideal_max": 4.0,
-        "fault_if_below": 2.5,      # too stubby → major fault
-        "fault_if_above": 4.5,      # too elongated → minor fault
+        "fault_if_below": 2.5,
+        "fault_if_above": 4.5,
         "description": "Length to depth ratio (male typical 3:1 to 4:1)",
     },
     "caudal_spread_degrees": {
         "ideal": 180,
         "preferred_min": 180,
-        "preferred_max": 190,       # over-180 slightly preferred, not faulted
+        "preferred_max": 190,
         "minor_fault_below": 170,
         "major_fault_below": 165,
         "description": "Angle between top and bottom caudal edges",
     },
     "caudal_length_to_body": {
-        "ideal_min": 0.5,           # caudal ≥ 1/2 body length
+        "ideal_min": 0.5,
         "fault_if_below": 0.4,
         "description": "Caudal fin length as fraction of body length",
     },
@@ -72,7 +71,7 @@ MEASURABLE_CRITERIA = {
         "description": "Anal fin length as fraction of body length",
     },
     "ventral_length_to_body": {
-        "ideal_min": 0.66,          # ~2/3 body length
+        "ideal_min": 0.66,
         "fault_if_below": 0.5,
         "description": "Ventral fin length as fraction of body length",
     },
@@ -82,7 +81,7 @@ MEASURABLE_CRITERIA = {
         "description": "Pectoral fin length as fraction of body length",
     },
     "dorsal_base_to_anal_base": {
-        "ideal_max": 0.5,           # dorsal base ≤ 1/2 anal base
+        "ideal_max": 0.5,
         "fault_if_above": 0.7,
         "description": "Dorsal fin base width relative to anal fin base width",
     },
@@ -92,16 +91,13 @@ MEASURABLE_CRITERIA = {
 # ============================================================
 # FIN SHAPE RULES
 # ============================================================
-# These describe ideal/accepted/unacceptable shapes per fin.
-# "Auto-detectable" flags note whether our classical CV can
-# realistically classify them.
 
 FIN_SHAPE_RULES = {
     "dorsal": {
         "accepted_shapes": ["semi_circle", "quarter_circle", "rectangular"],
         "unacceptable_shapes": ["triangular", "spiky"],
-        "must_overlap_caudal": False,   # preferred but not required
-        "auto_detectable": False,       # needs landmark model
+        "must_overlap_caudal": False,
+        "auto_detectable": False,
         "ibc_notes": "Full, wide base, no rounded edges at corners",
     },
     "caudal": {
@@ -109,7 +105,7 @@ FIN_SHAPE_RULES = {
         "unacceptable_shapes": ["spade", "spike", "forked"],
         "spread_ideal_degrees": 180,
         "rays_uniform_required": True,
-        "auto_detectable": True,        # via spread angle
+        "auto_detectable": True,
         "ibc_notes": "Rays evenly spaced with no gaps",
     },
     "anal": {
@@ -117,7 +113,7 @@ FIN_SHAPE_RULES = {
         "unacceptable_shapes": ["triangle", "flat", "rounded"],
         "must_slope_front_to_back": True,
         "parallel_rays_required": True,
-        "auto_detectable": True,        # via slope measurement
+        "auto_detectable": True,
         "ibc_notes": "Distinct corners, pointed tip, front-to-back slope",
     },
     "ventral": {
@@ -139,10 +135,9 @@ FIN_SHAPE_RULES = {
 # ============================================================
 # FORM TYPE STANDARDS
 # ============================================================
-# Per-morph requirements. The 5 most common betta show classes.
 
 FORM_TYPES = {
-    "HMPK": {   # Halfmoon Plakat
+    "HMPK": {
         "display_name": "Halfmoon Plakat",
         "caudal_spread_ideal": 180,
         "caudal_spread_minor_fault": 170,
@@ -152,7 +147,7 @@ FORM_TYPES = {
         "ventral_broad_required": True,
         "notes": "Symmetrical show class; 180° spread and matched fins required",
     },
-    "HM": {     # Halfmoon
+    "HM": {
         "display_name": "Halfmoon",
         "caudal_spread_ideal": 180,
         "caudal_spread_minor_fault": 170,
@@ -161,7 +156,7 @@ FORM_TYPES = {
         "dorsal_overlap_required": True,
         "notes": "Long-finned; caudal must reach past anal fin base",
     },
-    "PK": {     # Plakat (traditional)
+    "PK": {
         "display_name": "Plakat",
         "caudal_spread_ideal": 180,
         "caudal_spread_minor_fault": 160,
@@ -169,17 +164,17 @@ FORM_TYPES = {
         "short_fins": True,
         "notes": "Short-finned; fins shorter than HMPK",
     },
-    "CT": {     # Crowntail
+    "CT": {
         "display_name": "Crowntail",
         "caudal_spread_ideal": 180,
-        "webbing_reduction_min_pct": 33,      # minimum reduction in webbing vs ray
+        "webbing_reduction_min_pct": 33,
         "webbing_reduction_ideal_pct": 50,
-        "webbing_reduction_dq_threshold": 33, # below this in 2+ fins = DQ
+        "webbing_reduction_dq_threshold": 33,
         "random_rays_fault": "minor",
         "curled_rays_fault": "minor",
         "notes": "Webbing reduced ≥33% in primary fins for males",
     },
-    "DT": {     # Double Tail
+    "DT": {
         "display_name": "Double Tail",
         "caudal_spread_ideal": 180,
         "body_length_depth_ratio": (3.0, 4.0),
@@ -192,7 +187,6 @@ FORM_TYPES = {
 # ============================================================
 # COLOR CLASS RULES
 # ============================================================
-# Faults per color class. These apply to specific color morphs.
 
 COLOR_CLASS_RULES = {
     "red": {
@@ -214,8 +208,8 @@ COLOR_CLASS_RULES = {
         "notes": "Blue / Steel / Turquoise / Green iridescent classes",
     },
     "marble": {
-        "ideal_blend_pct": 50,               # 50% light / 50% dark
-        "major_fault_if_below_pct": 25,      # <25% of either color
+        "ideal_blend_pct": 50,
+        "major_fault_if_below_pct": 25,
         "butterfly_accepted": True,
         "notes": "Random patches of light and dark",
     },
@@ -275,7 +269,7 @@ def evaluate_measurement(
     value: float,
 ) -> Optional[dict]:
     """
-    Given a measurement key and its numeric value, return a dict:
+    Given a measurement key and its numeric value, return:
       {
         "key": key,
         "value": value,
@@ -284,8 +278,6 @@ def evaluate_measurement(
         "reason": str,
       }
     Or None if the criterion isn't defined.
-
-    Uses MEASURABLE_CRITERIA ranges to determine fault level.
     """
     crit = MEASURABLE_CRITERIA.get(key)
     if not crit or value is None:
@@ -295,7 +287,6 @@ def evaluate_measurement(
     reason = "Within IBC range"
     fault_points = 0
 
-    # Handle different criterion shapes
     if "ideal_min" in crit and "ideal_max" in crit:
         lo = crit["ideal_min"]
         hi = crit["ideal_max"]
