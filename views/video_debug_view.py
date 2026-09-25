@@ -1,7 +1,7 @@
 # views/video_debug_view.py
 # Betta Farm Management System
 # Session 26E — TEMPORARY video diagnostic page.
-# Visual per-frame gate report so we can tune posture thresholds.
+# Visual per-frame gate report + tracking visualization.
 # Delete this file when done (also remove the nav entry in app.py).
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import io
 
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from modules.color_detector import (
     extract_frames_from_video,
@@ -26,8 +26,10 @@ from modules.color_detector import (
     _detect_flare,
     _check_completeness,
     validate_fish_posture,
-    _build_motion_map,
-    _motion_region_mask,
+    _per_frame_motion_blobs,
+    _track_largest_blob,
+    _build_trajectory_mask,
+    _head_direction_from_track,
     MIN_ASPECT_RATIO,
     MIN_COVERAGE_PCT,
     MAX_SOLIDITY_FLARED,
@@ -38,11 +40,10 @@ from modules.color_detector import (
 
 
 # ============================================================
-# MASK OVERLAY
+# OVERLAY RENDERERS
 # ============================================================
 
 def _render_blob_overlay(img_pil: Image.Image, blob_mask: np.ndarray) -> bytes:
-    """Draw the blob mask as a red tint over the frame."""
     try:
         base = np.asarray(img_pil.convert("RGB")).copy()
         base[blob_mask] = (
@@ -57,13 +58,13 @@ def _render_blob_overlay(img_pil: Image.Image, blob_mask: np.ndarray) -> bytes:
         return None
 
 
-def _render_motion_overlay(img_pil: Image.Image, motion_region: np.ndarray) -> bytes:
-    """Draw the motion region as a blue tint over the frame."""
+def _render_trajectory_overlay(img_pil: Image.Image,
+                                 traj_mask: np.ndarray) -> bytes:
     try:
         base = np.asarray(img_pil.convert("RGB")).copy()
-        if motion_region.shape == base.shape[:2]:
-            base[motion_region] = (
-                base[motion_region] * 0.5 + np.array([0, 100, 255]) * 0.5
+        if traj_mask.shape == base.shape[:2]:
+            base[traj_mask] = (
+                base[traj_mask] * 0.5 + np.array([0, 200, 100]) * 0.5
             ).astype(np.uint8)
         out = Image.fromarray(base)
         out.thumbnail((360, 360), Image.LANCZOS)
@@ -74,11 +75,50 @@ def _render_motion_overlay(img_pil: Image.Image, motion_region: np.ndarray) -> b
         return None
 
 
+def _render_trajectory_map(frames_shape: tuple[int, int],
+                             track: list) -> bytes:
+    """Small map showing all tracked centroids + bboxes across frames."""
+    try:
+        H, W = frames_shape
+        canvas = Image.new("RGB", (W, H), (240, 244, 248))
+        draw = ImageDraw.Draw(canvas)
+
+        # Draw bboxes
+        for t, b in enumerate(track):
+            if b is None:
+                continue
+            x0, y0, x1, y1 = b["bbox"]
+            draw.rectangle([x0, y0, x1, y1], outline=(200, 200, 200), width=1)
+
+        # Draw centroids path
+        points = [(b["centroid"]) for b in track if b is not None]
+        for i in range(1, len(points)):
+            draw.line([points[i - 1], points[i]], fill=(220, 40, 40), width=2)
+
+        # Draw centroid dots with frame index labels
+        for t, b in enumerate(track):
+            if b is None:
+                continue
+            cx, cy = b["centroid"]
+            r = 4
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                         fill=(255, 100, 0), outline=(150, 0, 0))
+            if t % 3 == 0:
+                draw.text((cx + 6, cy - 6), str(t), fill=(0, 0, 0))
+
+        canvas.thumbnail((480, 480), Image.LANCZOS)
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 # ============================================================
 # FRAME ANALYSIS
 # ============================================================
 
-def _analyze_one_frame(fbytes: bytes, motion_region=None) -> dict:
+def _analyze_one_frame(fbytes: bytes, traj_mask=None, head_override=None) -> dict:
     result: dict = {"preview": fbytes}
 
     try:
@@ -95,11 +135,10 @@ def _analyze_one_frame(fbytes: bytes, motion_region=None) -> dict:
         preview.save(buf, format="JPEG", quality=80)
         result["preview"] = buf.getvalue()
 
-        # Motion region overlay
-        if motion_region is not None:
-            mo = _render_motion_overlay(img, motion_region)
-            if mo:
-                result["motion_overlay"] = mo
+        if traj_mask is not None:
+            to = _render_trajectory_overlay(img, traj_mask)
+            if to:
+                result["traj_overlay"] = to
 
         rgb = np.asarray(img).astype(np.float32)
         rgb = _normalize_white_balance(rgb)
@@ -111,8 +150,8 @@ def _analyze_one_frame(fbytes: bytes, motion_region=None) -> dict:
 
         mask = _mask_fish_region(hsv, rgb_u8,
                                  water_tint=water_tint, bg_color=bg_color)
-        if motion_region is not None and motion_region.shape == mask.shape:
-            mask &= motion_region
+        if traj_mask is not None and traj_mask.shape == mask.shape:
+            mask &= traj_mask
 
         result["mask_px_raw"] = int(mask.sum())
         result["water_tint"] = water_tint is not None
@@ -145,7 +184,7 @@ def _analyze_one_frame(fbytes: bytes, motion_region=None) -> dict:
         result["length"] = orientation.get("length", 0)
         result["height"] = orientation.get("height", 0)
         result["angle_deg"] = orientation.get("major_axis_angle_deg", 0)
-        result["head_dir"] = orientation.get("head_direction", "?")
+        result["head_dir"] = head_override or orientation.get("head_direction", "?")
 
         result["solidity"] = flare.get("solidity", 1.0)
         result["ext_px"] = flare.get("extension_px", 0)
@@ -206,7 +245,7 @@ def _render_frame_card(idx: int, r: dict):
         col_img, col_gates = st.columns([1, 2])
 
         with col_img:
-            tabs = st.tabs(["Original", "Blob mask", "Motion region"])
+            tabs = st.tabs(["Original", "Blob mask", "Trajectory"])
             with tabs[0]:
                 try:
                     st.image(r.get("preview"), use_container_width=True)
@@ -219,15 +258,15 @@ def _render_frame_card(idx: int, r: dict):
                     except Exception:
                         st.caption("overlay failed")
                 else:
-                    st.caption("No mask available")
+                    st.caption("No blob mask")
             with tabs[2]:
-                if r.get("motion_overlay"):
+                if r.get("traj_overlay"):
                     try:
-                        st.image(r.get("motion_overlay"), use_container_width=True)
+                        st.image(r.get("traj_overlay"), use_container_width=True)
                     except Exception:
-                        st.caption("motion overlay failed")
+                        st.caption("trajectory overlay failed")
                 else:
-                    st.caption("No motion region available")
+                    st.caption("No tracked region for this frame")
             st.caption(
                 f"**Frame {idx}** · head: `{r.get('head_dir', '?')}` · "
                 f"side: `{r.get('side_label', '?')}`"
@@ -309,11 +348,10 @@ def render_video_debug_page():
     with col_m:
         st.markdown(
             f"""<div style="font-size:12px;color:#4A5568;margin-top:28px;line-height:1.5;">
-            <b>Thresholds in use:</b><br>
+            <b>Thresholds:</b><br>
             aspect ≥ {MIN_ASPECT_RATIO} · coverage ≥ {MIN_COVERAGE_PCT}%<br>
-            body ratio ≥ {MIN_BODY_RATIO_SIDE} (IBC side view)<br>
-            solidity ≤ {MAX_SOLIDITY_FLARED} · ext ≥ {MIN_FLARE_PIXELS} px<br>
-            tail ratio ≥ {MIN_TAIL_SPREAD_RATIO}
+            body ratio ≥ {MIN_BODY_RATIO_SIDE} · solidity ≤ {MAX_SOLIDITY_FLARED}<br>
+            ext ≥ {MIN_FLARE_PIXELS} px · tail ratio ≥ {MIN_TAIL_SPREAD_RATIO}
             </div>""",
             unsafe_allow_html=True,
         )
@@ -350,7 +388,8 @@ def render_video_debug_page():
 
     st.success(f"Extracted {len(frames)} frames.")
 
-    with st.spinner("Building motion map…"):
+    # Decode all frames
+    with st.spinner("Decoding frames…"):
         frames_rgb = []
         for fbytes in frames:
             img = _load_image_rgb(fbytes)
@@ -360,19 +399,40 @@ def render_video_debug_page():
             img.thumbnail((640, 640), Image.LANCZOS)
             frames_rgb.append(np.asarray(img.convert("RGB")).astype(np.uint8))
 
-        motion_map = _build_motion_map(frames_rgb)
-        motion_region = _motion_region_mask(motion_map)
+    # Tracking
+    with st.spinner("Tracking the real fish…"):
+        blobs_per_frame = _per_frame_motion_blobs(frames_rgb)
+        track = _track_largest_blob(blobs_per_frame)
+
+    tracked_n = sum(1 for b in track if b is not None)
+    coverage_pct = tracked_n / max(1, len(frames)) * 100
 
     st.info(
-        f"Motion region covers **{motion_region.sum() / motion_region.size * 100:.1f}%** "
-        f"of frame — this is the moving-fish area. "
-        f"Static background/divider/wall excluded."
+        f"Tracking: **{tracked_n}/{len(frames)} frames** ({coverage_pct:.0f}%) "
+        f"have a confirmed fish location."
     )
 
+    # Show trajectory map
+    with st.expander("🗺️ Fish trajectory map", expanded=True):
+        traj_map = _render_trajectory_map(frames_rgb[0].shape[:2], track)
+        if traj_map:
+            st.image(traj_map, caption="Tracked fish path across frames (dot = frame centroid, number = frame idx)")
+        else:
+            st.caption("No trajectory to display.")
+
+    # Analyze each tracked frame
     results = []
     progress = st.progress(0.0, text="Analyzing frames…")
     for i, fbytes in enumerate(frames):
-        results.append(_analyze_one_frame(fbytes, motion_region=motion_region))
+        traj_mask = _build_trajectory_mask(frames_rgb[i].shape[:2], track, i)
+        # head direction from motion
+        head_override = None
+        if track[i] is not None:
+            tmp_orient = {"major_axis_angle_deg": 0, "head_direction": "unknown"}
+            head_override = _head_direction_from_track(track, i, tmp_orient)
+            if head_override == "unknown":
+                head_override = None
+        results.append(_analyze_one_frame(fbytes, traj_mask=traj_mask, head_override=head_override))
         progress.progress((i + 1) / len(frames),
                           text=f"Frame {i + 1}/{len(frames)}")
     progress.empty()
@@ -403,7 +463,7 @@ def render_video_debug_page():
             _render_frame_card(i, r)
 
     with st.expander("📋 Raw JSON (developer)"):
-        clean = [{k: v for k, v in r.items() if k not in ("preview", "overlay", "motion_overlay")} for r in results]
+        clean = [{k: v for k, v in r.items() if k not in ("preview", "overlay", "traj_overlay")} for r in results]
         st.json({
             "thresholds": {
                 "MIN_ASPECT_RATIO": MIN_ASPECT_RATIO,
@@ -413,6 +473,6 @@ def render_video_debug_page():
                 "MIN_FLARE_PIXELS": MIN_FLARE_PIXELS,
                 "MIN_TAIL_SPREAD_RATIO": MIN_TAIL_SPREAD_RATIO,
             },
-            "motion_region_pct": round(float(motion_region.sum() / motion_region.size * 100), 2),
+            "track_coverage_pct": round(coverage_pct, 1),
             "results": clean,
         })
