@@ -12,6 +12,7 @@
 # Session 26B — Multi-photo upload + tap-to-select region analysis.
 # Session 26C — Added video upload (auto frame scan).
 # Session 26D fix — Better video UX + best frame handling.
+# Session 26D round 2 — Stronger framing warning banner.
 
 import io
 import datetime
@@ -371,25 +372,30 @@ def _render_color_capture_ui(version_key: str):
     # METHOD B — VIDEO UPLOAD + AUTO SCAN
     # ============================================================
     else:
-        st.markdown(
-            f"**🎬 Video (auto scan)** — records 5–10 seconds, extracts ~{VIDEO_MAX_FRAMES} frames, "
-            "analyzes each, shows consensus. **Video is never saved to Drive.**"
+        st.warning(
+            "📏 **Get CLOSE.** The fish should fill **40–60% of the frame**. "
+            "If the whole tank is visible, detection fails — the app picks up "
+            "glass and water instead of the fish."
         )
-        with st.expander("📋 Recording tips", expanded=False):
+        with st.expander("📋 Recording tips (tap to expand)", expanded=False):
             st.markdown(
-                "**✅ Best for:**\n"
-                "- Fish in a plain jar (fish fills 30–60% of frame)\n"
-                "- Fish with a **mirror background** — the app picks the "
-                "**largest fish** in each frame, so the real fish wins over its "
-                "smaller reflection\n"
+                "**✅ Do:**\n"
+                "- Point at **ONE fish** — get close (10–15 cm away)\n"
+                "- Fish fills 40–60% of the frame\n"
+                "- Record 5–10 seconds, keep fish centered\n"
+                "- Even lighting, minimal glare\n"
                 "\n"
-                "**❌ Avoid:**\n"
-                "- Multiple fish in the same frame\n"
+                "**🎯 Mirror setup:** the app picks the **largest fish** each "
+                "frame. The real fish is bigger than its reflection, so it wins.\n"
+                "\n"
+                "**❌ Don't:**\n"
+                "- Capture the whole tank\n"
+                "- Multiple fish in frame\n"
                 "- Fish cut off by frame edges\n"
-                "- Camera shake\n"
-                "- Very dark / very bright lighting\n"
+                "- Camera shake / very dark / very bright\n"
                 "\n"
-                "**Recommended:** 1080p@60fps, 5–10 seconds"
+                "**Recommended recording:** 1080p @ 60fps, 5–10 seconds, "
+                "H.264 codec if possible (most compatible)."
             )
 
         video_file = st.file_uploader(
