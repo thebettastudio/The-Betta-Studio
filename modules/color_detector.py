@@ -10,11 +10,8 @@
 # Session 26E — Two-pass posture strategy + 5-region split + Side A/B.
 # Session 26F — Gemini AI frame judge integration.
 # Session 26G — Trust AI completely. 15 frames. Best frame + crop box.
-#   • If GOOGLE_API_KEY set, AI judges frames before classical pipeline.
-#   • AI verdicts are trusted without classical re-validation.
-#   • AI provides head_direction + pass/fail per frame.
-#   • Gemini also returns "best frame + crop box" for profile photo.
-#   • Classical pipeline remains as fallback if AI unavailable.
+# Session 26H — Reference silhouettes, match_score, flare_score,
+#                posture_class, real_fish_bbox, IBC grading.
 
 from __future__ import annotations
 
@@ -94,8 +91,11 @@ MIN_PARTIAL_REGION_FRAMES = 3
 MIN_REGION_PIXELS = 30
 EDGE_MARGIN_PX = 2
 
-# Session 26G — when AI is authoritative, we trust its verdicts.
+# Session 26G — when AI is authoritative, we trust its verdicts
 MIN_AI_APPROVED_FRAMES = 1
+
+# Session 26H — how many top-ranked frames to analyze
+MAX_AI_ANALYZED_FRAMES = 10
 
 
 # ============================================================
@@ -106,6 +106,19 @@ MOTION_DIFF_THRESHOLD = 30
 MIN_TRACK_BLOB_AREA = 150
 TRACK_MAX_JUMP_PX = 250
 TRACK_BBOX_PAD = 1.6
+
+
+# ============================================================
+# POSTURE CLASS RANK
+# ============================================================
+
+POSTURE_CLASS_RANK = {
+    "fully_flared":     5,
+    "mostly_flared":    4,
+    "partially_flared": 3,
+    "clamped":          2,
+    "unusable":         1,
+}
 
 
 # ============================================================
@@ -940,15 +953,15 @@ def _split_into_candidates(blob_mask: np.ndarray,
 
         x_min = int(xs.min())
         x_max = int(xs.max())
-        y_min = int(ys.min())
-        y_max = int(ys.max())
         width = x_max - x_min + 1
-        height = y_max - y_min + 1
-
-        if width < 40 or height < 40:
+        if width < 40:
             return [blob_mask]
 
-        bbox_aspect = max(width, height) / max(1, min(width, height))
+        bbox_h = int(ys.max() - ys.min() + 1)
+        if bbox_h < 40:
+            return [blob_mask]
+
+        bbox_aspect = max(width, bbox_h) / max(1, min(width, bbox_h))
         if bbox_aspect >= 1.20:
             return [blob_mask]
 
@@ -1478,6 +1491,84 @@ def _classify_pattern(palette: dict[str, float]) -> str:
 
 
 # ============================================================
+# IBC GRADING (Session 26H)
+# ============================================================
+
+def _deviation_to_fault(deviation_text: str) -> str:
+    """Map a Gemini deviation string to an IBC fault level."""
+    t = deviation_text.lower()
+    if any(w in t for w in ["disqualif", "missing", "not visible", "absent"]):
+        return "disqualifying"
+    if any(w in t for w in ["severe", "very ", "badly", "distorted", "torn"]):
+        return "severe"
+    if any(w in t for w in ["major", "significant", "much ", "greatly"]):
+        return "major"
+    if any(w in t for w in ["slight", "minor", "small"]):
+        return "slight"
+    if any(w in t for w in ["narrow", "short", "long", "wide", "overlap",
+                             "spread", "slope", "asymmetr", "mismatch"]):
+        return "minor"
+    return "none"
+
+
+def compute_ibc_score(ai_best_verdict: dict, consensus: dict) -> dict:
+    """
+    Combine Gemini deviations + classical measurements into an IBC score.
+    """
+    try:
+        from modules.ibc_standards import (
+            IBC_BASE_SCORE, get_fault_deduction, score_to_grade,
+            evaluate_measurement,
+        )
+    except Exception:
+        return {"score": None, "grade": None, "deviations": [],
+                "faults_applied": [], "error": "ibc_standards unavailable"}
+
+    score = IBC_BASE_SCORE
+    faults_applied = []
+
+    deviations = []
+    if ai_best_verdict:
+        deviations = ai_best_verdict.get("deviations", []) or []
+
+    for dev in deviations:
+        level = _deviation_to_fault(dev)
+        if level == "none":
+            continue
+        pts = get_fault_deduction(level)
+        score -= pts
+        faults_applied.append({
+            "source": "ai", "reason": dev,
+            "level": level, "points": pts,
+        })
+
+    body_ratio = None
+    if consensus:
+        body_ratio = consensus.get("body_length_depth_ratio")
+
+    if body_ratio:
+        ev = evaluate_measurement("body_length_depth_ratio", body_ratio)
+        if ev and ev["status"] != "pass":
+            score -= ev["fault_points"]
+            faults_applied.append({
+                "source": "measurement",
+                "reason": f"body ratio {body_ratio:.2f} ({ev['reason']})",
+                "level": ev["status"],
+                "points": ev["fault_points"],
+            })
+
+    score = max(0, min(100, int(score)))
+    grade = score_to_grade(score)
+
+    return {
+        "score": score,
+        "grade": grade,
+        "deviations": deviations,
+        "faults_applied": faults_applied,
+    }
+
+
+# ============================================================
 # MAIN: ANALYZE PHOTO
 # ============================================================
 
@@ -1485,12 +1576,11 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
                   use_blob: bool = True, skip_posture: bool = False,
                   motion_hint: Optional[np.ndarray] = None,
                   head_override: Optional[str] = None,
-                  pass_override: Optional[int] = None) -> Optional[dict]:
+                  pass_override: Optional[int] = None,
+                  real_fish_bbox: Optional[dict] = None) -> Optional[dict]:
     """
-    Analyze a photo.
-
-    pass_override: if 1 or 2, trusts an external judgment (AI) and
-    skips the internal posture validation entirely.
+    pass_override: 1 or 2 → trust AI verdict, skip classical posture check.
+    real_fish_bbox: {x,y,w,h} normalized 0..1 → constrain mask inside bbox.
     """
     img = _load_image_rgb(raw_bytes)
     if img is None:
@@ -1507,6 +1597,15 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
     bg_color = _detect_background_color_cluster(rgb_u8)
 
     mask = _mask_fish_region(hsv, rgb_u8, water_tint=water_tint, bg_color=bg_color)
+
+    if real_fish_bbox:
+        try:
+            from modules.ai_frame_judge import bbox_to_mask
+            bb_mask = bbox_to_mask(mask.shape, real_fish_bbox)
+            if bb_mask is not None:
+                mask &= bb_mask
+        except Exception:
+            pass
 
     if motion_hint is not None and motion_hint.shape == mask.shape:
         mask &= motion_hint
@@ -1535,7 +1634,6 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
         }
         pass_num = 1
     elif pass_override is not None and pass_override in (1, 2):
-        # AI approved — trust Gemini completely. Skip classical checks.
         posture = {
             "pass": pass_override,
             "side_profile": True,
@@ -1610,6 +1708,8 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
     regions_used = len(region_palettes)
     region_confidence = round(min(1.0, regions_used / 5.0), 2)
 
+    body_ratio_measurement = round(_compute_body_ratio(mask, orientation_full), 2)
+
     return {
         "ok": True,
         "palette": merged,
@@ -1626,10 +1726,12 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
         "region_confidence": region_confidence,
         "side_label": side_label,
         "pass": pass_num,
+        "body_length_depth_ratio": body_ratio_measurement,
         "debug": {
             "water_tint_detected": water_tint is not None,
             "adaptive_bg_detected": bg_color is not None,
             "motion_hint_applied": motion_hint is not None,
+            "bbox_applied": real_fish_bbox is not None,
             "head_override": head_override,
             "pass_override": pass_override,
         },
@@ -1684,12 +1786,8 @@ def analyze_region(
         return analysis or {"ok": False, "error": "Region analysis failed"}
 
     analysis["region"] = {
-        "tap_x": tap_x,
-        "tap_y": tap_y,
-        "left": left,
-        "top": top,
-        "right": right,
-        "bottom": bottom,
+        "tap_x": tap_x, "tap_y": tap_y,
+        "left": left, "top": top, "right": right, "bottom": bottom,
         "region_size": region_size,
     }
     return analysis
@@ -1789,16 +1887,7 @@ def analyze_video(
     use_ai: bool = True,
 ) -> dict:
     """
-    Video pipeline.
-
-    If use_ai=True and GOOGLE_API_KEY configured:
-      • Gemini judges frames; its verdicts are TRUSTED (no classical
-        re-validation on AI-approved frames).
-      • Gemini also picks the best frame + crop box.
-      • If AI approves >= 1 frame, that's the result.
-      • Falls back to classical if AI unavailable or nothing approved.
-
-    Else: classical motion + tracking pipeline.
+    Video pipeline with Session 26H preference ranking.
     """
     try:
         frames = extract_frames_from_video(
@@ -1821,9 +1910,8 @@ def analyze_video(
         img.thumbnail((640, 640), Image.LANCZOS)
         frames_rgb.append(np.asarray(img.convert("RGB")).astype(np.uint8))
 
-    # ============================================================
-    # AI JUDGE PATH
-    # ============================================================
+    # AI judge path
+    ai_result = None
     ai_verdicts = None
     ai_best = None
     if use_ai:
@@ -1841,80 +1929,81 @@ def analyze_video(
             ai_verdicts = None
 
     if ai_verdicts:
-        verdict_by_idx = {v["frame_index"]: v for v in ai_verdicts}
+        usable = [v for v in ai_verdicts
+                  if v.get("posture_class", "unusable") != "unusable"]
 
-        strict_analyses = []
-        strict_indices = []
+        usable.sort(key=lambda v: (
+            -POSTURE_CLASS_RANK.get(v.get("posture_class", "unusable"), 1),
+            -v.get("flare_score", 0.0),
+            -v.get("match_score", 0.0),
+        ))
 
-        for fi, fbytes in enumerate(frames):
-            v = verdict_by_idx.get(fi)
-            if v is None:
-                continue
-            if not v.get("pass", False):
-                continue
-            if v.get("is_reflection_only", False):
-                continue
+        if len(usable) >= MIN_AI_APPROVED_FRAMES:
+            selected = usable[:MAX_AI_ANALYZED_FRAMES]
 
-            head_dir = v.get("head_direction", "unknown")
-            try:
-                a = analyze_photo(
-                    fbytes,
-                    k_clusters=k_clusters,
-                    use_blob=True,
-                    head_override=head_dir,
-                    pass_override=1,
-                )
-                if not a or not a.get("ok"):
+            analyses = []
+            for v in selected:
+                fi = v["frame_index"]
+                if fi < 0 or fi >= len(frames):
                     continue
-                a["ai_verdict"] = v
-                strict_analyses.append(a)
-                strict_indices.append(fi)
-            except Exception:
-                continue
+                head_dir = v.get("head_direction", "unknown")
+                bbox = v.get("bbox") if isinstance(v.get("bbox"), dict) else None
 
-        # Trust Gemini: accept even 1 approved frame.
-        if len(strict_analyses) >= MIN_AI_APPROVED_FRAMES:
-            sides = [a.get("side_label", "?") for a in strict_analyses]
-            a_count = sides.count("A")
-            b_count = sides.count("B")
-            if a_count >= b_count:
-                majority = "A"
-            else:
-                majority = "B"
+                try:
+                    a = analyze_photo(
+                        frames[fi],
+                        k_clusters=k_clusters,
+                        use_blob=True,
+                        head_override=head_dir,
+                        pass_override=1,
+                        real_fish_bbox=bbox,
+                    )
+                    if not a or not a.get("ok"):
+                        continue
+                    a["ai_verdict"] = v
+                    analyses.append(a)
+                except Exception:
+                    continue
 
-            kept = [a for a in strict_analyses if a.get("side_label") == majority]
-            if not kept:
-                kept = strict_analyses
-                majority = "?"
+            if analyses:
+                sides = [a.get("side_label", "?") for a in analyses]
+                a_count = sides.count("A")
+                b_count = sides.count("B")
+                majority = "A" if a_count >= b_count else "B"
 
-            consensus = merge_analyses(kept)
-            best_idx = max(
-                range(len(kept)),
-                key=lambda i: (kept[i].get("quality", {}) or {}).get("score", 0),
-            )
-            best_frame_idx = strict_indices[best_idx]
-            best_frame_bytes = frames[best_frame_idx]
+                consensus = merge_analyses(analyses)
 
-            return {
-                "ok": True,
-                "mode": "ai",
-                "frames_analyzed": len(kept),
-                "analyses": kept,
-                "consensus": consensus,
-                "best_frame_idx": best_frame_idx,
-                "best_frame_bytes": best_frame_bytes,
-                "side_a_count": sum(1 for a in kept if a.get("side_label") == "A"),
-                "side_b_count": sum(1 for a in kept if a.get("side_label") == "B"),
-                "majority_side": majority,
-                "ai_verdicts": ai_verdicts,
-                "ai_best": ai_best,
-                "ai_frames_passed": sum(1 for v in ai_verdicts if v.get("pass")),
-                "ai_frames_total": len(ai_verdicts),
-            }
+                if ai_best and ai_best.get("frame_index", -1) >= 0:
+                    best_frame_idx = ai_best["frame_index"]
+                else:
+                    best_frame_idx = selected[0]["frame_index"] if selected else 0
+                best_frame_bytes = frames[best_frame_idx] if 0 <= best_frame_idx < len(frames) else frames[0]
 
-    # ============================================================
-    # CLASSICAL PATH (fallback)
-    # ============================================================
+                best_verdict = selected[0] if selected else {}
+                ibc = compute_ibc_score(best_verdict, consensus)
+
+                return {
+                    "ok": True,
+                    "mode": "ai",
+                    "frames_analyzed": len(analyses),
+                    "analyses": analyses,
+                    "consensus": consensus,
+                    "best_frame_idx": best_frame_idx,
+                    "best_frame_bytes": best_frame_bytes,
+                    "side_a_count": a_count,
+                    "side_b_count": b_count,
+                    "majority_side": majority,
+                    "ai_verdicts": ai_verdicts,
+                    "ai_best": ai_best,
+                    "ai_frames_passed": sum(
+                        1 for v in ai_verdicts
+                        if v.get("posture_class", "unusable") != "unusable"
+                    ),
+                    "ai_frames_total": len(ai_verdicts),
+                    "ibc": ibc,
+                }
+
+    # Classical fallback
     blobs_per_frame = _per_frame_motion_blobs(frames_rgb)
     track = _track_largest_blob(blobs_per_frame)
 
@@ -1945,10 +2034,7 @@ def analyze_video(
         sides = [a.get("side_label", "?") for a in strict_analyses]
         a_count = sides.count("A")
         b_count = sides.count("B")
-        if a_count >= b_count:
-            majority = "A"
-        else:
-            majority = "B"
+        majority = "A" if a_count >= b_count else "B"
 
         kept = [a for a in strict_analyses if a.get("side_label") == majority]
         if len(kept) >= MIN_STRICT_FRAMES:
@@ -1975,9 +2061,10 @@ def analyze_video(
                 "track_coverage": round(track_coverage, 2),
                 "ai_verdicts": ai_verdicts,
                 "ai_best": ai_best,
+                "ibc": compute_ibc_score({}, consensus),
             }
 
-    # Pass 2 (regional)
+    # Pass 2 regional
     regional_contributors = 0
     region_samples: dict[str, list[dict[str, float]]] = {
         "head": [], "body": [], "tail": [], "dorsal": [], "anal": []
@@ -2073,33 +2160,36 @@ def analyze_video(
             "region_samples": {k: len(v) for k, v in region_samples.items()},
             "merged_region_palettes": merged_region_palettes,
             "consensus": {
-                "ok": True,
-                "palette": merged,
-                "primary": primary,
-                "secondary": secondary,
+                "ok": True, "palette": merged,
+                "primary": primary, "secondary": secondary,
                 "pattern_hint": pattern,
                 "shot_count": regional_contributors,
             },
             "best_frame_idx": 0,
             "best_frame_bytes": frames[0] if frames else None,
-            "side_a_count": 0,
-            "side_b_count": 0,
+            "side_a_count": 0, "side_b_count": 0,
             "track_coverage": round(track_coverage, 2),
             "ai_verdicts": ai_verdicts,
             "ai_best": ai_best,
+            "ibc": compute_ibc_score({}, {"palette": merged}),
         }
+
+    all_unusable = True
+    if ai_verdicts:
+        all_unusable = all(
+            v.get("posture_class", "unusable") == "unusable"
+            for v in ai_verdicts
+        )
 
     return {
         "ok": False,
-        "error": (
-            "Could not find a clear side view. "
-            "Try again with fish side-on and fins flared."
-        ),
+        "error": "Could not find a clear side view. Try again with fish side-on and fins flared.",
         "strict_frames_found": len(strict_analyses),
         "regional_contributors": regional_contributors,
         "track_coverage": round(track_coverage, 2),
         "ai_verdicts": ai_verdicts,
         "ai_best": ai_best,
+        "all_unusable": all_unusable,
     }
 
 
@@ -2146,6 +2236,10 @@ def merge_analyses(analyses: list[dict]) -> dict:
 
     sides_seen = sorted(set(a.get("side_label", "?") for a in valid))
 
+    body_ratios = [a.get("body_length_depth_ratio", 0.0) for a in valid
+                   if a.get("body_length_depth_ratio", 0.0) > 0]
+    avg_body_ratio = round(sum(body_ratios) / len(body_ratios), 2) if body_ratios else None
+
     return {
         "ok": True,
         "palette": merged,
@@ -2161,6 +2255,7 @@ def merge_analyses(analyses: list[dict]) -> dict:
         ),
         "region_confidence": avg_region_conf,
         "sides_seen": sides_seen,
+        "body_length_depth_ratio": avg_body_ratio,
     }
 
 
