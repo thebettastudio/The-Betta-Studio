@@ -1,8 +1,11 @@
-# modules/ai_frame_judge.py
+﻿# modules/ai_frame_judge.py
 # Betta Farm Management System
 # Session 26H — Gemini AI frame judge with reference silhouettes,
 # match_score, flare_score, posture_class, real_fish_bbox.
+<<<<<<< HEAD
 # Session 26H.3 — Sharper prompt: one-eye = side view rule, bbox required.
+=======
+>>>>>>> 9711565 (Session 26H.3 — sharper prompt + classical bbox fallback)
 #
 # Sends 4 reference silhouettes + up to 15 candidate frames to Gemini.
 # Returns {"frames": [...], "best": {...}}.
@@ -54,6 +57,7 @@ The reference silhouettes show what an ideal HMPK side view looks like:
 - Asymmetrical Show Plakat
 - Pet-grade baseline
 
+<<<<<<< HEAD
 === CRITICAL RULE: SIDE VIEW IS MANDATORY ===
 
 Look at the fish's EYES to determine orientation:
@@ -67,25 +71,38 @@ If the frame is NOT a clean side view, you MUST set posture_class = "unusable",
 REGARDLESS of how flared the fins look. Fin flare alone does not make a side view.
 
 === For EACH candidate frame, evaluate: ===
+=======
+For EACH candidate frame, evaluate:
+>>>>>>> 9711565 (Session 26H.3 — sharper prompt + classical bbox fallback)
 
 1. match_score (0..1) — how closely does this frame's fish silhouette match ANY reference?
 2. flare_score (0..1) — how flared are the fins?
 3. matched_reference (string) — "hmpk_traditional_show" | "hmpk_symmetrical_show" | "hmpk_asymmetrical_show" | "hmpk_pet_grade" | "none"
 4. posture_class (string) — "fully_flared" | "mostly_flared" | "partially_flared" | "clamped" | "unusable"
 5. head_direction (string) — "left" | "right" | "up" | "down" | "unknown"
+<<<<<<< HEAD
 6. bbox (object) — REQUIRED. Tight box around the REAL fish (not reflection),
    normalized 0..1: {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
    If you cannot determine the box, use {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}.
    NEVER omit this field.
+=======
+6. bbox (object) — tight box around the REAL fish (not reflection), normalized 0..1:
+   {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+>>>>>>> 9711565 (Session 26H.3 — sharper prompt + classical bbox fallback)
 7. deviations (list of strings) — visual differences from the matched reference
 8. confidence (0..1)
 9. reason (one short sentence)
 
 RULES:
 - Do NOT reject a frame just because fins are clamped — set posture_class accordingly.
+<<<<<<< HEAD
 - "unusable" REQUIRED if: head-on, top-down, both eyes visible, only reflection.
 - Only the highest (flare_score, match_score) frame gets "best".
 - Prefer full-body-visible frames.
+=======
+- "unusable" only if head-on/top-down, or only reflection visible.
+- Prefer highest (flare_score, match_score) for "best".
+>>>>>>> 9711565 (Session 26H.3 — sharper prompt + classical bbox fallback)
 
 Return ONLY JSON:
 {
@@ -198,10 +215,14 @@ def judge_frames(frames_bytes, frame_indices=None):
         except Exception as e:
             last_error = e
             err_str = str(e)
+<<<<<<< HEAD
             transient = any(code in err_str for code in [
                 "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
                 "500", "INTERNAL", "DEADLINE_EXCEEDED", "TIMEOUT",
             ])
+=======
+            transient = any(code in err_str for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "DEADLINE_EXCEEDED", "TIMEOUT"])
+>>>>>>> 9711565 (Session 26H.3 — sharper prompt + classical bbox fallback)
             if transient and attempt < MAX_RETRY_ATTEMPTS - 1:
                 wait = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
                 st.info("Gemini busy (attempt " + str(attempt + 1) + "/" + str(MAX_RETRY_ATTEMPTS) + "). Retrying in " + str(wait) + "s...")
