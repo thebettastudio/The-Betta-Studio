@@ -9,10 +9,12 @@
 # Session 26D round 3 — Suppress silver glass noise.
 # Session 26E — Two-pass posture strategy + 5-region split + Side A/B.
 # Session 26F — Gemini AI frame judge integration.
-#   • If GOOGLE_API_KEY is set, AI judges frames before classical pipeline.
+# Session 26G — Trust AI completely. 15 frames. Best frame + crop box.
+#   • If GOOGLE_API_KEY set, AI judges frames before classical pipeline.
+#   • AI verdicts are trusted without classical re-validation.
 #   • AI provides head_direction + pass/fail per frame.
-#   • Classical pipeline still does color science on AI-approved frames.
-#   • Fallback to classical pipeline if AI unavailable or errors.
+#   • Gemini also returns "best frame + crop box" for profile photo.
+#   • Classical pipeline remains as fallback if AI unavailable.
 
 from __future__ import annotations
 
@@ -91,6 +93,9 @@ MIN_STRICT_FRAMES = 3
 MIN_PARTIAL_REGION_FRAMES = 3
 MIN_REGION_PIXELS = 30
 EDGE_MARGIN_PX = 2
+
+# Session 26G — when AI is authoritative, we trust its verdicts.
+MIN_AI_APPROVED_FRAMES = 1
 
 
 # ============================================================
@@ -473,11 +478,6 @@ def _build_trajectory_mask(shape: tuple[int, int],
 def _head_direction_from_track(track: list[Optional[dict]],
                                  frame_idx: int,
                                  orientation: dict) -> str:
-    """
-    Determine head direction from the fish's motion vector and the
-    orientation's major axis. Falls back to orientation-based head
-    direction if no motion info.
-    """
     default = orientation.get("head_direction", "unknown")
 
     if frame_idx is None or frame_idx <= 0 or frame_idx >= len(track):
@@ -1486,6 +1486,12 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
                   motion_hint: Optional[np.ndarray] = None,
                   head_override: Optional[str] = None,
                   pass_override: Optional[int] = None) -> Optional[dict]:
+    """
+    Analyze a photo.
+
+    pass_override: if 1 or 2, trusts an external judgment (AI) and
+    skips the internal posture validation entirely.
+    """
     img = _load_image_rgb(raw_bytes)
     if img is None:
         return {"ok": False, "error": "Could not load image"}
@@ -1529,9 +1535,23 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
         }
         pass_num = 1
     elif pass_override is not None and pass_override in (1, 2):
-        posture = validate_fish_posture(mask, rgb_u8, coverage_pct)
-        posture["pass"] = pass_override
-        posture["reason"] = "AI-approved frame"
+        # AI approved — trust Gemini completely. Skip classical checks.
+        posture = {
+            "pass": pass_override,
+            "side_profile": True,
+            "body_ratio": 0.0,
+            "flared": True,
+            "complete": True,
+            "partial_ok": True,
+            "head_direction": head_override or "unknown",
+            "side_label": (
+                "A" if head_override == "left"
+                else "B" if head_override == "right"
+                else "?"
+            ),
+            "reason": "AI-approved frame (Gemini)",
+            "ai_trusted": True,
+        }
         pass_num = pass_override
     else:
         posture = validate_fish_posture(mask, rgb_u8, coverage_pct)
@@ -1768,6 +1788,18 @@ def analyze_video(
     k_clusters: int = 5,
     use_ai: bool = True,
 ) -> dict:
+    """
+    Video pipeline.
+
+    If use_ai=True and GOOGLE_API_KEY configured:
+      • Gemini judges frames; its verdicts are TRUSTED (no classical
+        re-validation on AI-approved frames).
+      • Gemini also picks the best frame + crop box.
+      • If AI approves >= 1 frame, that's the result.
+      • Falls back to classical if AI unavailable or nothing approved.
+
+    Else: classical motion + tracking pipeline.
+    """
     try:
         frames = extract_frames_from_video(
             video_bytes,
@@ -1793,14 +1825,18 @@ def analyze_video(
     # AI JUDGE PATH
     # ============================================================
     ai_verdicts = None
+    ai_best = None
     if use_ai:
         try:
             from modules.ai_frame_judge import judge_frames, is_ai_available
             if is_ai_available():
-                ai_verdicts = judge_frames(
+                ai_result = judge_frames(
                     frames_bytes=frames,
                     frame_indices=list(range(len(frames))),
                 )
+                if ai_result:
+                    ai_verdicts = ai_result.get("frames", [])
+                    ai_best = ai_result.get("best", None)
         except Exception:
             ai_verdicts = None
 
@@ -1836,7 +1872,8 @@ def analyze_video(
             except Exception:
                 continue
 
-        if len(strict_analyses) >= MIN_STRICT_FRAMES:
+        # Trust Gemini: accept even 1 approved frame.
+        if len(strict_analyses) >= MIN_AI_APPROVED_FRAMES:
             sides = [a.get("side_label", "?") for a in strict_analyses]
             a_count = sides.count("A")
             b_count = sides.count("B")
@@ -1846,33 +1883,37 @@ def analyze_video(
                 majority = "B"
 
             kept = [a for a in strict_analyses if a.get("side_label") == majority]
-            if len(kept) >= MIN_STRICT_FRAMES:
-                consensus = merge_analyses(kept)
-                best_idx = max(
-                    range(len(kept)),
-                    key=lambda i: (kept[i].get("quality", {}) or {}).get("score", 0),
-                )
-                best_frame_idx = strict_indices[best_idx]
-                best_frame_bytes = frames[best_frame_idx]
+            if not kept:
+                kept = strict_analyses
+                majority = "?"
 
-                return {
-                    "ok": True,
-                    "mode": "ai",
-                    "frames_analyzed": len(kept),
-                    "analyses": kept,
-                    "consensus": consensus,
-                    "best_frame_idx": best_frame_idx,
-                    "best_frame_bytes": best_frame_bytes,
-                    "side_a_count": sum(1 for a in kept if a.get("side_label") == "A"),
-                    "side_b_count": sum(1 for a in kept if a.get("side_label") == "B"),
-                    "majority_side": majority,
-                    "ai_verdicts": ai_verdicts,
-                    "ai_frames_passed": sum(1 for v in ai_verdicts if v.get("pass")),
-                    "ai_frames_total": len(ai_verdicts),
-                }
+            consensus = merge_analyses(kept)
+            best_idx = max(
+                range(len(kept)),
+                key=lambda i: (kept[i].get("quality", {}) or {}).get("score", 0),
+            )
+            best_frame_idx = strict_indices[best_idx]
+            best_frame_bytes = frames[best_frame_idx]
+
+            return {
+                "ok": True,
+                "mode": "ai",
+                "frames_analyzed": len(kept),
+                "analyses": kept,
+                "consensus": consensus,
+                "best_frame_idx": best_frame_idx,
+                "best_frame_bytes": best_frame_bytes,
+                "side_a_count": sum(1 for a in kept if a.get("side_label") == "A"),
+                "side_b_count": sum(1 for a in kept if a.get("side_label") == "B"),
+                "majority_side": majority,
+                "ai_verdicts": ai_verdicts,
+                "ai_best": ai_best,
+                "ai_frames_passed": sum(1 for v in ai_verdicts if v.get("pass")),
+                "ai_frames_total": len(ai_verdicts),
+            }
 
     # ============================================================
-    # CLASSICAL PATH
+    # CLASSICAL PATH (fallback)
     # ============================================================
     blobs_per_frame = _per_frame_motion_blobs(frames_rgb)
     track = _track_largest_blob(blobs_per_frame)
@@ -1933,6 +1974,7 @@ def analyze_video(
                 "discarded_minority_frames": len(strict_analyses) - len(kept),
                 "track_coverage": round(track_coverage, 2),
                 "ai_verdicts": ai_verdicts,
+                "ai_best": ai_best,
             }
 
     # Pass 2 (regional)
@@ -2044,6 +2086,7 @@ def analyze_video(
             "side_b_count": 0,
             "track_coverage": round(track_coverage, 2),
             "ai_verdicts": ai_verdicts,
+            "ai_best": ai_best,
         }
 
     return {
@@ -2056,6 +2099,7 @@ def analyze_video(
         "regional_contributors": regional_contributors,
         "track_coverage": round(track_coverage, 2),
         "ai_verdicts": ai_verdicts,
+        "ai_best": ai_best,
     }
 
 
