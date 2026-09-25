@@ -1,7 +1,7 @@
 # views/video_debug_view.py
 # Betta Farm Management System
 # Session 26E — TEMPORARY video diagnostic page.
-# Visual per-frame gate report + tracking visualization.
+# Session 26F — Gemini AI frame judge panel added.
 # Delete this file when done (also remove the nav entry in app.py).
 
 from __future__ import annotations
@@ -83,19 +83,16 @@ def _render_trajectory_map(frames_shape: tuple[int, int],
         canvas = Image.new("RGB", (W, H), (240, 244, 248))
         draw = ImageDraw.Draw(canvas)
 
-        # Draw bboxes
         for t, b in enumerate(track):
             if b is None:
                 continue
             x0, y0, x1, y1 = b["bbox"]
             draw.rectangle([x0, y0, x1, y1], outline=(200, 200, 200), width=1)
 
-        # Draw centroids path
         points = [(b["centroid"]) for b in track if b is not None]
         for i in range(1, len(points)):
             draw.line([points[i - 1], points[i]], fill=(220, 40, 40), width=2)
 
-        # Draw centroid dots with frame index labels
         for t, b in enumerate(track):
             if b is None:
                 continue
@@ -118,7 +115,8 @@ def _render_trajectory_map(frames_shape: tuple[int, int],
 # FRAME ANALYSIS
 # ============================================================
 
-def _analyze_one_frame(fbytes: bytes, traj_mask=None, head_override=None) -> dict:
+def _analyze_one_frame(fbytes: bytes, traj_mask=None, head_override=None,
+                         pass_override=None) -> dict:
     result: dict = {"preview": fbytes}
 
     try:
@@ -197,9 +195,18 @@ def _analyze_one_frame(fbytes: bytes, traj_mask=None, head_override=None) -> dic
         result["completeness_reason"] = completeness.get("reason", "")
 
         posture = validate_fish_posture(blob, rgb_u8, result["coverage_pct"])
-        result["pass"] = posture.get("pass", 3)
+        if pass_override is not None and pass_override in (1, 2):
+            result["pass"] = pass_override
+            result["posture_reason"] = "AI-approved frame"
+        else:
+            result["pass"] = posture.get("pass", 3)
+            result["posture_reason"] = posture.get("reason", "")
+
         result["side_label"] = posture.get("side_label", "?")
-        result["posture_reason"] = posture.get("reason", "")
+        if head_override == "left":
+            result["side_label"] = "A"
+        elif head_override == "right":
+            result["side_label"] = "B"
 
     except Exception as e:
         result["error"] = str(e)
@@ -240,7 +247,7 @@ def _verdict_banner(pass_num: int, reason: str = "") -> str:
     )
 
 
-def _render_frame_card(idx: int, r: dict):
+def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None):
     with st.container(border=True):
         col_img, col_gates = st.columns([1, 2])
 
@@ -273,6 +280,24 @@ def _render_frame_card(idx: int, r: dict):
             )
 
         with col_gates:
+            # AI verdict strip at the top
+            if ai_verdict is not None:
+                ai_ok = ai_verdict.get("pass", False)
+                ai_color = "#16A34A" if ai_ok else "#DC2626"
+                ai_bg = "#DCFCE7" if ai_ok else "#FEE2E2"
+                ai_icon = "✅" if ai_ok else "❌"
+                st.markdown(
+                    f'<div style="background:{ai_bg};color:{ai_color};'
+                    f'border-radius:6px;padding:6px 10px;font-size:13px;'
+                    f'font-weight:600;margin-bottom:6px;">'
+                    f'🤖 Gemini: {ai_icon} '
+                    f'head={ai_verdict.get("head_direction", "?")} · '
+                    f'conf={ai_verdict.get("confidence", 0):.2f} — '
+                    f'<span style="font-weight:400;">{ai_verdict.get("reason", "")}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
             if r.get("reject") or r.get("error"):
                 msg = r.get("reject") or r.get("error")
                 st.error(msg)
@@ -336,7 +361,7 @@ def _render_frame_card(idx: int, r: dict):
 def render_video_debug_page():
     st.header("🐛 Video Debug (temp)")
     st.caption(
-        "Upload a video to see the per-frame posture gate breakdown. "
+        "Upload a video to see the per-frame posture gate breakdown + Gemini AI verdicts. "
         "Delete this page when tuning is done."
     )
 
@@ -354,6 +379,23 @@ def render_video_debug_page():
             ext ≥ {MIN_FLARE_PIXELS} px · tail ratio ≥ {MIN_TAIL_SPREAD_RATIO}
             </div>""",
             unsafe_allow_html=True,
+        )
+
+    # ---- AI availability check ----
+    ai_available = False
+    try:
+        from modules.ai_frame_judge import is_ai_available
+        ai_available = is_ai_available()
+    except Exception:
+        ai_available = False
+
+    if ai_available:
+        st.success("🤖 **Gemini AI judge is active.** Frames will be sent to Gemini for side-view detection.")
+    else:
+        st.warning(
+            "⚠️ **Gemini AI not configured.** Add `GOOGLE_API_KEY` to Streamlit "
+            "secrets (`.streamlit/secrets.toml`) for AI-assisted frame selection. "
+            "Falling back to classical pipeline."
         )
 
     video_file = st.file_uploader(
@@ -399,8 +441,43 @@ def render_video_debug_page():
             img.thumbnail((640, 640), Image.LANCZOS)
             frames_rgb.append(np.asarray(img.convert("RGB")).astype(np.uint8))
 
-    # Tracking
-    with st.spinner("Tracking the real fish…"):
+    # ---- Gemini AI verdicts ----
+    ai_verdicts = None
+    ai_map = {}
+    if ai_available:
+        with st.spinner("🤖 Asking Gemini to judge frames… this may take 5–15s"):
+            try:
+                from modules.ai_frame_judge import judge_frames
+                ai_verdicts = judge_frames(
+                    frames_bytes=frames,
+                    frame_indices=list(range(len(frames))),
+                )
+            except Exception as e:
+                st.error(f"Gemini judge failed: {e}")
+                ai_verdicts = None
+
+    if ai_verdicts:
+        ai_map = {v["frame_index"]: v for v in ai_verdicts}
+        ai_passed = sum(1 for v in ai_verdicts if v.get("pass"))
+        st.success(
+            f"🤖 Gemini AI: **{ai_passed}/{len(ai_verdicts)}** frames passed "
+            f"side-view + flared + full-body check"
+        )
+        with st.expander("🤖 AI verdicts per frame", expanded=False):
+            for v in ai_verdicts:
+                icon = "✅" if v.get("pass") else "❌"
+                st.markdown(
+                    f"{icon} **Frame {v['frame_index']}** — "
+                    f"head: `{v.get('head_direction', '?')}` · "
+                    f"reflection: `{v.get('is_reflection_only')}` · "
+                    f"fins flared: `{v.get('fins_flared')}` · "
+                    f"full body: `{v.get('full_body_visible')}` · "
+                    f"conf: `{v.get('confidence', 0):.2f}`  \n"
+                    f"   _{v.get('reason', '')}_"
+                )
+
+    # ---- Classical tracking (for comparison / fallback) ----
+    with st.spinner("Tracking the real fish (classical)…"):
         blobs_per_frame = _per_frame_motion_blobs(frames_rgb)
         track = _track_largest_blob(blobs_per_frame)
 
@@ -408,31 +485,46 @@ def render_video_debug_page():
     coverage_pct = tracked_n / max(1, len(frames)) * 100
 
     st.info(
-        f"Tracking: **{tracked_n}/{len(frames)} frames** ({coverage_pct:.0f}%) "
+        f"Classical tracking: **{tracked_n}/{len(frames)} frames** ({coverage_pct:.0f}%) "
         f"have a confirmed fish location."
     )
 
-    # Show trajectory map
-    with st.expander("🗺️ Fish trajectory map", expanded=True):
+    with st.expander("🗺️ Fish trajectory map (classical)", expanded=False):
         traj_map = _render_trajectory_map(frames_rgb[0].shape[:2], track)
         if traj_map:
-            st.image(traj_map, caption="Tracked fish path across frames (dot = frame centroid, number = frame idx)")
+            st.image(traj_map, caption="Tracked fish path (classical algorithm)")
         else:
             st.caption("No trajectory to display.")
 
-    # Analyze each tracked frame
+    # ---- Analyze each frame ----
     results = []
     progress = st.progress(0.0, text="Analyzing frames…")
     for i, fbytes in enumerate(frames):
         traj_mask = _build_trajectory_mask(frames_rgb[i].shape[:2], track, i)
-        # head direction from motion
+
+        # If AI approved this frame, use AI head_direction + pass override
+        ai_v = ai_map.get(i) if ai_map else None
         head_override = None
-        if track[i] is not None:
+        pass_override = None
+
+        if ai_v is not None:
+            head_override = ai_v.get("head_direction") if ai_v.get("head_direction") in ("left", "right", "up", "down") else None
+            if ai_v.get("pass"):
+                pass_override = 1
+
+        # Classical head fallback if no AI
+        if head_override is None and track[i] is not None:
             tmp_orient = {"major_axis_angle_deg": 0, "head_direction": "unknown"}
             head_override = _head_direction_from_track(track, i, tmp_orient)
             if head_override == "unknown":
                 head_override = None
-        results.append(_analyze_one_frame(fbytes, traj_mask=traj_mask, head_override=head_override))
+
+        results.append(_analyze_one_frame(
+            fbytes,
+            traj_mask=traj_mask,
+            head_override=head_override,
+            pass_override=pass_override,
+        ))
         progress.progress((i + 1) / len(frames),
                           text=f"Frame {i + 1}/{len(frames)}")
     progress.empty()
@@ -460,7 +552,7 @@ def render_video_debug_page():
     cols = st.columns(2)
     for i, r in enumerate(results):
         with cols[i % 2]:
-            _render_frame_card(i, r)
+            _render_frame_card(i, r, ai_verdict=ai_map.get(i))
 
     with st.expander("📋 Raw JSON (developer)"):
         clean = [{k: v for k, v in r.items() if k not in ("preview", "overlay", "traj_overlay")} for r in results]
@@ -474,5 +566,6 @@ def render_video_debug_page():
                 "MIN_TAIL_SPREAD_RATIO": MIN_TAIL_SPREAD_RATIO,
             },
             "track_coverage_pct": round(coverage_pct, 1),
+            "ai_verdicts": ai_verdicts,
             "results": clean,
         })
