@@ -9,13 +9,10 @@
 # Session 26D round 3 — Suppress silver glass noise.
 # Session 26E — Two-pass posture strategy + 5-region split + Side A/B.
 #   Pass 1 (strict): clean side profile + fully flared + complete
-#                    → if >=3 frames, consensus, mode="strict"
 #   Pass 2 (lenient + regional): per-frame regional fallback
-#                    → only clean/flared regions per frame, merged
-#   Both fail → reject with clear error.
+#   Tuned for real flared bettas (wide aspect, tank reflections).
 #   Side A = head-left, Side B = head-right.
 #   tap-to-select region crops bypass posture via skip_posture=True.
-#   IBC standards module available (import-only).
 
 from __future__ import annotations
 
@@ -66,19 +63,31 @@ COLOR_CATEGORIES = [
 
 
 # ============================================================
-# POSTURE VALIDATION CONSTANTS (Session 26E)
+# POSTURE VALIDATION CONSTANTS (Session 26E, tuned)
 # ============================================================
 
-MIN_ASPECT_RATIO = 1.3
-MIN_COVERAGE_PCT = 2.0
-MAX_SOLIDITY_FLARED = 0.80
-MIN_FLARE_PIXELS = 40
-MIN_TAIL_SPREAD_RATIO = 1.3
+# Side profile: elongated blob. Flared bettas are WIDE — lower threshold.
+# Head-on/top-down gives ~1.0 aspect. Flared side view gives 1.05–1.5.
+MIN_ASPECT_RATIO = 1.05
 
+# Coverage: blob must be >=2% of frame
+MIN_COVERAGE_PCT = 2.0
+
+# Flare: solidity below this = distinct fin extensions.
+# Real flared bettas hit 0.86–0.88 due to hull noise; only a solid
+# tube (>0.92) is truly clamped.
+MAX_SOLIDITY_FLARED = 0.92
+# Minimum fin-extension pixels outside core-body ellipse
+MIN_FLARE_PIXELS = 100
+# Tail width vs mid-body width (only meaningful when near-horizontal)
+MIN_TAIL_SPREAD_RATIO = 1.1
+
+# Region split fractions along principal axis
 HEAD_REGION_FRAC = 0.25
 BODY_REGION_FRAC = 0.50
 TAIL_REGION_FRAC = 0.25
 
+# Region weights for palette merge
 REGION_WEIGHTS = {
     "head":   0.15,
     "body":   0.35,
@@ -87,6 +96,7 @@ REGION_WEIGHTS = {
     "anal":   0.15,
 }
 
+# Pass thresholds
 MIN_STRICT_FRAMES = 3
 MIN_PARTIAL_REGION_FRAMES = 3
 MIN_REGION_PIXELS = 30
@@ -461,10 +471,18 @@ def _compute_orientation(blob_mask: np.ndarray) -> dict:
 
 
 # ============================================================
-# FLARE DETECTION (Session 26E)
+# FLARE DETECTION (Session 26E, tuned)
 # ============================================================
 
 def _detect_flare(blob_mask: np.ndarray, orientation: dict) -> dict:
+    """
+    Detect fin flare using:
+      1. Solidity (blob area / convex hull area)
+      2. Fin-extension pixel count outside core-body ellipse
+      3. Tail spread ratio (only counted when near-horizontal)
+
+    Flared if >= 1 signal. Hard-reject if aspect > 3.5 (tube).
+    """
     try:
         if blob_mask.sum() < 30:
             return {"is_flared": False, "confidence": 0.0,
@@ -529,20 +547,30 @@ def _detect_flare(blob_mask: np.ndarray, orientation: dict) -> dict:
             except Exception:
                 tail_ratio = 1.0
 
+        # --- Decision ---
         flared_signals = 0
         if solidity <= MAX_SOLIDITY_FLARED:
             flared_signals += 1
         if extension_px >= MIN_FLARE_PIXELS:
             flared_signals += 1
-        if tail_ratio >= MIN_TAIL_SPREAD_RATIO:
+
+        # Tail-ratio signal only counts when the fish is near-horizontal.
+        # When vertical/angled, PCA slices are wrong — skip it.
+        angle = orientation.get("major_axis_angle_deg", 0)
+        near_horizontal = (angle < 30) or (angle > 150)
+        if near_horizontal and tail_ratio >= MIN_TAIL_SPREAD_RATIO:
             flared_signals += 1
 
-        is_flared = flared_signals >= 2
+        # Flared if >= 1 solid signal
+        is_flared = flared_signals >= 1
+
+        # Hard override: any tube-shaped blob (aspect > 3.5) is clamped.
         aspect = orientation.get("aspect", 0)
-        if aspect > 3.0:
+        if aspect > 3.5:
             is_flared = False
 
-        confidence = flared_signals / 3.0
+        # Confidence: 1 signal = 0.5, 2 = 0.75, 3 = 1.0
+        confidence = min(1.0, 0.25 + 0.25 * flared_signals) if is_flared else 0.0
 
         reason_bits = [
             f"solidity={solidity:.2f}",
@@ -647,13 +675,15 @@ def validate_fish_posture(blob_mask: np.ndarray, rgb: np.ndarray,
         "flare": flare,
     }
 
-    if (coverage_ok and is_side_profile and is_flared and flare_conf >= 0.66
+    # --- PASS 1: strict ---
+    if (coverage_ok and is_side_profile and is_flared and flare_conf >= 0.5
             and (is_complete or is_partial_ok)):
         base["pass"] = 1
         base["reason"] = "Strict pass — side profile + flared"
         return base
 
-    if coverage_ok and aspect >= 1.15 and is_partial_ok:
+    # --- PASS 2: regional fallback ---
+    if coverage_ok and aspect >= 1.0 and is_partial_ok:
         base["pass"] = 2
         base["reason"] = (
             "Regional pass — "
@@ -661,10 +691,11 @@ def validate_fish_posture(blob_mask: np.ndarray, rgb: np.ndarray,
         )
         return base
 
+    # --- PASS 3: reject ---
     base["pass"] = 3
     if not coverage_ok:
         base["reason"] = "Fish too small in frame"
-    elif not is_side_profile and aspect < 1.15:
+    elif not is_side_profile and aspect < 1.0:
         base["reason"] = "Not a side profile (head-on or top-down)"
     elif not is_partial_ok:
         base["reason"] = "Fish cut off — body not visible enough"
@@ -1066,7 +1097,6 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
 
     coverage_pct = float(mask.sum() / mask.size * 100)
 
-    # Posture validation (skippable for tap-to-select region crops)
     if skip_posture:
         posture = {
             "pass": 1,
@@ -1412,7 +1442,7 @@ def analyze_video(
 
             orientation_full = _compute_orientation(mask)
             aspect = orientation_full.get("aspect", 0)
-            if aspect < 1.15:
+            if aspect < 1.0:
                 continue
 
             regions = _split_blob_into_regions(mask, orientation=orientation_full)
