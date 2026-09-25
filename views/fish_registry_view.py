@@ -10,6 +10,7 @@
 # Session 24A — Photo cropper + form reset.
 # Session 26A — Multi-shot color capture (photo-based).
 # Session 26B — Multi-photo upload + tap-to-select region analysis.
+# Session 26C — Added video upload (auto frame scan).
 
 import io
 import datetime
@@ -80,6 +81,7 @@ from modules.fish_milestones import (
 from modules.color_detector import (
     analyze_photo,
     analyze_region,
+    analyze_video,
     merge_analyses,
     color_swatch_html,
     palette_html,
@@ -97,6 +99,9 @@ MAX_SAMPLES = 10
 MIN_SAMPLES_FOR_CONSENSUS = 3
 TAP_REGION_SIZE = 150
 DISPLAY_WIDTH = 480
+VIDEO_SAMPLE_EVERY = 5      # 1 frame out of every 5
+VIDEO_MAX_FRAMES = 30       # hard cap
+VIDEO_MAX_MB = 150          # upload size warning threshold
 
 
 # ============================================================
@@ -221,7 +226,7 @@ def _get_available_tank_options() -> list[dict]:
 
 
 # ============================================================
-# COLOR CAPTURE — MULTI-PHOTO UPLOAD + TAP-TO-SELECT
+# COLOR CAPTURE — PHOTO + VIDEO
 # ============================================================
 
 def _reset_color_session(version_key: str):
@@ -237,19 +242,16 @@ def _session_key(version_key: str, suffix: str) -> str:
 
 def _render_color_capture_ui(version_key: str):
     """
-    Multi-photo upload → tap the fish on each photo → analyze region.
-    No camera access needed. Works with photos from phone's native camera.
+    Color analysis via either:
+      A) Multi-photo upload + tap-to-select
+      B) Single video upload + auto frame scan
     """
-    if not _TAP_AVAILABLE:
-        st.error("Tap coordinate widget missing. Run: `py -m pip install streamlit-image-coordinates`")
-        return
-
     session_prefix = f"color_session_{version_key}"
 
     defaults = {
-        f"{session_prefix}_samples": [],      # analysis dicts
-        f"{session_prefix}_snapshots": [],    # raw bytes of each analyzed photo
-        f"{session_prefix}_pending": [],      # uploaded photos not yet analyzed
+        f"{session_prefix}_samples": [],
+        f"{session_prefix}_snapshots": [],
+        f"{session_prefix}_pending": [],
         f"{session_prefix}_tap_idx": 0,
         f"{session_prefix}_done": False,
         f"{session_prefix}_consensus": None,
@@ -265,10 +267,7 @@ def _render_color_capture_ui(version_key: str):
     tap_idx = st.session_state[f"{session_prefix}_tap_idx"]
 
     st.markdown("##### 🎨 Color Analysis")
-    st.caption(
-        f"Upload {MIN_SAMPLES_FOR_CONSENSUS}–{MAX_SAMPLES} clear photos of the same fish from different angles. "
-        "Tap the fish on each photo to analyze. Take photos with your phone's camera app for best quality."
-    )
+    st.caption("Choose a method below. Take photos or video with your phone's camera app for best quality.")
 
     if st.session_state[f"{session_prefix}_done"]:
         _render_color_result(version_key)
@@ -277,100 +276,180 @@ def _render_color_capture_ui(version_key: str):
     if st.session_state[f"{session_prefix}_accepted"]:
         st.success("✓ Color analysis accepted. Save it with the fish registration below.")
 
-    # ---- Upload section ----
-    uploaded_files = st.file_uploader(
-        "📁 Choose photos (multi-select works on most devices)",
-        type=["jpg", "jpeg", "png", "heic", "heif"],
-        accept_multiple_files=True,
-        key=f"color_uploads_{version_key}_{len(samples)}",
+    # ---- Method selector ----
+    method = st.radio(
+        "Method",
+        options=["📸 Photos (tap to select)", "🎬 Video (auto scan)"],
+        horizontal=True,
+        key=f"method_{version_key}",
+        label_visibility="collapsed",
     )
 
-    if uploaded_files:
-        # Load any new files into pending queue
-        existing_hashes = {
-            hash(p) for p in pending
-        }
-        for f in uploaded_files:
-            data = f.getvalue()
-            h = hash(data)
-            # Skip if we already have this photo (pending or analyzed)
-            if h in existing_hashes:
-                continue
-            if len(samples) >= MAX_SAMPLES:
-                break
-            pending.append(data)
-            existing_hashes.add(h)
-        st.session_state[f"{session_prefix}_pending"] = pending
+    # ============================================================
+    # METHOD A — PHOTO UPLOAD + TAP-TO-SELECT
+    # ============================================================
+    if method.startswith("📸"):
+        if not _TAP_AVAILABLE:
+            st.error("Tap coordinate widget missing. Run: `py -m pip install streamlit-image-coordinates`")
+            return
 
-    # ---- Tap-to-select on pending photos ----
-    if pending and tap_idx < len(pending):
-        photo = pending[tap_idx]
-        st.markdown(f"**🎯 Tap the fish on photo {len(samples) + 1} of {MAX_SAMPLES}**")
+        uploaded_files = st.file_uploader(
+            f"📁 Choose {MIN_SAMPLES_FOR_CONSENSUS}–{MAX_SAMPLES} photos of the same fish",
+            type=["jpg", "jpeg", "png", "heic", "heif"],
+            accept_multiple_files=True,
+            key=f"color_uploads_{version_key}_{len(samples)}",
+        )
 
-        try:
-            pil = Image.open(io.BytesIO(photo))
-            if pil.mode in ("RGBA", "P", "LA"):
-                pil = pil.convert("RGB")
-            display = _resize_for_display(pil, target_w=DISPLAY_WIDTH)
-            dw, dh = display.size
-
-            coords = streamlit_image_coordinates(display, key=f"tap_{version_key}_{len(samples)}_{tap_idx}")
-
-            col_skip, col_discard = st.columns(2)
-            with col_skip:
-                if st.button("⏭️ Skip this photo", use_container_width=True, key=f"skip_{version_key}_{tap_idx}"):
-                    pending.pop(tap_idx)
-                    st.session_state[f"{session_prefix}_pending"] = pending
-                    st.session_state[f"{session_prefix}_tap_idx"] = max(0, tap_idx - 1)
-                    st.rerun()
-            with col_discard:
-                if st.button("🗑️ Discard all", use_container_width=True, key=f"discard_all_{version_key}"):
-                    _reset_color_session(version_key)
-                    st.rerun()
-
-            if coords is not None:
-                with st.spinner("Analyzing tapped region..."):
-                    analysis = analyze_region(
-                        raw_bytes=photo,
-                        tap_x=coords["x"],
-                        tap_y=coords["y"],
-                        display_w=dw,
-                        display_h=dh,
-                        region_size=TAP_REGION_SIZE,
-                    )
-                if analysis and analysis.get("ok"):
-                    samples.append(analysis)
-                    snapshots.append(photo)
-                    pending.pop(tap_idx)
-                    st.session_state[f"{session_prefix}_samples"] = samples
-                    st.session_state[f"{session_prefix}_snapshots"] = snapshots
-                    st.session_state[f"{session_prefix}_pending"] = pending
-                    st.session_state[f"{session_prefix}_tap_idx"] = max(0, tap_idx - 1)
-
-                    if len(samples) >= MAX_SAMPLES:
-                        st.session_state[f"{session_prefix}_done"] = True
-                        st.session_state[f"{session_prefix}_consensus"] = merge_analyses(samples)
-                    st.rerun()
-                else:
-                    err = (analysis or {}).get("error", "unknown")
-                    st.warning(f"Tap analysis failed: {err}")
-        except Exception as e:
-            st.warning(f"Could not process photo: {e}")
-            pending.pop(tap_idx)
+        if uploaded_files:
+            existing_hashes = {hash(p) for p in pending}
+            for f in uploaded_files:
+                data = f.getvalue()
+                h = hash(data)
+                if h in existing_hashes:
+                    continue
+                if len(samples) >= MAX_SAMPLES:
+                    break
+                pending.append(data)
+                existing_hashes.add(h)
             st.session_state[f"{session_prefix}_pending"] = pending
-            st.rerun()
+
+        if pending and tap_idx < len(pending):
+            photo = pending[tap_idx]
+            st.markdown(f"**🎯 Tap the fish on photo {len(samples) + 1} of {MAX_SAMPLES}**")
+            try:
+                pil = Image.open(io.BytesIO(photo))
+                if pil.mode in ("RGBA", "P", "LA"):
+                    pil = pil.convert("RGB")
+                display = _resize_for_display(pil, target_w=DISPLAY_WIDTH)
+                dw, dh = display.size
+
+                coords = streamlit_image_coordinates(display, key=f"tap_{version_key}_{len(samples)}_{tap_idx}")
+
+                col_skip, col_discard = st.columns(2)
+                with col_skip:
+                    if st.button("⏭️ Skip this photo", use_container_width=True, key=f"skip_{version_key}_{tap_idx}"):
+                        pending.pop(tap_idx)
+                        st.session_state[f"{session_prefix}_pending"] = pending
+                        st.session_state[f"{session_prefix}_tap_idx"] = max(0, tap_idx - 1)
+                        st.rerun()
+                with col_discard:
+                    if st.button("🗑️ Discard all", use_container_width=True, key=f"discard_all_{version_key}"):
+                        _reset_color_session(version_key)
+                        st.rerun()
+
+                if coords is not None:
+                    with st.spinner("Analyzing tapped region..."):
+                        analysis = analyze_region(
+                            raw_bytes=photo,
+                            tap_x=coords["x"],
+                            tap_y=coords["y"],
+                            display_w=dw,
+                            display_h=dh,
+                            region_size=TAP_REGION_SIZE,
+                        )
+                    if analysis and analysis.get("ok"):
+                        samples.append(analysis)
+                        snapshots.append(photo)
+                        pending.pop(tap_idx)
+                        st.session_state[f"{session_prefix}_samples"] = samples
+                        st.session_state[f"{session_prefix}_snapshots"] = snapshots
+                        st.session_state[f"{session_prefix}_pending"] = pending
+                        st.session_state[f"{session_prefix}_tap_idx"] = max(0, tap_idx - 1)
+                        if len(samples) >= MAX_SAMPLES:
+                            st.session_state[f"{session_prefix}_done"] = True
+                            st.session_state[f"{session_prefix}_consensus"] = merge_analyses(samples)
+                        st.rerun()
+                    else:
+                        err = (analysis or {}).get("error", "unknown")
+                        st.warning(f"Tap analysis failed: {err}")
+            except Exception as e:
+                st.warning(f"Could not process photo: {e}")
+                pending.pop(tap_idx)
+                st.session_state[f"{session_prefix}_pending"] = pending
+                st.rerun()
+
+        if not samples and not pending:
+            st.info("👆 Upload photos above to start.")
+
+    # ============================================================
+    # METHOD B — VIDEO UPLOAD + AUTO SCAN
+    # ============================================================
+    else:
+        st.caption(
+            f"Record a **5–10 second video** with your phone (1080p@60fps recommended). "
+            f"Point at one fish. Upload — the app extracts and analyzes ~{VIDEO_MAX_FRAMES} frames automatically. "
+            f"**The video is never saved to Drive.**"
+        )
+
+        video_file = st.file_uploader(
+            "🎬 Upload a video of the fish",
+            type=["mp4", "mov", "webm", "m4v", "avi"],
+            accept_multiple_files=False,
+            key=f"video_upload_{version_key}",
+        )
+
+        if video_file is not None:
+            video_bytes = video_file.getvalue()
+            size_mb = len(video_bytes) / (1024 * 1024)
+
+            if size_mb > VIDEO_MAX_MB:
+                st.warning(
+                    f"⚠️ Video is {size_mb:.0f} MB. For best results, keep videos under "
+                    f"{VIDEO_MAX_MB} MB (roughly 10 seconds at 1080p)."
+                )
+            else:
+                st.caption(f"Video size: {size_mb:.1f} MB — ready to analyze.")
+
+            if st.button("🔍 Analyze video", type="primary", use_container_width=True, key=f"analyze_video_{version_key}"):
+                with st.spinner(f"Extracting frames and analyzing... this takes ~10–20s"):
+                    result = analyze_video(
+                        video_bytes,
+                        sample_every=VIDEO_SAMPLE_EVERY,
+                        max_frames=VIDEO_MAX_FRAMES,
+                    )
+
+                if not result or not result.get("ok"):
+                    err = (result or {}).get("error", "unknown")
+                    st.error(f"Video analysis failed: {err}")
+                else:
+                    analyses = result.get("analyses") or []
+                    consensus = result.get("consensus") or {}
+                    best_idx = result.get("best_frame_idx", 0)
+
+                    st.session_state[f"{session_prefix}_samples"] = analyses
+                    st.session_state[f"{session_prefix}_consensus"] = consensus
+                    st.session_state[f"{session_prefix}_done"] = True
+
+                    # Extract the best frame as a snapshot for the profile photo
+                    # Note: only the best frame bytes survive
+                    from modules.color_detector import extract_frames_from_video
+                    try:
+                        frames = extract_frames_from_video(
+                            video_bytes,
+                            sample_every=VIDEO_SAMPLE_EVERY,
+                            max_frames=VIDEO_MAX_FRAMES,
+                        )
+                        if frames and 0 <= best_idx < len(frames):
+                            st.session_state[f"{session_prefix}_snapshots"] = [frames[best_idx]]
+                    except Exception:
+                        st.session_state[f"{session_prefix}_snapshots"] = []
+
+                    st.success(f"✓ Analyzed {len(analyses)} frames from video.")
+                    st.rerun()
 
     # ---- Samples taken so far ----
     if samples:
         st.markdown("---")
-        st.markdown(f"**📊 Samples taken: {len(samples)} / {MAX_SAMPLES}**")
-        for i, a in enumerate(samples):
+        st.markdown(f"**📊 Samples taken: {len(samples)}**")
+        for i, a in enumerate(samples[:5]):
             pal = a.get("palette", {})
             pal_str = ", ".join(f"{k} {v:.0f}%" for k, v in pal.items())
             q = a.get("quality", {}).get("score", 0)
             st.caption(f"Sample {i+1}: quality {q}/100 — {pal_str or 'no palette'}")
+        if len(samples) > 5:
+            st.caption(f"... and {len(samples) - 5} more")
 
-        if len(samples) >= MIN_SAMPLES_FOR_CONSENSUS:
+        if not st.session_state[f"{session_prefix}_done"] and len(samples) >= MIN_SAMPLES_FOR_CONSENSUS:
             consensus_preview = merge_analyses(samples)
             st.markdown("**Live consensus:**")
             st.markdown(palette_html(consensus_preview.get("palette", {})), unsafe_allow_html=True)
@@ -382,9 +461,6 @@ def _render_color_capture_ui(version_key: str):
                 st.session_state[f"{session_prefix}_done"] = True
                 st.session_state[f"{session_prefix}_consensus"] = consensus_preview
                 st.rerun()
-
-    if not samples and not pending:
-        st.info("👆 Upload photos above to start.")
 
 
 def _render_color_result(version_key: str):
@@ -460,6 +536,9 @@ def _get_best_snapshot_bytes(version_key: str) -> Optional[bytes]:
     samples = st.session_state.get(f"{session_prefix}_samples") or []
     if not snapshots or not samples:
         return None
+    # For video flow, snapshots has 1 entry (best frame)
+    if len(snapshots) == 1:
+        return snapshots[0]
     best_idx = max(
         range(len(samples)),
         key=lambda i: (samples[i].get("quality", {}) or {}).get("score", 0),
