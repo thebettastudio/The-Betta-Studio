@@ -3,8 +3,15 @@
 # Session 26A — Color analysis via computer vision.
 # Session 26B — Added analyze_region() for tap-to-select flow.
 # Session 26C — Added extract_frames_from_video() for video upload flow.
-# Session 26C fix — Added blob detection to isolate the largest fish region
-#                   (solves multi-fish + background contamination).
+# Session 26C fix — Added blob detection to isolate the largest fish region.
+# Session 26D — Major accuracy upgrade:
+#              • Auto white-balance normalization
+#              • Water tint subtraction
+#              • Tighter reflection filter
+#              • Color-adaptive background detection
+#              • Blob quality gate (aspect, edges, variance)
+#              • 18 color categories (was 12)
+#              • Better iridescence detection (window variance)
 
 from __future__ import annotations
 
@@ -29,22 +36,36 @@ except ImportError:
 
 
 # ============================================================
-# COLOR CATEGORY DEFINITIONS
+# COLOR CATEGORY DEFINITIONS (Session 26D — 18 categories)
 # ============================================================
+# Format: (name, hue_center, hue_width, min_sat, min_val, max_val)
 
 COLOR_CATEGORIES = [
+    # Reds / oranges
     ("red",                5,         20,        90,      40,      255),
     ("orange",             30,        18,        90,      40,      255),
-    ("yellow",             52,        18,        90,      60,      255),
-    ("green",              110,       45,        80,      40,      255),
-    ("blue",               200,       50,        80,      40,      255),
-    ("purple",             275,       35,        70,      40,      255),
-    ("pink",               320,       30,        70,      40,      255),
-    ("white",              0,         360,       0,       200,     255),
-    ("black",              0,         360,       0,       0,       60),
-    ("silver",             0,         360,       0,       120,     200),
-    ("gold_metallic",      45,        25,        120,     170,     255),
     ("copper",             20,        20,        120,     120,     200),
+    # Yellows / golds
+    ("yellow",             52,        18,        90,      60,      255),
+    ("gold_metallic",      45,        25,        120,     170,     255),
+    ("cream",              55,        20,        40,      200,     255),
+    # Greens / teals
+    ("green",              110,       45,        80,      40,      255),
+    ("teal",               165,       30,        70,      40,      255),
+    # Blues / cyans
+    ("cyan",               185,       25,        80,      60,      255),
+    ("blue",               210,       35,        80,      40,      255),
+    ("dark_blue",          220,       30,        60,      0,       80),
+    # Purples / violets
+    ("purple",             275,       30,        70,      40,      255),
+    ("violet",             295,       25,        70,      40,      255),
+    ("pink",               320,       30,        70,      40,      255),
+    # Metallic browns
+    ("bronze",             25,        20,        100,     80,      160),
+    # Achromatic
+    ("white",              0,         360,       0,       200,     255),
+    ("silver",             0,         360,       0,       120,     200),
+    ("black",              0,         360,       0,       0,       60),
 ]
 
 
@@ -94,17 +115,205 @@ def _hue_distance(h1: float, h2: float) -> float:
 
 
 # ============================================================
+# SESSION 26D IMPROVEMENT 1 — WHITE BALANCE NORMALIZATION
+# ============================================================
+
+def _normalize_white_balance(rgb: np.ndarray) -> np.ndarray:
+    """
+    Estimate the illuminant from the brightest ~5% of pixels and
+    rescale channels so that illuminant becomes neutral white.
+
+    Removes camera warm/cool cast. Works on a float RGB array (H,W,3).
+    """
+    try:
+        # Sample the brightest pixels by luminance
+        lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+        threshold = np.percentile(lum, 95)
+        bright_mask = lum >= threshold
+
+        if bright_mask.sum() < 20:
+            return rgb
+
+        # Mean RGB of the brightest pixels = estimated illuminant
+        illuminant = rgb[bright_mask].mean(axis=0)
+        if np.any(illuminant < 1e-3):
+            return rgb
+
+        # Normalize so illuminant becomes neutral grey
+        target = illuminant.mean()
+        scale = target / np.maximum(illuminant, 1e-3)
+
+        normalized = rgb * scale[None, None, :]
+        return np.clip(normalized, 0, 255)
+    except Exception:
+        return rgb
+
+
+# ============================================================
+# SESSION 26D IMPROVEMENT 2 — WATER TINT SUBTRACTION
+# ============================================================
+
+def _detect_water_tint(hsv: np.ndarray) -> Optional[tuple[float, float]]:
+    """
+    Detect the water's dominant hue (usually green/cyan, low saturation).
+
+    Returns (hue_center, hue_width) or None if no consistent tint found.
+
+    Strategy: look at the border 10% of the frame (mostly background).
+    If most border pixels cluster in a single hue range with low-to-mid
+    saturation, that's the water tint.
+    """
+    try:
+        h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        H, W = h.shape
+
+        # Border ring
+        border = np.zeros((H, W), dtype=bool)
+        b = max(2, int(min(H, W) * 0.10))
+        border[:b, :] = True
+        border[-b:, :] = True
+        border[:, :b] = True
+        border[:, -b:] = True
+
+        border_mask = border & (s > 40) & (s < 150) & (v > 40) & (v < 220)
+        if border_mask.sum() < 100:
+            return None
+
+        border_hues = h[border_mask]
+
+        # Check if hues cluster (std < 25° on the circle)
+        if _SCIPY_AVAILABLE:
+            pass  # skip scipy circular stats; use simple approach below
+
+        # Simple approach: histogram in 20° bins, find peak
+        bins = (border_hues // 20).astype(int) % 18
+        counts = np.bincount(bins, minlength=18)
+        peak_bin = int(np.argmax(counts))
+        peak_pct = counts[peak_bin] / len(border_hues)
+
+        if peak_pct < 0.35:
+            return None  # not a consistent tint
+
+        hue_center = (peak_bin + 0.5) * 20
+        hue_width = 20  # +- 10° each side
+        return (hue_center, hue_width)
+    except Exception:
+        return None
+
+
+def _subtract_water_tint(hsv: np.ndarray, tint: Optional[tuple[float, float]]) -> np.ndarray:
+    """
+    Remove pixels that match the water tint from the mask
+    (applied later in _mask_fish_region).
+    Returns the tint info; caller uses it in masking.
+    """
+    return hsv  # placeholder — actual exclusion happens in mask step
+
+
+# ============================================================
+# SESSION 26D IMPROVEMENT 3+4 — REFLECTION FILTER + ADAPTIVE BG
+# ============================================================
+
+def _detect_background_color_cluster(rgb: np.ndarray) -> Optional[tuple[int, int, int]]:
+    """
+    Find the most common color cluster in the border ring (10%).
+    Treat as background color for exclusion.
+
+    Simple: quantize border colors to 32-step buckets, find most frequent.
+    """
+    try:
+        H, W = rgb.shape[:2]
+        b = max(2, int(min(H, W) * 0.10))
+
+        border = np.concatenate([
+            rgb[:b, :].reshape(-1, 3),
+            rgb[-b:, :].reshape(-1, 3),
+            rgb[:, :b].reshape(-1, 3),
+            rgb[:, -b:].reshape(-1, 3),
+        ])
+
+        if len(border) < 100:
+            return None
+
+        # Quantize
+        quantized = (border // 32) * 32
+        # Find most common (r, g, b) tuple
+        uniq, counts = np.unique(quantized, axis=0, return_counts=True)
+        if len(uniq) == 0:
+            return None
+
+        top_idx = int(np.argmax(counts))
+        top_pct = counts[top_idx] / len(border)
+
+        if top_pct < 0.30:
+            return None  # background not consistent
+
+        return tuple(int(c) for c in uniq[top_idx])
+    except Exception:
+        return None
+
+
+def _mask_adaptive_background(rgb: np.ndarray, bg_color: Optional[tuple[int, int, int]],
+                                tolerance: int = 60) -> np.ndarray:
+    """
+    Return True where pixels are NOT background.
+    Excludes pixels within `tolerance` (Euclidean RGB distance) of bg_color.
+    """
+    if bg_color is None:
+        return np.ones(rgb.shape[:2], dtype=bool)
+
+    diff = rgb.astype(np.int32) - np.array(bg_color, dtype=np.int32)[None, None, :]
+    dist = np.sqrt((diff ** 2).sum(axis=-1))
+    return dist > tolerance
+
+
+# ============================================================
 # BACKGROUND FILTERING + CROP
 # ============================================================
 
-def _mask_fish_region(hsv: np.ndarray) -> np.ndarray:
+def _mask_fish_region(
+    hsv: np.ndarray,
+    rgb: np.ndarray,
+    water_tint: Optional[tuple[float, float]] = None,
+    bg_color: Optional[tuple[int, int, int]] = None,
+) -> np.ndarray:
+    """
+    Build a boolean mask of likely fish pixels using:
+      - Saturation & value thresholds
+      - Water tint exclusion
+      - Adaptive background exclusion
+      - Center 70% crop
+    """
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
 
     is_fish = np.ones_like(s, dtype=bool)
-    is_fish &= ~(s < 30)
-    is_fish &= ~(v > 240)
-    is_fish &= ~(v < 25)
 
+    # Base thresholds
+    is_fish &= ~(s < 30)              # too grey
+    is_fish &= ~(v > 240)             # blown highlight
+    is_fish &= ~(v < 25)              # shadow
+
+    # SESSION 26D — tighter reflection filter (Session 26C used v > 240 only)
+    # Reflections are bright but not fully blown; they sit ~200-240 with low sat
+    is_reflection = (v > 200) & (s < 45)
+    is_fish &= ~is_reflection
+
+    # Water tint exclusion
+    if water_tint is not None:
+        wc_h, wc_w = water_tint
+        water_like = (
+            (np.abs(((h - wc_h + 180) % 360) - 180) <= wc_w / 2)  # hue close
+            & (s > 40) & (s < 150)                                 # moderate sat
+            & (v > 40) & (v < 220)                                 # moderate brightness
+        )
+        is_fish &= ~water_like
+
+    # Adaptive background exclusion (Session 26D improvement)
+    if bg_color is not None:
+        not_bg = _mask_adaptive_background(rgb, bg_color)
+        is_fish &= not_bg
+
+    # Center 70% crop
     H, W = s.shape
     y0, y1 = int(H * 0.15), int(H * 0.85)
     x0, x1 = int(W * 0.15), int(W * 0.85)
@@ -116,15 +325,61 @@ def _mask_fish_region(hsv: np.ndarray) -> np.ndarray:
     return is_fish
 
 
-def _isolate_largest_blob(mask: np.ndarray, min_size_pct: float = 0.5) -> np.ndarray:
-    """
-    Return a new mask containing only the largest connected component
-    (in pixels). Small blobs (reflections, tape, specks) are dropped.
+# ============================================================
+# SESSION 26D IMPROVEMENT 5 — BLOB QUALITY GATE
+# ============================================================
 
-    min_size_pct: blob must be at least this % of total image pixels
-                  to be considered (avoids noise-only frames).
-    Falls back to original mask if scipy isn't available or no
-    components are large enough.
+def _blob_quality_ok(mask: np.ndarray, blob_mask: np.ndarray, rgb: np.ndarray) -> bool:
+    """
+    Reject a blob if:
+      - aspect ratio too square (fish are elongated)
+      - touches edges (cut off, likely background)
+      - color variance too low (flat wall)
+    """
+    try:
+        if blob_mask.sum() < 30:
+            return False
+
+        ys, xs = np.where(blob_mask)
+        h_span = xs.max() - xs.min() + 1
+        v_span = ys.max() - ys.min() + 1
+
+        if h_span < 5 or v_span < 5:
+            return False
+
+        aspect = max(h_span, v_span) / max(1, min(h_span, v_span))
+
+        # Fish are elongated — reject too-square blobs
+        if aspect < 1.15:
+            return False
+
+        # Reject blobs touching edges (likely cut off)
+        H, W = mask.shape
+        b = 2
+        if xs.min() < b or ys.min() < b or xs.max() > W - 1 - b or ys.max() > H - 1 - b:
+            # Not necessarily bad — fish could be near edge
+            # But combine with small size
+            if blob_mask.sum() / mask.size < 0.05:
+                return False
+
+        # Color variance check
+        blob_pixels = rgb[blob_mask]
+        if len(blob_pixels) < 10:
+            return False
+
+        std_rgb = blob_pixels.std(axis=0).mean()
+        if std_rgb < 8:  # nearly single-color region (wall, tape)
+            return False
+
+        return True
+    except Exception:
+        return True  # on error, allow
+
+
+def _isolate_largest_blob(mask: np.ndarray, rgb: np.ndarray, min_size_pct: float = 0.5) -> np.ndarray:
+    """
+    Return mask of the largest connected component that passes quality gate.
+    Tries the largest first; falls back to smaller if the largest fails quality.
     """
     if not _SCIPY_AVAILABLE or mask.sum() == 0:
         return mask
@@ -134,20 +389,24 @@ def _isolate_largest_blob(mask: np.ndarray, min_size_pct: float = 0.5) -> np.nda
         if num == 0:
             return mask
 
-        # Count pixels in each component
         component_sizes = _ndimage.sum(mask, labeled, index=range(1, num + 1))
         if len(component_sizes) == 0:
             return mask
 
-        # Find the largest
-        largest_idx = int(np.argmax(component_sizes)) + 1
-        largest_mask = (labeled == largest_idx)
+        # Sort components by size descending
+        order = np.argsort(-component_sizes) + 1
 
-        # Sanity check: largest blob should be reasonably big
-        total = mask.size
-        if largest_mask.sum() / total < min_size_pct / 100.0:
+        for comp_id in order:
+            blob_mask = (labeled == comp_id)
+            if blob_mask.sum() / mask.size < min_size_pct / 100.0:
+                break
+            if _blob_quality_ok(mask, blob_mask, rgb):
+                return blob_mask
+
+        # No blob passed quality gate — fall back to largest
+        largest_mask = (labeled == order[0])
+        if largest_mask.sum() / mask.size < min_size_pct / 100.0:
             return mask
-
         return largest_mask
     except Exception:
         return mask
@@ -191,7 +450,8 @@ def _kmeans(pixels: np.ndarray, k: int = 5, iterations: int = 15) -> tuple[np.nd
 # ============================================================
 
 def _map_hsv_to_category(h: float, s: float, v: float) -> Optional[str]:
-    for name in ("gold_metallic", "copper"):
+    # Metallic / special first
+    for name in ("gold_metallic", "copper", "bronze"):
         for cat in COLOR_CATEGORIES:
             if cat[0] != name:
                 continue
@@ -199,6 +459,7 @@ def _map_hsv_to_category(h: float, s: float, v: float) -> Optional[str]:
             if _hue_distance(h, hc) <= hw and s >= smin and vmin <= v <= vmax:
                 return name
 
+    # Achromatic
     if s < 40:
         if v > 200:
             return "white"
@@ -206,10 +467,19 @@ def _map_hsv_to_category(h: float, s: float, v: float) -> Optional[str]:
             return "black"
         return "silver"
 
+    # Cream: low-sat warm tone, high brightness
+    if s < 60 and v > 200 and (h < 70 or h > 320):
+        return "cream"
+
+    # Dark blue: low brightness, blue hue
+    if v < 80 and 200 < h < 250:
+        return "dark_blue"
+
+    # General chromatic — nearest hue center
     best = None
     best_dist = 999
     for name, hc, hw, smin, vmin, vmax in COLOR_CATEGORIES:
-        if name in ("white", "silver", "black", "gold_metallic", "copper"):
+        if name in ("white", "silver", "black", "gold_metallic", "copper", "bronze", "cream", "dark_blue"):
             continue
         if s < smin or not (vmin <= v <= vmax):
             continue
@@ -222,31 +492,55 @@ def _map_hsv_to_category(h: float, s: float, v: float) -> Optional[str]:
 
 
 # ============================================================
-# IRIDESCENCE
+# SESSION 26D IMPROVEMENT 7 — BETTER IRIDESCENCE DETECTION
 # ============================================================
 
 def _detect_iridescence(hsv: np.ndarray, mask: np.ndarray) -> tuple[str, int]:
+    """
+    Improved iridescence detection:
+
+    1. Find bright+saturated pixels (sparkle candidates)
+    2. Measure local brightness variance in a small sliding window
+       — iridescent patches sparkle (high local variance)
+    3. Measure hue diversity across sparkle pixels
+    4. Score = sparkle_pct × local_variance × hue_diversity
+    """
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
 
-    sparkle = (v > 180) & (s > 100) & mask
-    total = mask.sum()
-    if total == 0:
+    if mask.sum() < 50:
         return "none", 0
 
-    sparkle_pct = sparkle.sum() / total * 100
+    # Sparkle candidates
+    sparkle = (v > 160) & (s > 80) & mask
+    sparkle_count = sparkle.sum()
 
-    if sparkle.sum() < 20:
-        return "none", int(sparkle_pct)
+    if sparkle_count < 20:
+        return "none", 0
 
+    sparkle_pct = sparkle_count / mask.sum() * 100
+
+    # Local brightness variance — high sparkle = high local contrast
+    if _SCIPY_AVAILABLE:
+        try:
+            local_mean = _ndimage.uniform_filter(v, size=7)
+            local_var = _ndimage.uniform_filter((v - local_mean) ** 2, size=7)
+            sparkle_variance = float(np.sqrt(local_var[sparkle]).mean())
+        except Exception:
+            sparkle_variance = float(v[sparkle].std())
+    else:
+        sparkle_variance = float(v[sparkle].std())
+
+    # Hue diversity among sparkle pixels
     sparkle_hues = h[sparkle]
     bins = (sparkle_hues // 60).astype(int) % 6
     unique_bins = len(np.unique(bins))
 
-    avg_v = float(v[sparkle].mean())
-
+    # Score
+    pct_factor = min(sparkle_pct / 20.0, 1.0)         # 20%+ = max
+    var_factor = min(sparkle_variance / 40.0, 1.0)     # 40+ = max
     diversity_factor = min(unique_bins / 3.0, 1.0)
-    brightness_factor = min((avg_v - 180) / 75.0, 1.0)
-    score = int(min(sparkle_pct * 3 * diversity_factor * brightness_factor, 100))
+
+    score = int(min(pct_factor * var_factor * diversity_factor * 150, 100))
 
     if score < 10:
         level = "none"
@@ -329,16 +623,25 @@ def _score_quality(img: Image.Image, mask: np.ndarray, hsv: np.ndarray) -> dict:
 
 
 # ============================================================
-# MAIN: ANALYZE FULL PHOTO
+# MAIN: ANALYZE FULL PHOTO (Session 26D pipeline)
 # ============================================================
 
 def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) -> Optional[dict]:
     """
-    Analyze a full photo.
+    Analyze a full photo with Session 26D accuracy improvements.
 
-    use_blob=True → isolates the largest connected region (fish body)
-                    before color analysis. Recommended for multi-fish
-                    or cluttered-background scenes.
+    Pipeline:
+      1. Load image → resize
+      2. White balance normalization
+      3. Convert to HSV
+      4. Detect water tint + adaptive background color
+      5. Build fish mask (with tint + bg + reflection filters)
+      6. Isolate largest blob with quality gate
+      7. K-means clustering on fish pixels
+      8. Map clusters → color categories
+      9. Compute palette, primary, secondary, pattern hint
+      10. Detect iridescence
+      11. Score quality
     """
     img = _load_image_rgb(raw_bytes)
     if img is None:
@@ -346,20 +649,32 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) 
 
     img.thumbnail((640, 640), Image.LANCZOS)
 
-    rgb = np.asarray(img)
-    hsv = _rgb_to_hsv_numpy(rgb)
+    rgb = np.asarray(img).astype(np.float32)
 
-    mask = _mask_fish_region(hsv)
+    # 1. White balance
+    rgb = _normalize_white_balance(rgb)
+
+    # 2. Convert to HSV (uint8 for compatibility with existing code)
+    rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+    hsv = _rgb_to_hsv_numpy(rgb_u8)
+
+    # 3. Detect water tint + adaptive background
+    water_tint = _detect_water_tint(hsv)
+    bg_color = _detect_background_color_cluster(rgb_u8)
+
+    # 4. Build mask
+    mask = _mask_fish_region(hsv, rgb_u8, water_tint=water_tint, bg_color=bg_color)
     if mask.sum() < 50:
         return {"ok": False, "error": "Too little fish region detected"}
 
-    # NEW: isolate the largest blob
+    # 5. Blob isolation with quality gate
     if use_blob:
-        mask = _isolate_largest_blob(mask, min_size_pct=0.5)
+        mask = _isolate_largest_blob(mask, rgb_u8, min_size_pct=0.5)
         if mask.sum() < 50:
             return {"ok": False, "error": "No significant fish region found"}
 
-    fish_pixels = rgb[mask]
+    # 6. K-means on fish pixels
+    fish_pixels = rgb_u8[mask]
     centroids, labels = _kmeans(fish_pixels.astype(np.float32), k=k_clusters)
 
     counts = np.bincount(labels, minlength=len(centroids))
@@ -390,7 +705,10 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) 
     else:
         pattern = "multicolor"
 
+    # 7. Iridescence
     iri_level, iri_score = _detect_iridescence(hsv, mask)
+
+    # 8. Quality
     quality = _score_quality(img, mask, hsv)
 
     return {
@@ -403,6 +721,11 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5, use_blob: bool = True) 
         "iridescence_score": iri_score,
         "quality": quality,
         "coverage_pct": round(float(mask.sum() / mask.size * 100), 1),
+        # Debug info (optional)
+        "debug": {
+            "water_tint_detected": water_tint is not None,
+            "adaptive_bg_detected": bg_color is not None,
+        },
     }
 
 
@@ -421,8 +744,8 @@ def analyze_region(
 ) -> Optional[dict]:
     """
     Analyze a small square region around a tap point.
-    Region is already tight → blob detection is NOT applied here
-    (we trust the user's tap).
+    User picked this region → no blob isolation needed.
+    Still benefits from white-balance normalization.
     """
     img = _load_image_rgb(raw_bytes)
     if img is None:
@@ -453,7 +776,6 @@ def analyze_region(
     cropped.save(buf, format="JPEG", quality=90)
     cropped_bytes = buf.getvalue()
 
-    # User picked this region → no blob isolation needed
     analysis = analyze_photo(cropped_bytes, k_clusters=k_clusters, use_blob=False)
     if not analysis or not analysis.get("ok"):
         return analysis or {"ok": False, "error": "Region analysis failed"}
@@ -471,7 +793,7 @@ def analyze_region(
 
 
 # ============================================================
-# VIDEO FRAME EXTRACTION (Session 26C)
+# VIDEO FRAME EXTRACTION
 # ============================================================
 
 def extract_frames_from_video(
@@ -537,8 +859,7 @@ def analyze_video(
     k_clusters: int = 5,
 ) -> dict:
     """
-    Full video pipeline: extract sampled frames → analyze each → consensus.
-    Uses blob detection per frame to isolate the largest fish.
+    Full video pipeline. Uses blob detection per frame.
     Skips frames that fail quality/coverage thresholds.
     """
     try:
@@ -558,7 +879,6 @@ def analyze_video(
         try:
             a = analyze_photo(fbytes, k_clusters=k_clusters, use_blob=True)
             if a and a.get("ok"):
-                # Skip low-coverage frames (fish too small / mostly background)
                 if a.get("coverage_pct", 0) >= 2.0:
                     analyses.append(a)
         except Exception:
@@ -656,21 +976,27 @@ COLOR_SWATCHES = {
     "red": "#DC2626",
     "orange": "#EA580C",
     "yellow": "#EAB308",
+    "cream": "#FEF3C7",
     "green": "#16A34A",
+    "teal": "#14B8A6",
+    "cyan": "#06B6D4",
     "blue": "#2563EB",
+    "dark_blue": "#1E3A8A",
     "purple": "#7C3AED",
+    "violet": "#8B5CF6",
     "pink": "#DB2777",
     "white": "#F3F4F6",
     "black": "#1F2937",
     "silver": "#9CA3AF",
     "gold_metallic": "#D4AF37",
     "copper": "#B87333",
+    "bronze": "#92400E",
 }
 
 
 def color_swatch_html(color: str, size: int = 16) -> str:
     hex_color = COLOR_SWATCHES.get(color, "#E5E7EB")
-    border = "border:1px solid #D1D5DB;" if color in ("white", "silver") else ""
+    border = "border:1px solid #D1D5DB;" if color in ("white", "silver", "cream") else ""
     return (
         f'<span style="display:inline-block;width:{size}px;height:{size}px;'
         f'background:{hex_color};border-radius:4px;vertical-align:middle;{border}'
