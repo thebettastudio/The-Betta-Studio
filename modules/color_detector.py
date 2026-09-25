@@ -10,9 +10,8 @@
 # Session 26E — Two-pass posture strategy + 5-region split + Side A/B.
 #   • Pass 1 (strict): clean side profile + fully flared + complete
 #   • Pass 2 (lenient + regional): per-frame regional fallback
-#   • Head-on/top-down detection via IBC body ratio (length/depth ≥ 2.0)
+#   • IBC body ratio uses interquartile depth (excludes fin tips)
 #   • Regions aligned to HMPK anatomy: head 20% / body 45% / tail 35%
-#   • Tuned for real flared bettas (wide aspect, tank reflections)
 #   • Side A = head-left, Side B = head-right
 #   • tap-to-select crops bypass posture via skip_posture=True
 
@@ -69,7 +68,6 @@ COLOR_CATEGORIES = [
 # ============================================================
 
 # Side profile: elongated blob. Flared bettas are WIDE — lower threshold.
-# Head-on/top-down gives ~1.0 aspect. Flared side view gives 1.05–1.5.
 MIN_ASPECT_RATIO = 1.05
 
 # IBC body ratio: side views have a long thin body, head-on is square.
@@ -77,8 +75,8 @@ MIN_ASPECT_RATIO = 1.05
 MIN_BODY_RATIO_SIDE = 2.0       # strict side view
 MIN_BODY_RATIO_PARTIAL = 1.6    # lenient regional fallback
 
-# Coverage: blob must be >=2% of frame
-MIN_COVERAGE_PCT = 2.0
+# Coverage: blob must be >=1% of frame (tank shots are farther away)
+MIN_COVERAGE_PCT = 1.0
 
 # Flare: solidity below this = distinct fin extensions
 MAX_SOLIDITY_FLARED = 0.92
@@ -88,7 +86,6 @@ MIN_FLARE_PIXELS = 100
 MIN_TAIL_SPREAD_RATIO = 1.1
 
 # Region split fractions — HMPK anatomy-aligned
-# head = front of fish (eye+gill), body = torso, tail = caudal fin
 HEAD_REGION_FRAC = 0.20
 BODY_REGION_FRAC = 0.45
 TAIL_REGION_FRAC = 0.35
@@ -477,17 +474,21 @@ def _compute_orientation(blob_mask: np.ndarray) -> dict:
 
 
 # ============================================================
-# BODY RATIO (IBC body_length_depth_ratio)
+# BODY RATIO (IBC body_length_depth_ratio, IQR-based)
 # ============================================================
 
 def _compute_body_ratio(blob_mask: np.ndarray, orientation: dict) -> float:
     """
-    Compute IBC body_length_depth_ratio from the BODY region only
-    (excluding dorsal/anal fin extensions).
+    Compute IBC body_length_depth_ratio from the BODY CORE only
+    (excluding long dorsal/anal fin extensions).
 
-    Uses the middle 40% of the major axis to isolate the torso.
+    Strategy:
+      • Length = span of the middle 40% band along the major axis.
+      • Depth  = interquartile perpendicular spread (25–75 pct) of that
+                 band. This trims fin tips which stick out far from the
+                 body centerline.
+
     Head-on fish → ~0.8–1.8.  Side-view fish → 2.5–4.5.
-
     Returns 0.0 if the ratio cannot be computed.
     """
     try:
@@ -502,6 +503,7 @@ def _compute_body_ratio(blob_mask: np.ndarray, orientation: dict) -> float:
         maj_max = float(proj_major.max())
         span = max(1e-6, maj_max - maj_min)
 
+        # Middle 40% band along the major axis
         body_lo = maj_min + span * 0.30
         body_hi = maj_min + span * 0.70
         body_band = (proj_major >= body_lo) & (proj_major <= body_hi)
@@ -509,12 +511,18 @@ def _compute_body_ratio(blob_mask: np.ndarray, orientation: dict) -> float:
         if body_band.sum() < 30:
             return 0.0
 
-        body_length = float(
-            proj_major[body_band].max() - proj_major[body_band].min()
-        )
-        body_depth = float(
-            proj_minor[body_band].max() - proj_minor[body_band].min()
-        )
+        body_major = proj_major[body_band]
+        body_minor = proj_minor[body_band]
+
+        # Length = span of the band along the major axis
+        body_length = float(body_major.max() - body_major.min())
+
+        # Depth = interquartile perpendicular spread (25th–75th pct)
+        # This trims the outer 25% on each side — dorsal fin tips above
+        # and anal fin tips below get cut off.
+        p25 = float(np.percentile(body_minor, 25))
+        p75 = float(np.percentile(body_minor, 75))
+        body_depth = p75 - p25
 
         if body_depth < 1.0:
             return 0.0
