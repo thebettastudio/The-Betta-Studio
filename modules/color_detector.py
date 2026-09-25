@@ -470,6 +470,41 @@ def _build_trajectory_mask(shape: tuple[int, int],
     return mask
 
 
+def _head_direction_from_track(track: list[Optional[dict]],
+                                 frame_idx: int,
+                                 orientation: dict) -> str:
+    """
+    Determine head direction from the fish's motion vector and the
+    orientation's major axis. Falls back to orientation-based head
+    direction if no motion info.
+    """
+    default = orientation.get("head_direction", "unknown")
+
+    if frame_idx is None or frame_idx <= 0 or frame_idx >= len(track):
+        return default
+    curr = track[frame_idx]
+    prev = track[frame_idx - 1]
+    if curr is None or prev is None:
+        return default
+
+    dx = curr["centroid"][0] - prev["centroid"][0]
+    dy = curr["centroid"][1] - prev["centroid"][1]
+    if abs(dx) < 1.0 and abs(dy) < 1.0:
+        return default
+
+    angle_deg = orientation.get("major_axis_angle_deg", 0)
+    vertical = 60 <= angle_deg <= 120
+
+    if vertical:
+        if abs(dy) >= abs(dx):
+            return "down" if dy > 0 else "up"
+        return "right" if dx > 0 else "left"
+
+    if abs(dx) >= 1.0:
+        return "right" if dx > 0 else "left"
+    return "down" if dy > 0 else "up"
+
+
 # ============================================================
 # BLOB QUALITY
 # ============================================================
@@ -1451,11 +1486,6 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
                   motion_hint: Optional[np.ndarray] = None,
                   head_override: Optional[str] = None,
                   pass_override: Optional[int] = None) -> Optional[dict]:
-    """
-    pass_override: if 1 or 2, skips the internal posture validation
-    and treats the frame as already-approved by AI. Used by the
-    Gemini integration where the AI already decided pass/fail.
-    """
     img = _load_image_rgb(raw_bytes)
     if img is None:
         return {"ok": False, "error": "Could not load image"}
@@ -1499,7 +1529,6 @@ def analyze_photo(raw_bytes: bytes, k_clusters: int = 5,
         }
         pass_num = 1
     elif pass_override is not None and pass_override in (1, 2):
-        # AI already decided this is a good frame — trust it
         posture = validate_fish_posture(mask, rgb_u8, coverage_pct)
         posture["pass"] = pass_override
         posture["reason"] = "AI-approved frame"
@@ -1739,17 +1768,6 @@ def analyze_video(
     k_clusters: int = 5,
     use_ai: bool = True,
 ) -> dict:
-    """
-    Video pipeline with optional Gemini AI frame judge.
-
-    If use_ai=True and GOOGLE_API_KEY is configured:
-      1. Extract frames
-      2. Send sampled frames to Gemini for per-frame judgment
-      3. AI-approved frames → classical color analysis (with AI head_direction)
-      4. Consensus from AI-approved frames
-
-    Else: fall back to classical motion + tracking pipeline.
-    """
     try:
         frames = extract_frames_from_video(
             video_bytes,
@@ -1762,7 +1780,6 @@ def analyze_video(
     if not frames:
         return {"ok": False, "error": "No frames could be extracted"}
 
-    # Decode all frames to RGB
     frames_rgb: list[np.ndarray] = []
     for fbytes in frames:
         img = _load_image_rgb(fbytes)
@@ -1784,11 +1801,10 @@ def analyze_video(
                     frames_bytes=frames,
                     frame_indices=list(range(len(frames))),
                 )
-        except Exception as e:
+        except Exception:
             ai_verdicts = None
 
     if ai_verdicts:
-        # Map: frame_index -> verdict
         verdict_by_idx = {v["frame_index"]: v for v in ai_verdicts}
 
         strict_analyses = []
@@ -1821,7 +1837,6 @@ def analyze_video(
                 continue
 
         if len(strict_analyses) >= MIN_STRICT_FRAMES:
-            # Group by AI head direction
             sides = [a.get("side_label", "?") for a in strict_analyses]
             a_count = sides.count("A")
             b_count = sides.count("B")
@@ -1856,11 +1871,8 @@ def analyze_video(
                     "ai_frames_total": len(ai_verdicts),
                 }
 
-        # AI path returned too few frames — fall through to classical
-        # but keep AI verdicts for debug
-
     # ============================================================
-    # CLASSICAL PATH (fallback / no AI)
+    # CLASSICAL PATH
     # ============================================================
     blobs_per_frame = _per_frame_motion_blobs(frames_rgb)
     track = _track_largest_blob(blobs_per_frame)
@@ -1923,7 +1935,7 @@ def analyze_video(
                 "ai_verdicts": ai_verdicts,
             }
 
-    # Pass 2 (regional) — unchanged
+    # Pass 2 (regional)
     regional_contributors = 0
     region_samples: dict[str, list[dict[str, float]]] = {
         "head": [], "body": [], "tail": [], "dorsal": [], "anal": []
