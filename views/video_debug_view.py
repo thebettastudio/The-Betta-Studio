@@ -1,6 +1,6 @@
 # views/video_debug_view.py
 # Betta Farm Management System
-# Session 26H.4 — Classical bbox preferred in gallery + pipeline.
+# Session 26H.6 — Fish-shaped blob filter (reject tall-thin divider blobs).
 # Delete this file when done (also remove the nav entry in app.py).
 
 from __future__ import annotations
@@ -62,7 +62,8 @@ def _render_blob_overlay(img_pil: Image.Image, blob_mask: np.ndarray) -> bytes:
 
 def _compute_classical_bbox(fbytes: bytes) -> Optional[dict]:
     """
-    Compute a bbox around the fish using classical HSV mask + blob isolation.
+    Compute a bbox around the fish using classical HSV mask + smart blob
+    selection. Filters out tall thin regions (tank dividers).
     Returns {"x", "y", "w", "h"} normalized 0..1, or None.
     """
     try:
@@ -85,17 +86,66 @@ def _compute_classical_bbox(fbytes: bytes) -> Optional[dict]:
         if mask.sum() < 50:
             return None
 
-        blob = _isolate_largest_blob(mask, rgb_u8, min_size_pct=0.5)
-        if blob.sum() < 50:
-            return None
+        # Enumerate ALL blobs, pick the best fish-shaped one
+        try:
+            from scipy import ndimage as _nd
+            labeled, num = _nd.label(mask)
+        except ImportError:
+            labeled, num = None, 0
 
-        ys, xs = np.where(blob)
+        if num == 0:
+            # Fallback: use whole mask
+            ys, xs = np.where(mask)
+        else:
+            best_blob = None
+            best_score = -1.0
+
+            for comp_id in range(1, num + 1):
+                blob = (labeled == comp_id)
+                area = int(blob.sum())
+                if area < 100:
+                    continue
+
+                ys_b, xs_b = np.where(blob)
+                bw = int(xs_b.max() - xs_b.min() + 1)
+                bh = int(ys_b.max() - ys_b.min() + 1)
+
+                # Reject tall-thin regions (tank dividers)
+                if bh > bw * 1.2:
+                    continue
+                if bw < 30 or bh < 20:
+                    continue
+
+                aspect = max(bw, bh) / max(1, min(bw, bh))
+                if aspect > 2.5:
+                    continue
+
+                # Prefer blob nearest to frame center
+                cx_blob = (xs_b.min() + xs_b.max()) / 2.0
+                cy_blob = (ys_b.min() + ys_b.max()) / 2.0
+                cx_frame, cy_frame = W / 2.0, H / 2.0
+                dist = ((cx_blob - cx_frame) ** 2 + (cy_blob - cy_frame) ** 2) ** 0.5
+                center_bonus = 1.0 - min(1.0, dist / (max(W, H) * 0.5))
+
+                score = area * 0.001 + center_bonus * 2.0
+
+                if score > best_score:
+                    best_score = score
+                    best_blob = blob
+
+            if best_blob is None:
+                # No fish-shaped blob found — fall back to whole mask
+                ys, xs = np.where(mask)
+            else:
+                ys, xs = np.where(best_blob)
+
         if len(xs) == 0:
             return None
 
         x0, x1 = int(xs.min()), int(xs.max())
         y0, y1 = int(ys.min()), int(ys.max())
 
+        # Pad 5%
         pad_x = int((x1 - x0) * 0.05)
         pad_y = int((y1 - y0) * 0.05)
         x0 = max(0, x0 - pad_x)
@@ -368,7 +418,7 @@ def _render_ai_gallery(frames: list, ai_verdicts: list, ai_rank: dict):
     st.markdown("### 🖼️ AI-approved frames")
     st.caption(
         f"Gemini found **{len(approved)} frames** with a usable side view. "
-        f"Green box = classical fish detection (independent of AI)."
+        f"Green box = fish-shaped classical detection (independent of AI)."
     )
 
     cols_per_row = 4
@@ -393,7 +443,7 @@ def _render_gallery_card(frames: list, frame_idx: int,
     reason = verdict.get("reason", "")
     deviations = verdict.get("deviations", []) or []
 
-    # ALWAYS use classical bbox (Gemini's is unreliable)
+    # ALWAYS use classical fish-shaped bbox
     thumb_bytes = None
     if 0 <= frame_idx < len(frames):
         try:
@@ -405,7 +455,6 @@ def _render_gallery_card(frames: list, frame_idx: int,
                     thumb_bytes = _render_bbox_overlay(img, bbox,
                                                         size=280, width=4)
                 else:
-                    # Classical failed — fall back to raw preview
                     img.thumbnail((280, 280), Image.LANCZOS)
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=85)
@@ -649,13 +698,11 @@ def render_video_debug_page():
         )
 
     ai_available = False
-    ai_error = None
     try:
         from modules.ai_frame_judge import is_ai_available
         ai_available = is_ai_available()
-    except Exception as _e:
+    except Exception:
         ai_available = False
-        ai_error = str(_e)
 
     if ai_available:
         st.success("🤖 **Gemini AI judge is active.** Frames sent to Gemini with reference silhouettes.")
@@ -853,8 +900,7 @@ def render_video_debug_page():
                 head_override = hd
             if ai_v.get("posture_class") != "unusable":
                 pass_override = 1
-            # Session 26H.4 — IGNORE Gemini's bbox (unreliable).
-            # analyze_photo will use full-frame HSV mask + classical blob.
+            # Gemini's bbox intentionally ignored (unreliable)
 
         if head_override is None and track[i] is not None:
             tmp_orient = {"major_axis_angle_deg": 0, "head_direction": "unknown"}
