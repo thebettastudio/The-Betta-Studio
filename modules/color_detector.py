@@ -2,19 +2,17 @@
 # Betta Farm Management System
 # Session 26A — Color analysis via computer vision.
 # Session 26B — Added analyze_region() for tap-to-select flow.
+# Session 26C — Added extract_frames_from_video() for video upload flow.
 #
 # Pipeline per photo:
 #   1. Load image → convert to HSV
-#   2. Filter background (low sat, extreme value)
-#   3. Crop to center 70% (fish region)
+#   2. Filter background
+#   3. Crop to center 70%
 #   4. K-means cluster remaining pixels (k=5)
 #   5. Map each cluster centroid → nearest color category
 #   6. Compute % per category
-#   7. Detect iridescence (bright, saturated, scattered pixels)
+#   7. Detect iridescence
 #   8. Score photo quality
-#
-# Multi-shot consensus via merge_analyses().
-# Region analysis via analyze_region() — used by WebRTC tap-to-select.
 
 from __future__ import annotations
 
@@ -30,6 +28,13 @@ try:
     _SCIPY_AVAILABLE = True
 except ImportError:
     _SCIPY_AVAILABLE = False
+
+# Video support — PyAV
+try:
+    import av
+    _AV_AVAILABLE = True
+except ImportError:
+    _AV_AVAILABLE = False
 
 
 # ============================================================
@@ -373,12 +378,6 @@ def analyze_region(
     region_size: int = 150,
     k_clusters: int = 5,
 ) -> Optional[dict]:
-    """
-    Analyze a small square region around a tap point.
-
-    Coordinates come from DISPLAY size (what the user sees).
-    Auto-scales to actual image dimensions before cropping.
-    """
     img = _load_image_rgb(raw_bytes)
     if img is None:
         return {"ok": False, "error": "Could not load image"}
@@ -422,6 +421,139 @@ def analyze_region(
         "region_size": region_size,
     }
     return analysis
+
+
+# ============================================================
+# VIDEO FRAME EXTRACTION (Session 26C)
+# ============================================================
+
+def extract_frames_from_video(
+    video_bytes: bytes,
+    sample_every: int = 5,
+    max_frames: int = 30,
+    target_width: int = 640,
+) -> list[bytes]:
+    """
+    Extract sampled frames from a video file (in-memory).
+
+    - sample_every: take 1 frame out of every N
+    - max_frames: hard cap on total frames returned
+    - target_width: downscale each frame to this width (for speed)
+
+    Returns: list of JPEG-encoded frame bytes.
+    Raises RuntimeError if PyAV isn't available or the video can't be opened.
+    """
+    if not _AV_AVAILABLE:
+        raise RuntimeError("PyAV (av) not installed. Run: `py -m pip install av`")
+
+    frames: list[bytes] = []
+    stream = io.BytesIO(video_bytes)
+
+    try:
+        container = av.open(stream)
+    except Exception as e:
+        raise RuntimeError(f"Could not open video: {e}")
+
+    try:
+        video_stream = next(
+            (s for s in container.streams if s.type == "video"),
+            None,
+        )
+        if video_stream is None:
+            raise RuntimeError("No video stream found in file")
+
+        idx = 0
+        for frame in container.decode(video_stream):
+            if idx % sample_every == 0:
+                try:
+                    img = frame.to_image()  # PIL Image
+                    # Downscale to target width to speed analysis
+                    w, h = img.size
+                    if w > target_width:
+                        ratio = target_width / w
+                        img = img.resize((target_width, int(h * ratio)), Image.LANCZOS)
+                    if img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
+
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    frames.append(buf.getvalue())
+
+                    if len(frames) >= max_frames:
+                        break
+                except Exception:
+                    # Skip frames that fail to convert
+                    pass
+            idx += 1
+    finally:
+        try:
+            container.close()
+        except Exception:
+            pass
+
+    return frames
+
+
+def analyze_video(
+    video_bytes: bytes,
+    sample_every: int = 5,
+    max_frames: int = 30,
+    k_clusters: int = 5,
+) -> dict:
+    """
+    Full video pipeline: extract sampled frames → analyze each → consensus.
+
+    Returns:
+      {
+        "ok": True,
+        "frames_analyzed": N,
+        "analyses": [analysis dicts],
+        "consensus": merge_analyses result,
+        "best_frame_idx": int,
+      }
+    Or {"ok": False, "error": "..."}.
+    """
+    try:
+        frames = extract_frames_from_video(
+            video_bytes,
+            sample_every=sample_every,
+            max_frames=max_frames,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    if not frames:
+        return {"ok": False, "error": "No frames could be extracted"}
+
+    analyses = []
+    for fbytes in frames:
+        try:
+            a = analyze_photo(fbytes, k_clusters=k_clusters)
+            if a and a.get("ok"):
+                analyses.append(a)
+        except Exception:
+            continue
+
+    if len(analyses) < 3:
+        return {
+            "ok": False,
+            "error": f"Only {len(analyses)} frames analyzed — need at least 3. Try a clearer video.",
+        }
+
+    consensus = merge_analyses(analyses)
+
+    best_idx = max(
+        range(len(analyses)),
+        key=lambda i: (analyses[i].get("quality", {}) or {}).get("score", 0),
+    )
+
+    return {
+        "ok": True,
+        "frames_analyzed": len(analyses),
+        "analyses": analyses,
+        "consensus": consensus,
+        "best_frame_idx": best_idx,
+    }
 
 
 # ============================================================
@@ -479,7 +611,10 @@ def merge_analyses(analyses: list[dict]) -> dict:
         "iridescence_level": iri_level,
         "iridescence_score": max_score,
         "shot_count": len(valid),
-        "best_shot_index": max(range(len(analyses)), key=lambda i: (analyses[i] or {}).get("quality", {}).get("score", 0)),
+        "best_shot_index": max(
+            range(len(analyses)),
+            key=lambda i: (analyses[i] or {}).get("quality", {}).get("score", 0),
+        ),
     }
 
 
