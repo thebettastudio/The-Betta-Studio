@@ -1,7 +1,7 @@
 # views/video_debug_view.py
 # Betta Farm Management System
-# Session 26H.3 — Classical bbox fallback for gallery.
-# Delete this file when done.
+# Session 26H.4 — Classical bbox preferred in gallery + pipeline.
+# Delete this file when done (also remove the nav entry in app.py).
 
 from __future__ import annotations
 
@@ -368,7 +368,7 @@ def _render_ai_gallery(frames: list, ai_verdicts: list, ai_rank: dict):
     st.markdown("### 🖼️ AI-approved frames")
     st.caption(
         f"Gemini found **{len(approved)} frames** with a usable side view. "
-        f"Green box = detected fish region."
+        f"Green box = classical fish detection (independent of AI)."
     )
 
     cols_per_row = 4
@@ -393,19 +393,19 @@ def _render_gallery_card(frames: list, frame_idx: int,
     reason = verdict.get("reason", "")
     deviations = verdict.get("deviations", []) or []
 
+    # ALWAYS use classical bbox (Gemini's is unreliable)
     thumb_bytes = None
     if 0 <= frame_idx < len(frames):
         try:
             img = _load_image_rgb(frames[frame_idx])
             if img is not None:
-                bbox = verdict.get("bbox")
-                if not isinstance(bbox, dict):
-                    bbox = _compute_classical_bbox(frames[frame_idx])
+                bbox = _compute_classical_bbox(frames[frame_idx])
 
                 if isinstance(bbox, dict):
                     thumb_bytes = _render_bbox_overlay(img, bbox,
                                                         size=280, width=4)
                 else:
+                    # Classical failed — fall back to raw preview
                     img.thumbnail((280, 280), Image.LANCZOS)
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=85)
@@ -454,7 +454,7 @@ def _render_gallery_card(frames: list, frame_idx: int,
 
 
 # ============================================================
-# FRAME CARD (per-frame breakdown)
+# FRAME CARD
 # ============================================================
 
 def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None,
@@ -853,8 +853,8 @@ def render_video_debug_page():
                 head_override = hd
             if ai_v.get("posture_class") != "unusable":
                 pass_override = 1
-            if isinstance(ai_v.get("bbox"), dict):
-                bbox = ai_v["bbox"]
+            # Session 26H.4 — IGNORE Gemini's bbox (unreliable).
+            # analyze_photo will use full-frame HSV mask + classical blob.
 
         if head_override is None and track[i] is not None:
             tmp_orient = {"major_axis_angle_deg": 0, "head_direction": "unknown"}
