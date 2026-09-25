@@ -1,14 +1,12 @@
 # views/video_debug_view.py
 # Betta Farm Management System
-# Session 26E — TEMPORARY video diagnostic page.
-# Session 26H — Reference silhouettes + match_score + flare_score +
-#                posture_class + IBC grading panel.
-# Session 26H.2 — AI-approved frames gallery at top.
-# Delete this file when done (also remove the nav entry in app.py).
+# Session 26H.3 — Classical bbox fallback for gallery.
+# Delete this file when done.
 
 from __future__ import annotations
 
 import io
+from typing import Optional
 
 import numpy as np
 import streamlit as st
@@ -62,9 +60,61 @@ def _render_blob_overlay(img_pil: Image.Image, blob_mask: np.ndarray) -> bytes:
         return None
 
 
+def _compute_classical_bbox(fbytes: bytes) -> Optional[dict]:
+    """
+    Compute a bbox around the fish using classical HSV mask + blob isolation.
+    Returns {"x", "y", "w", "h"} normalized 0..1, or None.
+    """
+    try:
+        img = _load_image_rgb(fbytes)
+        if img is None:
+            return None
+        img.thumbnail((640, 640), Image.LANCZOS)
+        W, H = img.size
+
+        rgb = np.asarray(img).astype(np.float32)
+        rgb = _normalize_white_balance(rgb)
+        rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+        hsv = _rgb_to_hsv_numpy(rgb_u8)
+
+        water_tint = _detect_water_tint(hsv)
+        bg_color = _detect_background_color_cluster(rgb_u8)
+
+        mask = _mask_fish_region(hsv, rgb_u8,
+                                 water_tint=water_tint, bg_color=bg_color)
+        if mask.sum() < 50:
+            return None
+
+        blob = _isolate_largest_blob(mask, rgb_u8, min_size_pct=0.5)
+        if blob.sum() < 50:
+            return None
+
+        ys, xs = np.where(blob)
+        if len(xs) == 0:
+            return None
+
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+
+        pad_x = int((x1 - x0) * 0.05)
+        pad_y = int((y1 - y0) * 0.05)
+        x0 = max(0, x0 - pad_x)
+        y0 = max(0, y0 - pad_y)
+        x1 = min(W, x1 + pad_x)
+        y1 = min(H, y1 + pad_y)
+
+        return {
+            "x": x0 / W,
+            "y": y0 / H,
+            "w": (x1 - x0) / W,
+            "h": (y1 - y0) / H,
+        }
+    except Exception:
+        return None
+
+
 def _render_bbox_overlay(img_pil: Image.Image, bbox: dict,
-                          size: int = 360, width: int = 4) -> bytes:
-    """Draw a green rectangle on the image using a normalized bbox."""
+                          size: int = 360, width: int = 4) -> Optional[bytes]:
     try:
         if not bbox:
             return None
@@ -101,8 +151,7 @@ def _render_trajectory_overlay(img_pil: Image.Image,
         return None
 
 
-def _render_trajectory_map(frames_shape: tuple[int, int],
-                             track: list) -> bytes:
+def _render_trajectory_map(frames_shape: tuple[int, int], track: list) -> bytes:
     try:
         H, W = frames_shape
         canvas = Image.new("RGB", (W, H), (240, 244, 248))
@@ -288,7 +337,7 @@ def _verdict_banner(pass_num: int, reason: str = "") -> str:
     )
 
 
-def _posture_color(posture_class: str) -> tuple[str, str]:
+def _posture_color(posture_class: str) -> tuple:
     mapping = {
         "fully_flared":     ("#DCFCE7", "#166534"),
         "mostly_flared":    ("#ECFCCB", "#3F6212"),
@@ -300,17 +349,13 @@ def _posture_color(posture_class: str) -> tuple[str, str]:
 
 
 # ============================================================
-# AI-APPROVED GALLERY (NEW in 26H.2)
+# AI GALLERY
 # ============================================================
 
 def _render_ai_gallery(frames: list, ai_verdicts: list, ai_rank: dict):
-    """
-    Grid of AI-approved frames with thumbnail + bbox + verdict.
-    """
     if not ai_verdicts:
         return
 
-    # Only show frames that AI approved (not unusable)
     approved = [v for v in ai_verdicts
                 if v.get("posture_class", "unusable") != "unusable"]
 
@@ -318,21 +363,18 @@ def _render_ai_gallery(frames: list, ai_verdicts: list, ai_rank: dict):
         st.error("No frames were approved by Gemini.")
         return
 
-    # Sort by rank
     approved.sort(key=lambda v: ai_rank.get(v["frame_index"], 9999))
 
     st.markdown("### 🖼️ AI-approved frames")
     st.caption(
         f"Gemini found **{len(approved)} frames** with a usable side view. "
-        f"Green box = AI's real-fish bbox (reflection excluded)."
+        f"Green box = detected fish region."
     )
 
-    # Grid: 4 columns
     cols_per_row = 4
     for row_start in range(0, len(approved), cols_per_row):
         row = approved[row_start:row_start + cols_per_row]
         cols = st.columns(cols_per_row)
-
         for i, v in enumerate(row):
             fi = v["frame_index"]
             with cols[i]:
@@ -341,7 +383,6 @@ def _render_ai_gallery(frames: list, ai_verdicts: list, ai_rank: dict):
 
 def _render_gallery_card(frames: list, frame_idx: int,
                           verdict: dict, rank: int = None):
-    """One small card in the AI gallery."""
     posture_class = verdict.get("posture_class", "unusable")
     pc_bg, pc_fg = _posture_color(posture_class)
     match_score = verdict.get("match_score", 0.0)
@@ -351,19 +392,20 @@ def _render_gallery_card(frames: list, frame_idx: int,
     matched_ref = verdict.get("matched_reference", "none")
     reason = verdict.get("reason", "")
     deviations = verdict.get("deviations", []) or []
-    bbox = verdict.get("bbox")
 
-    # Thumbnail (with bbox overlay if available)
     thumb_bytes = None
     if 0 <= frame_idx < len(frames):
         try:
             img = _load_image_rgb(frames[frame_idx])
             if img is not None:
+                bbox = verdict.get("bbox")
+                if not isinstance(bbox, dict):
+                    bbox = _compute_classical_bbox(frames[frame_idx])
+
                 if isinstance(bbox, dict):
                     thumb_bytes = _render_bbox_overlay(img, bbox,
                                                         size=280, width=4)
                 else:
-                    # No bbox: just use the raw preview
                     img.thumbnail((280, 280), Image.LANCZOS)
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=85)
@@ -372,11 +414,9 @@ def _render_gallery_card(frames: list, frame_idx: int,
             thumb_bytes = None
 
     with st.container(border=True):
-        # Rank + frame number
         rank_txt = f"#{rank} · " if rank is not None else ""
         st.markdown(f"**{rank_txt}Frame {frame_idx}**")
 
-        # Thumbnail
         if thumb_bytes:
             try:
                 st.image(thumb_bytes, use_container_width=True)
@@ -385,7 +425,6 @@ def _render_gallery_card(frames: list, frame_idx: int,
         else:
             st.caption("(no preview)")
 
-        # Posture class badge
         st.markdown(
             f'<div style="background:{pc_bg};color:{pc_fg};border-radius:6px;'
             f'padding:4px 8px;font-size:12px;font-weight:600;text-align:center;'
@@ -395,14 +434,12 @@ def _render_gallery_card(frames: list, frame_idx: int,
             unsafe_allow_html=True,
         )
 
-        # Scores row
         st.caption(
             f"match **{match_score:.2f}** · flare **{flare_score:.2f}** · "
             f"conf **{confidence:.2f}**"
         )
         st.caption(f"head: `{head_dir}` · ref: `{matched_ref}`")
 
-        # Reason
         if reason:
             st.markdown(
                 f'<div style="font-size:11px;color:#4A5568;'
@@ -410,7 +447,6 @@ def _render_gallery_card(frames: list, frame_idx: int,
                 unsafe_allow_html=True,
             )
 
-        # Deviations (hidden by default)
         if deviations:
             with st.expander(f"Deviations ({len(deviations)})", expanded=False):
                 for dev in deviations:
@@ -418,7 +454,7 @@ def _render_gallery_card(frames: list, frame_idx: int,
 
 
 # ============================================================
-# FRAME CARD (per-frame breakdown, existing)
+# FRAME CARD (per-frame breakdown)
 # ============================================================
 
 def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None,
@@ -553,7 +589,7 @@ def _render_frame_card(idx: int, r: dict, ai_verdict: dict = None,
 
 
 # ============================================================
-# REFERENCE SILHOUETTES PANEL
+# REFERENCE PANEL
 # ============================================================
 
 def _render_references_panel():
@@ -612,7 +648,6 @@ def render_video_debug_page():
             unsafe_allow_html=True,
         )
 
-    # AI availability
     ai_available = False
     ai_error = None
     try:
@@ -630,34 +665,6 @@ def render_video_debug_page():
             "⚠️ **Gemini AI not configured.** Add `GOOGLE_API_KEY` to Streamlit "
             "secrets. Falling back to classical pipeline."
         )
-
-        with st.expander("🔍 Diagnostic — why is Gemini not configured?", expanded=False):
-            try:
-                import os as _os
-                from modules import ai_frame_judge as _afj
-                _genai_ok = getattr(_afj, "_GENAI_AVAILABLE", "unknown")
-                _secret_keys = "unavailable"
-                _key_found = "unavailable"
-                _key_len = "unavailable"
-                _secret_err = None
-                try:
-                    _secret_keys = list(st.secrets.keys())
-                    _key_found = "GOOGLE_API_KEY" in st.secrets
-                    _key_len = len(str(st.secrets.get("GOOGLE_API_KEY", "")))
-                except Exception as _se:
-                    _secret_err = str(_se)
-                st.json({
-                    "cwd": _os.getcwd(),
-                    "secrets_file_exists": _os.path.exists(".streamlit/secrets.toml"),
-                    "genai_sdk_available": _genai_ok,
-                    "st_secrets_top_level_keys": _secret_keys,
-                    "GOOGLE_API_KEY_found": _key_found,
-                    "GOOGLE_API_KEY_length": _key_len,
-                    "st_secrets_error": _secret_err,
-                    "ai_import_error": ai_error,
-                })
-            except Exception as _de:
-                st.error(f"Diagnostic failed: {_de}")
 
     video_file = st.file_uploader(
         "Upload video",
@@ -701,7 +708,6 @@ def render_video_debug_page():
             img.thumbnail((640, 640), Image.LANCZOS)
             frames_rgb.append(np.asarray(img.convert("RGB")).astype(np.uint8))
 
-    # ---------- Gemini ----------
     ai_verdicts = None
     ai_best = None
     ai_map = {}
@@ -738,9 +744,6 @@ def render_video_debug_page():
         for i, v in enumerate(ranked):
             ai_rank[v["frame_index"]] = i + 1
 
-        # ============================================================
-        # TOP: Summary tiles
-        # ============================================================
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total frames", len(ai_verdicts))
         c2.metric("✅ Fully flared", sum(1 for v in ai_verdicts
@@ -760,9 +763,6 @@ def render_video_debug_page():
                 f"match {ranked[0].get('match_score', 0):.2f})"
             )
 
-        # ============================================================
-        # Best frame + crop
-        # ============================================================
         if ai_best:
             with st.expander("🏆 Gemini's best frame + suggested crop", expanded=True):
                 bidx = ai_best.get("frame_index", -1)
@@ -787,14 +787,8 @@ def render_video_debug_page():
                             st.caption(f"Crop failed: {e}")
                     st.caption(f"_{ai_best.get('reason', '')}_")
 
-        # ============================================================
-        # AI-APPROVED GALLERY (the new thing!)
-        # ============================================================
         _render_ai_gallery(frames, ai_verdicts, ai_rank)
 
-        # ============================================================
-        # All verdicts (compact text list)
-        # ============================================================
         with st.expander(f"🤖 All {len(ai_verdicts)} AI verdicts (compact)", expanded=False):
             for v in ranked:
                 pc = v.get("posture_class", "unusable")
@@ -814,7 +808,6 @@ def render_video_debug_page():
                     unsafe_allow_html=True,
                 )
 
-    # ---------- Classical tracking ----------
     with st.spinner("Classical tracking (comparison)…"):
         blobs_per_frame = _per_frame_motion_blobs(frames_rgb)
         track = _track_largest_blob(blobs_per_frame)
@@ -834,7 +827,6 @@ def render_video_debug_page():
         else:
             st.caption("No trajectory")
 
-    # ---------- Per-frame analysis ----------
     if ai_verdicts:
         ordered_indices = [v["frame_index"] for v in sorted(
             ai_verdicts,
@@ -902,7 +894,6 @@ def render_video_debug_page():
     else:
         st.error("Video would be REJECTED.")
 
-    # ---------- IBC Score card ----------
     if ai_verdicts:
         top_verdict = sorted(
             ai_verdicts,
@@ -929,7 +920,6 @@ def render_video_debug_page():
                         f"  _source: {f['source']}_"
                     )
 
-    # ---------- Per-frame cards ----------
     st.markdown("---")
     st.markdown("#### Per-frame breakdown (AI-ranked)")
 
@@ -943,7 +933,6 @@ def render_video_debug_page():
                 rank=ai_rank.get(fi) if ai_map else None,
             )
 
-    # Raw JSON
     with st.expander("📋 Raw JSON (developer)"):
         clean = [{
             k: v for k, v in r.items()
