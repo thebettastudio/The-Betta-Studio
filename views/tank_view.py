@@ -6,7 +6,7 @@
 #   • Column-list tank layout (compact row, colored left stripe, click to expand)
 #   • Status colors:  Empty grey · Reserved yellow · Occupied green ·
 #                     Cleaning orange · Retired dark
-#   • KPI row: clickable chips (single row, no bloat)
+#   • KPI row: native clickable buttons (no HTML overlay)
 #   • Filter bar: search + sort always visible; advanced filters in expander
 #   • Expanded card: 3-column layout (photo | details | occupants + actions)
 #   • ⭐ Starred indicator inherited from fish.is_starred
@@ -645,7 +645,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
     starred = any(_is_starred_occupant(o["occupant_type"], o["occupant_id"], fish_index)
                   for o in occupants)
 
-    # Summary column text
     if occupants:
         if len(occupants) == 1:
             occ_summary = _occupant_chip_text(occupants[0], fish_index)
@@ -656,7 +655,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
     else:
         occ_summary = ""
 
-    # ---- Collapsed header (single-line, clean columns) ----
     star_prefix = "⭐ " if starred else ""
     badge_html = _status_badge_html(status)
     purpose_str = _purpose_label(purpose)
@@ -688,11 +686,9 @@ def _render_tank_row(tank: dict, fish_index: dict):
             unsafe_allow_html=True,
         )
 
-    # Occupant summary line, if present, as a thin caption
     if occ_summary:
         st.caption(f"　　└─ {occ_summary}")
 
-    # Expand toggle
     toggle_key = f"_expand_{tank_id}"
     is_open = st.session_state.get(toggle_key, False)
 
@@ -710,11 +706,9 @@ def _render_tank_row(tank: dict, fish_index: dict):
         )
         return
 
-    # ---- Expanded card ----
     with st.container(border=True):
         col_photo, col_details, col_actions = st.columns([2, 3, 3])
 
-        # ---- Column 1: photo + QR ----
         with col_photo:
             if tank.get("photo_id"):
                 st.image(photo_url(tank["photo_id"]), use_container_width=True)
@@ -730,9 +724,8 @@ def _render_tank_row(tank: dict, fish_index: dict):
                 with st.expander("QR Code", expanded=False):
                     st.image(photo_url(tank["qr_id"]), use_container_width=True)
 
-        # ---- Column 2: details ----
         with col_details:
-            st.markdown(f"##### 📋 Details")
+            st.markdown("##### 📋 Details")
             st.caption(f"System ID: `{tank.get('system_id')}`")
             st.markdown(f"**Type:** {ttype}")
             st.markdown(f"**Purpose:** {purpose_str}")
@@ -757,7 +750,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
                 st.markdown("---")
                 st.markdown(f"**📝 Notes:** {tank['notes']}")
 
-        # ---- Column 3: occupants + actions ----
         with col_actions:
             st.markdown(f"##### 🐟 Occupants ({len(occupants)})")
             if not occupants:
@@ -896,7 +888,6 @@ def _render_inventory():
         st.info("No containers registered yet. Use the Register tab to add your first one.")
         return
 
-    # ---- Load full fish index (includes is_starred) ----
     fish_index = {}
     try:
         from database import get_all_fish
@@ -904,7 +895,6 @@ def _render_inventory():
     except Exception:
         pass
 
-    # ---- Attach occupants + starred flag ----
     from database import get_tank_occupants
     for t in all_tanks:
         try:
@@ -917,7 +907,6 @@ def _render_inventory():
             for o in occupants
         )
 
-    # ---- Compute counts from the SAME list we render (can't drift) ----
     counts = {s: 0 for s in VALID_STATUSES}
     for t in all_tanks:
         s = t.get("status") or "Empty / Idle"
@@ -925,34 +914,31 @@ def _render_inventory():
             counts[s] += 1
     total = len(all_tanks)
 
-    # ---- KPI row: clickable chips ----
+    # ---- KPI row: native clickable buttons ----
     selected_kpi = st.session_state.get("_inv_kpi", "All")
 
     kpi_cols = st.columns(6)
     chips = [
-        ("All", f"📦 All {total}", "#E5E7EB", "#374151"),
-        ("Empty / Idle", f"⚪ Empty {counts['Empty / Idle']}", "#F3F4F6", "#374151"),
-        ("Reserved", f"🟡 Reserved {counts['Reserved']}", "#FEF3C7", "#92400E"),
-        ("Occupied", f"🟢 Occupied {counts['Occupied']}", "#D1FAE5", "#065F46"),
-        ("Cleaning / Quarantine", f"🟠 Cleaning {counts['Cleaning / Quarantine']}", "#FED7AA", "#9A3412"),
-        ("Retired", f"⚫ Retired {counts['Retired']}", "#E5E7EB", "#6B7280"),
+        ("All", f"📦 All  ·  {total}"),
+        ("Empty / Idle", f"⚪ Empty  ·  {counts['Empty / Idle']}"),
+        ("Reserved", f"🟡 Reserved  ·  {counts['Reserved']}"),
+        ("Occupied", f"🟢 Occupied  ·  {counts['Occupied']}"),
+        ("Cleaning / Quarantine", f"🟠 Cleaning  ·  {counts['Cleaning / Quarantine']}"),
+        ("Retired", f"⚫ Retired  ·  {counts['Retired']}"),
     ]
-    for col, (key, label, bg, fg) in zip(kpi_cols, chips):
+    for col, (key, label) in zip(kpi_cols, chips):
         with col:
             is_active = (selected_kpi == key)
-            border = "2px solid #111827" if is_active else "1px solid #E5E7EB"
-            st.markdown(
-                f'<div style="background:{bg};color:{fg};border:{border};'
-                f'border-radius:10px;padding:10px 8px;text-align:center;'
-                f'font-size:13px;font-weight:600;">{label}</div>',
-                unsafe_allow_html=True,
-            )
-            if st.button("Select", key=f"kpi_{key}", use_container_width=True,
-                         label_visibility="collapsed"):
+            btn_type = "primary" if is_active else "secondary"
+            if st.button(
+                label,
+                key=f"kpi_{key}",
+                use_container_width=True,
+                type=btn_type,
+            ):
                 st.session_state["_inv_kpi"] = key
                 st.rerun()
 
-    # ---- Expiring banner ----
     expiring = get_expiring(days_ahead=3)
     if expiring:
         locs = ", ".join(t.get("location_code") or "?" for t in expiring[:5])
@@ -964,7 +950,6 @@ def _render_inventory():
 
     st.markdown("")
 
-    # ---- Filter bar: search + sort always visible ----
     f1, f2 = st.columns([4, 2])
     with f1:
         query = st.text_input(
@@ -982,7 +967,6 @@ def _render_inventory():
             label_visibility="collapsed",
         )
 
-    # ---- Advanced filters in expander ----
     with st.expander("🎛️ Advanced filters", expanded=False):
         af1, af2, af3 = st.columns(3)
         with af1:
@@ -1002,7 +986,6 @@ def _render_inventory():
         with af3:
             starred_only = st.checkbox("⭐ Show starred only", key="inv_star_only")
 
-    # ---- Apply filters ----
     filtered = all_tanks
 
     if selected_kpi != "All":
@@ -1052,7 +1035,6 @@ def _render_inventory():
         st.info("No containers match your filters.")
         return
 
-    # ---- Render rows ----
     for t in filtered:
         _render_tank_row(t, fish_index)
 
