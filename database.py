@@ -17,23 +17,20 @@
 # Session 26H.7 — Step 2 (this revision):
 #   • VALID_STATUSES constant added (5 values, source of truth)
 #   • assign_occupant() + clear_occupant() restored as backward-compat
-#     wrappers over the join table (A1 decision).
-#     - assign_occupant(tank_id, fish_id, label=None)
-#       * fish_id=None → writes label directly to tanks.occupant_label
-#         (spawn-tank marker; no join row — B1 decision).
-#       * fish_id=X → joins the join table (occupant_type='fish').
-#       * Auto-cancels any reservation, sets st.session_state warning.
-#   • _refresh_tank_cache() fixed:
-#       - primary role chosen with a two-pass scan (not first-fish).
-#       - preserves 'Cleaning / Quarantine' when no occupants.
-#       - clears reserved_* fields when an occupant is added.
+#     wrappers over the join table.
+#   • _refresh_tank_cache() fixed: primary role via two-pass scan,
+#     preserves 'Cleaning / Quarantine', clears reservation fields on
+#     occupant arrival.
 #   • transfer_occupant() parameterized by occupant_type.
-#   • get_tank_stats() added (includes 'reserved' count).
-#   • delete_tank_safely() added — blocks deletion of occupied tanks
-#     unless transfers={} is supplied (Q3 Option D).
-#   • regenerate_tape_code() added — uses id_generator.generate_tape_code
-#     for the new purpose (Q4 Option C).
-#   • get_expiring_reservations() unchanged from prior revision.
+#   • get_tank_stats() added (includes 'reserved').
+#   • delete_tank_safely_impl() added — blocks occupied deletes unless
+#     transfers are supplied (Q3 Option D). Named "_impl" so the
+#     higher-level wrapper in tank_registry.py can present the public
+#     delete_tank_safely() with activity logging.
+#   • regenerate_tape_code() added — delegates to
+#     modules.id_generator.generate_tape_code() for the new purpose
+#     (Q4 Option C). The import is INSIDE the function body to avoid a
+#     circular import (id_generator imports database at module top).
 
 from __future__ import annotations
 
@@ -161,7 +158,6 @@ def retire_fish(fish_id: str, reason: str = "", extra_notes: str = "") -> bool:
     new_notes = (fish.get("notes") or "").strip()
     new_notes = f"{new_notes} | {tag} {extra_notes}".strip(" |") if new_notes else f"{tag} {extra_notes}".strip()
 
-    # Clear occupants from any tank
     for occ in get_occupants_for_fish(fish_id):
         remove_tank_occupant(occ["tank_id"], "fish", fish_id)
 
@@ -211,8 +207,6 @@ def get_next_fish_sequence(prefix: str = "FISH-") -> str:
 # TANKS
 # ============================================================
 
-# Source of truth for tank statuses (Session 26H.7 Q2, Option C).
-# "Active" is retired — do not reintroduce.
 VALID_STATUSES = [
     "Empty / Idle",
     "Reserved",
@@ -275,7 +269,7 @@ def update_tank(tank_id: str, updates: dict) -> bool:
 
 
 def delete_tank(tank_id: str) -> bool:
-    """Raw delete — does NOT check occupants. Use delete_tank_safely() from UI."""
+    """Raw delete — does NOT check occupants. UI should use delete_tank_safely_impl()."""
     try:
         _sb().table("tanks").delete().eq("id", tank_id).execute()
         return True
@@ -370,12 +364,10 @@ def add_tank_occupant(
 ) -> Optional[dict]:
     """
     Add an occupant to a tank.
-    Also updates the denormalized cache on tanks (occupant_fish_id/label)
-    and flips status to Occupied. Auto-cancels any reservation on the tank
-    (a warning is stashed in session_state for the UI to surface).
+    Auto-cancels any reservation on the tank (warning stashed in
+    st.session_state['_reservation_warnings'] for the UI to surface).
     """
     try:
-        # Auto-cancel reservation (Q2 rule)
         tank = get_tank_by_id(tank_id)
         if tank and tank.get("status") == "Reserved":
             _stash_reservation_warning(tank)
@@ -398,9 +390,7 @@ def add_tank_occupant(
         res = _sb().table("tank_occupants").insert(record).execute()
         new_row = (res.data or [None])[0]
 
-        # Refresh cache + status
         _refresh_tank_cache(tank_id)
-
         return new_row
     except Exception as e:
         st.error(f"add_tank_occupant failed: {e}")
@@ -417,7 +407,6 @@ def remove_tank_occupant(tank_id: str, occupant_type: str, occupant_id: str) -> 
          .eq("occupant_id", occupant_id)
          .execute())
 
-        # Refresh cache + status
         _refresh_tank_cache(tank_id)
         return True
     except Exception as e:
@@ -425,11 +414,7 @@ def remove_tank_occupant(tank_id: str, occupant_type: str, occupant_id: str) -> 
         return False
 
 
-# ---------- Backward-compat wrappers (A1 decision) ----------
-# These preserve the old 3-arg API used by:
-#   modules/tank_registry.py   (assign_fish_to_tank, unassign_tank, register_tank)
-#   modules/fish_manager.py    (change_location, delete_fish_and_photos, cull_fish)
-#   modules/spawn_manager.py   (create_new_spawn — passes fish_id=None)
+# ---------- Backward-compat wrappers ----------
 
 def assign_occupant(
     tank_id: str,
@@ -439,15 +424,14 @@ def assign_occupant(
     """
     Backward-compatible occupant assignment.
 
-    - fish_id is a real uuid → adds a join-table row (type='fish', role='primary')
-      and caches the label onto tanks.occupant_label.
-    - fish_id is None → "spawn-tank marker": writes the label directly to
-      tanks.occupant_label and sets status='Occupied'. No join row is created
-      (tank_occupants.occupant_id is NOT NULL). B1 decision.
+    - fish_id is a real uuid → adds a join-table row (type='fish',
+      role='primary') and caches the label onto tanks.occupant_label.
+    - fish_id is None → "spawn-tank marker": writes the label directly
+      to tanks.occupant_label and sets status='Occupied'. No join row
+      (tank_occupants.occupant_id is NOT NULL).
     """
     try:
         if fish_id:
-            # Resolve a fallback label if caller didn't supply one
             if not label:
                 fish = get_fish_by_id(fish_id)
                 if fish:
@@ -461,13 +445,11 @@ def assign_occupant(
                 return False
             if label:
                 update_tank(tank_id, {"occupant_label": label})
-            # Mirror onto fish
             tank = get_tank_by_id(tank_id)
             loc = tank.get("location_code") if tank else None
             update_fish(fish_id, {"tank_id": tank_id, "location": loc})
             return True
         else:
-            # No join-table row; label-only marker
             _refresh_tank_cache(tank_id)
             updates = {"status": "Occupied"}
             if label:
@@ -480,24 +462,21 @@ def assign_occupant(
 
 def clear_occupant(tank_id: str) -> bool:
     """
-    Remove ALL occupants from a tank. Mirrors the old clear_occupant(tank_id)
-    signature. Clears fish.location for any fish occupant.
+    Remove ALL occupants from a tank. Mirrors the old clear_occupant(tank_id).
+    Clears fish.location for any fish occupant.
     """
     try:
         occupants = get_tank_occupants(tank_id)
 
-        # Un-mirror fish locations first
         for occ in occupants:
             if occ.get("occupant_type") == "fish":
                 update_fish(occ["occupant_id"], {"tank_id": None, "location": None})
 
-        # Delete join rows in one pass
         (_sb().table("tank_occupants")
          .delete()
          .eq("tank_id", tank_id)
          .execute())
 
-        # Clear denormalized cache and reset status
         _refresh_tank_cache(tank_id)
         return True
     except Exception as e:
@@ -519,7 +498,6 @@ def _stash_reservation_warning(tank: dict) -> None:
             "until": tank.get("reserved_until"),
         })
     except Exception:
-        # st.session_state may not be available in non-Streamlit contexts
         pass
 
 
@@ -529,13 +507,13 @@ def _refresh_tank_cache(tank_id: str) -> None:
     based on current tank_occupants rows.
 
     Rules:
-      - If occupants exist → status='Occupied' (unless current status is
+      - Occupants exist → status='Occupied' (unless current is
         'Cleaning / Quarantine', which we don't silently override).
-      - If no occupants AND current status is 'Reserved' → keep 'Reserved'.
-      - If no occupants AND current status is 'Cleaning / Quarantine' → keep.
+      - No occupants AND current is 'Reserved' → keep 'Reserved'.
+      - No occupants AND current is 'Cleaning / Quarantine' → keep.
       - Otherwise → 'Empty / Idle'.
-      - Primary occupant: prefer role='primary'; fall back to first fish;
-        if only fry batches, use batch label.
+      - Primary occupant: prefer role='primary'; else first fish;
+        else fry-batch summary label.
     """
     try:
         occupants = get_tank_occupants(tank_id)
@@ -546,13 +524,11 @@ def _refresh_tank_cache(tank_id: str) -> None:
         primary_label = None
 
         if occupants:
-            # Pass 1: look for role='primary' fish
             for occ in occupants:
                 if occ.get("occupant_type") == "fish" and occ.get("role") == "primary":
                     primary_fish_id = occ["occupant_id"]
                     break
 
-            # Pass 2: any fish
             if primary_fish_id is None:
                 for occ in occupants:
                     if occ.get("occupant_type") == "fish":
@@ -568,20 +544,17 @@ def _refresh_tank_cache(tank_id: str) -> None:
                         f"{fish.get('variety') or ''}"
                     ).strip(" |")
             else:
-                # Only fry batches — build a summary label
                 batch_count = sum(1 for o in occupants if o.get("occupant_type") == "fry_batch")
                 if batch_count == 1:
                     primary_label = "Fry batch (1)"
                 elif batch_count > 1:
                     primary_label = f"Fry batches ({batch_count})"
 
-            # Status resolution
             if current_status == "Cleaning / Quarantine":
                 status = "Cleaning / Quarantine"
             else:
                 status = "Occupied"
         else:
-            # No occupants
             if current_status in ("Reserved", "Cleaning / Quarantine", "Retired"):
                 status = current_status
             else:
@@ -607,17 +580,14 @@ def transfer_occupant(
 ) -> bool:
     """
     Move an occupant (fish OR fry batch) from one tank to another.
-    Removes from old, adds to new. For fish, mirrors fish.location + tank_id.
+    For fish, mirrors fish.location + tank_id.
     """
     try:
-        # Remove from old
         if from_tank_id:
             remove_tank_occupant(from_tank_id, occupant_type, fish_id)
 
-        # Add to new
         add_tank_occupant(to_tank_id, occupant_type, fish_id, role=role)
 
-        # Mirror to fish row only if it's a fish
         if occupant_type == "fish":
             new_tank = get_tank_by_id(to_tank_id)
             loc = new_tank.get("location_code") if new_tank else None
@@ -630,7 +600,7 @@ def transfer_occupant(
 
 # ---------- Safe delete (Q3 Option D) ----------
 
-def delete_tank_safely(
+def delete_tank_safely_impl(
     tank_id: str,
     transfers: Optional[dict] = None,
 ) -> tuple[bool, str]:
@@ -644,8 +614,10 @@ def delete_tank_safely(
           ("fry_batch",  batch_uuid): destination_tank_uuid,
         }
 
-    Returns (success, message). The caller (UI) is responsible for
-    showing the transfer dialog before calling this.
+    Returns (success, message).
+    NOTE: this is the raw implementation. UI calls the wrapper in
+    modules/tank_registry.py which also handles Drive media cleanup +
+    activity logging.
     """
     try:
         tank = get_tank_by_id(tank_id)
@@ -668,7 +640,6 @@ def delete_tank_safely(
                     f"{len(missing)} have no transfer destination."
                 )
 
-            # Perform transfers
             for occ in occupants:
                 key = (occ["occupant_type"], occ["occupant_id"])
                 dest = transfers[key]
@@ -680,10 +651,9 @@ def delete_tank_safely(
                     occupant_type=occ["occupant_type"],
                 )
 
-        # Now safe to delete
         return (delete_tank(tank_id), "Tank deleted.")
     except Exception as e:
-        st.error(f"delete_tank_safely failed: {e}")
+        st.error(f"delete_tank_safely_impl failed: {e}")
         return False, str(e)
 
 
@@ -698,10 +668,7 @@ def reserve_tank(
     reserved_until: Optional[str] = None,
     reserved_ref_id: Optional[str] = None,
 ) -> bool:
-    """
-    Set a reservation on a tank.
-    Cannot reserve a tank that already has occupants.
-    """
+    """Set a reservation on a tank. Cannot reserve a tank with occupants."""
     try:
         tank = get_tank_by_id(tank_id)
         if not tank:
@@ -755,7 +722,6 @@ def move_reservation(from_tank_id: str, to_tank_id: str) -> bool:
             st.error("Destination tank is occupied — cannot move reservation.")
             return False
 
-        # Copy reservation fields
         update_tank(to_tank_id, {
             "status": "Reserved",
             "reserved_for": src.get("reserved_for"),
@@ -764,7 +730,6 @@ def move_reservation(from_tank_id: str, to_tank_id: str) -> bool:
             "reserved_ref_id": src.get("reserved_ref_id"),
         })
 
-        # Clear source
         cancel_reservation(from_tank_id)
         return True
     except Exception as e:
@@ -805,15 +770,11 @@ def regenerate_tape_code(
     """
     Regenerate a tank's tape code after a purpose change.
 
-    Steps:
-      1. Compute new code via modules.id_generator.generate_tape_code(new_purpose)
-      2. Update tanks.location_code + tanks.purpose
-      3. Mirror the new code onto every fish currently in this tank
-         (fish.location), so search + registry stay in sync.
-    Returns (old_code, new_code) or None on failure.
+    The import of generate_tape_code is INSIDE the function on purpose:
+    modules/id_generator.py imports from database.py at module top, so
+    a top-level import here would create a circular import.
 
-    NOTE: Activity logging + tape-rewrite prompt belong to the caller
-    (tank_registry.change_purpose_and_regenerate_code).
+    Returns (old_code, new_code) or None on failure.
     """
     try:
         from modules.id_generator import generate_tape_code
@@ -825,7 +786,6 @@ def regenerate_tape_code(
         old_code = tank.get("location_code") or "?"
         new_code = generate_tape_code(new_purpose)
 
-        # Update tank
         ok = update_tank(tank_id, {
             "location_code": new_code,
             "purpose": new_purpose,
@@ -833,7 +793,6 @@ def regenerate_tape_code(
         if not ok:
             return None
 
-        # Mirror onto any fish occupant rows
         for occ in get_tank_occupants(tank_id):
             if occ.get("occupant_type") == "fish":
                 update_fish(occ["occupant_id"], {"location": new_code})
@@ -1175,17 +1134,14 @@ def get_dashboard_counts() -> dict:
 
         total_tanks = len(tanks)
 
-        # Available = Empty / Idle only (Reserved excluded)
         available_tanks = sum(
             1 for t in tanks
             if (t.get("status") or "").strip() == "Empty / Idle"
         )
-
         reserved_tanks = sum(
             1 for t in tanks
             if (t.get("status") or "").strip() == "Reserved"
         )
-
         occupied_tanks = sum(
             1 for t in tanks
             if (t.get("status") or "").strip() == "Occupied"
