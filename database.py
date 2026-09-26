@@ -8,6 +8,11 @@
 # Session 24C — added died_count to FRY_BATCH_FIELDS.
 # Session 26A — added color_primary, color_secondary, color_palette,
 #               pattern_hint, iridescence_level to FISH_FIELDS.
+# Session 26H.7 — Tank model redesign:
+#   • tank_occupants join table (multi-occupant support)
+#   • reservation fields (reserved_for/reason/until/ref_id)
+#   • "Active" status removed → "Occupied"
+#   • transfer_occupant(), reserve_tank(), cancel_reservation()
 
 from __future__ import annotations
 
@@ -49,7 +54,6 @@ FISH_FIELDS = [
     "photo_id", "qr_id", "location", "tank_id",
     "status", "is_breeder", "breeder_status",
     "notes", "stage",
-    # Session 26A — color analysis
     "color_primary", "color_secondary", "color_palette",
     "pattern_hint", "iridescence_level",
 ]
@@ -136,6 +140,10 @@ def retire_fish(fish_id: str, reason: str = "", extra_notes: str = "") -> bool:
     new_notes = (fish.get("notes") or "").strip()
     new_notes = f"{new_notes} | {tag} {extra_notes}".strip(" |") if new_notes else f"{tag} {extra_notes}".strip()
 
+    # Clear occupants from any tank
+    for occ in get_occupants_for_fish(fish_id):
+        remove_tank_occupant(occ["tank_id"], "fish", fish_id)
+
     ok = update_fish(fish_id, {
         "is_breeder": False,
         "breeder_status": "Retired",
@@ -144,9 +152,6 @@ def retire_fish(fish_id: str, reason: str = "", extra_notes: str = "") -> bool:
         "location": None,
         "tank_id": None,
     })
-
-    if fish.get("tank_id"):
-        update_tank(fish["tank_id"], {"occupant_fish_id": None, "occupant_label": None, "status": "Empty / Idle"})
     return ok
 
 
@@ -189,6 +194,7 @@ TANK_FIELDS = [
     "system_id", "tank_type", "location_code", "capacity_liters",
     "status", "purpose", "occupant_fish_id", "occupant_label",
     "photo_id", "qr_id", "notes",
+    "reserved_for", "reserved_reason", "reserved_until", "reserved_ref_id",
 ]
 
 
@@ -221,7 +227,8 @@ def create_tank(data: dict) -> Optional[dict]:
 
 
 def update_tank(tank_id: str, updates: dict) -> bool:
-    payload = {k: v for k, v in updates.items() if k in TANK_FIELDS or k in ("date_registered",)}
+    payload = {k: v for k, v in updates.items()
+               if k in TANK_FIELDS or k in ("date_registered",)}
     if not payload:
         return False
     try:
@@ -241,22 +248,6 @@ def delete_tank(tank_id: str) -> bool:
         return False
 
 
-def assign_occupant(tank_id: str, fish_id: Optional[str], label: str) -> bool:
-    return update_tank(tank_id, {
-        "occupant_fish_id": fish_id,
-        "occupant_label": label,
-        "status": "Active" if fish_id else "Empty / Idle",
-    })
-
-
-def clear_occupant(tank_id: str) -> bool:
-    return update_tank(tank_id, {
-        "occupant_fish_id": None,
-        "occupant_label": None,
-        "status": "Empty / Idle",
-    })
-
-
 def get_next_tank_sequence() -> str:
     """Sequential integer string ("1", "2", "3", ...)."""
     try:
@@ -266,6 +257,289 @@ def get_next_tank_sequence() -> str:
     except Exception as e:
         st.error(f"get_next_tank_sequence failed: {e}")
         return "1"
+
+
+# ============================================================
+# TANK OCCUPANTS (Session 26H.7 — join table)
+# ============================================================
+
+def get_tank_occupants(tank_id: str) -> list[dict]:
+    """All occupants of a tank."""
+    try:
+        res = (_sb().table("tank_occupants")
+               .select("*")
+               .eq("tank_id", tank_id)
+               .order("added_at")
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_tank_occupants failed: {e}")
+        return []
+
+
+def get_occupants_for_fish(fish_id: str) -> list[dict]:
+    """Find which tank(s) a fish is in."""
+    try:
+        res = (_sb().table("tank_occupants")
+               .select("*")
+               .eq("occupant_type", "fish")
+               .eq("occupant_id", fish_id)
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_occupants_for_fish failed: {e}")
+        return []
+
+
+def get_occupants_for_fry_batch(batch_id: str) -> list[dict]:
+    """Find which tank(s) a fry batch is in."""
+    try:
+        res = (_sb().table("tank_occupants")
+               .select("*")
+               .eq("occupant_type", "fry_batch")
+               .eq("occupant_id", batch_id)
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_occupants_for_fry_batch failed: {e}")
+        return []
+
+
+def add_tank_occupant(
+    tank_id: str,
+    occupant_type: str,
+    occupant_id: str,
+    role: str = "primary",
+    spawn_id: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Add an occupant to a tank.
+    Also updates the denormalized cache on tanks (occupant_fish_id/label)
+    and flips status to Occupied.
+    """
+    try:
+        record = {
+            "tank_id": tank_id,
+            "occupant_type": occupant_type,
+            "occupant_id": occupant_id,
+            "role": role,
+        }
+        if spawn_id:
+            record["spawn_id"] = spawn_id
+
+        res = _sb().table("tank_occupants").insert(record).execute()
+        new_row = (res.data or [None])[0]
+
+        # Refresh cache + status
+        _refresh_tank_cache(tank_id)
+
+        return new_row
+    except Exception as e:
+        st.error(f"add_tank_occupant failed: {e}")
+        return None
+
+
+def remove_tank_occupant(tank_id: str, occupant_type: str, occupant_id: str) -> bool:
+    """Remove an occupant from a tank."""
+    try:
+        (_sb().table("tank_occupants")
+         .delete()
+         .eq("tank_id", tank_id)
+         .eq("occupant_type", occupant_type)
+         .eq("occupant_id", occupant_id)
+         .execute())
+
+        # Refresh cache + status
+        _refresh_tank_cache(tank_id)
+        return True
+    except Exception as e:
+        st.error(f"remove_tank_occupant failed: {e}")
+        return False
+
+
+def _refresh_tank_cache(tank_id: str) -> None:
+    """
+    Recompute occupant_fish_id / occupant_label / status for a tank
+    based on current tank_occupants rows.
+    """
+    try:
+        occupants = get_tank_occupants(tank_id)
+
+        primary_fish_id = None
+        primary_label = None
+        status = "Empty / Idle"
+
+        if occupants:
+            status = "Occupied"
+            # Pick the primary fish (role='primary' or first fish)
+            for occ in occupants:
+                if occ.get("occupant_type") == "fish":
+                    if occ.get("role") == "primary" or primary_fish_id is None:
+                        primary_fish_id = occ["occupant_id"]
+                        break
+
+            if primary_fish_id:
+                fish = get_fish_by_id(primary_fish_id)
+                if fish:
+                    primary_label = (
+                        f"{fish.get('system_id')} | "
+                        f"{fish.get('gender') or ''} | "
+                        f"{fish.get('variety') or ''}"
+                    ).strip(" |")
+            else:
+                # Only fry batches — use first batch label
+                for occ in occupants:
+                    if occ.get("occupant_type") == "fry_batch":
+                        primary_label = f"Fry batch ({occ['occupant_id'][:8]})"
+                        break
+
+        # Preserve reservation status if Reserved
+        current = get_tank_by_id(tank_id)
+        if current and current.get("status") == "Reserved" and not occupants:
+            status = "Reserved"
+
+        update_tank(tank_id, {
+            "occupant_fish_id": primary_fish_id,
+            "occupant_label": primary_label,
+            "status": status,
+        })
+    except Exception as e:
+        st.error(f"_refresh_tank_cache failed: {e}")
+
+
+def transfer_occupant(
+    fish_id: str,
+    from_tank_id: Optional[str],
+    to_tank_id: str,
+    role: str = "primary",
+) -> bool:
+    """
+    Move a fish from one tank to another.
+    Removes from old, adds to new, mirrors fish.location + tank_id.
+    """
+    try:
+        # Remove from old
+        if from_tank_id:
+            remove_tank_occupant(from_tank_id, "fish", fish_id)
+
+        # Add to new
+        add_tank_occupant(to_tank_id, "fish", fish_id, role=role)
+
+        # Mirror to fish
+        new_tank = get_tank_by_id(to_tank_id)
+        loc = new_tank.get("location_code") if new_tank else None
+        update_fish(fish_id, {"tank_id": to_tank_id, "location": loc})
+        return True
+    except Exception as e:
+        st.error(f"transfer_occupant failed: {e}")
+        return False
+
+
+# ============================================================
+# TANK RESERVATIONS (Session 26H.7)
+# ============================================================
+
+def reserve_tank(
+    tank_id: str,
+    reason: str,
+    reserved_for: Optional[str] = None,
+    reserved_until: Optional[str] = None,
+    reserved_ref_id: Optional[str] = None,
+) -> bool:
+    """
+    Set a reservation on a tank.
+    Cannot reserve a tank that already has occupants.
+    """
+    try:
+        tank = get_tank_by_id(tank_id)
+        if not tank:
+            return False
+
+        occupants = get_tank_occupants(tank_id)
+        if occupants:
+            st.error(f"Cannot reserve — tank has {len(occupants)} occupant(s).")
+            return False
+
+        updates = {
+            "status": "Reserved",
+            "reserved_for": reserved_for,
+            "reserved_reason": reason,
+            "reserved_until": reserved_until,
+            "reserved_ref_id": reserved_ref_id,
+        }
+        return update_tank(tank_id, updates)
+    except Exception as e:
+        st.error(f"reserve_tank failed: {e}")
+        return False
+
+
+def cancel_reservation(tank_id: str) -> bool:
+    """Clear reservation and flip to Empty / Idle."""
+    try:
+        return update_tank(tank_id, {
+            "status": "Empty / Idle",
+            "reserved_for": None,
+            "reserved_reason": None,
+            "reserved_until": None,
+            "reserved_ref_id": None,
+        })
+    except Exception as e:
+        st.error(f"cancel_reservation failed: {e}")
+        return False
+
+
+def move_reservation(from_tank_id: str, to_tank_id: str) -> bool:
+    """Move a reservation from one tank to another."""
+    try:
+        src = get_tank_by_id(from_tank_id)
+        if not src or src.get("status") != "Reserved":
+            st.error("Source tank is not Reserved.")
+            return False
+
+        dst = get_tank_by_id(to_tank_id)
+        if not dst:
+            return False
+        if get_tank_occupants(to_tank_id):
+            st.error("Destination tank is occupied — cannot move reservation.")
+            return False
+
+        # Copy reservation fields
+        update_tank(to_tank_id, {
+            "status": "Reserved",
+            "reserved_for": src.get("reserved_for"),
+            "reserved_reason": src.get("reserved_reason"),
+            "reserved_until": src.get("reserved_until"),
+            "reserved_ref_id": src.get("reserved_ref_id"),
+        })
+
+        # Clear source
+        cancel_reservation(from_tank_id)
+        return True
+    except Exception as e:
+        st.error(f"move_reservation failed: {e}")
+        return False
+
+
+def get_expiring_reservations(days_ahead: int = 3) -> list[dict]:
+    """
+    Reservations whose reserved_until is within `days_ahead` days
+    or already past.
+    """
+    try:
+        today = _dt.date.today()
+        cutoff = today + _dt.timedelta(days=days_ahead)
+
+        res = (_sb().table("tanks")
+               .select("*")
+               .eq("status", "Reserved")
+               .not_.is_("reserved_until", "null")
+               .lte("reserved_until", cutoff.isoformat())
+               .execute())
+
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_expiring_reservations failed: {e}")
+        return []
 
 
 # ============================================================
@@ -572,10 +846,7 @@ def delete_milestone(milestone_id: str) -> bool:
 
 
 def get_milestone_counts_by_fish() -> dict:
-    """
-    Returns { fish_id: count } for all fish that have milestones.
-    Single round-trip for the list view.
-    """
+    """Returns { fish_id: count } for all fish that have milestones."""
     try:
         res = _sb().table("fish_milestones").select("fish_id").execute()
         counts: dict[str, int] = {}
@@ -590,20 +861,32 @@ def get_milestone_counts_by_fish() -> dict:
 
 
 # ============================================================
-# DASHBOARD AGGREGATES (single round-trip)
+# DASHBOARD AGGREGATES
 # ============================================================
 
 def get_dashboard_counts() -> dict:
-    """Returns the 6 KPI numbers the dashboard needs in one call."""
+    """Returns the KPI numbers the dashboard needs in one call."""
     try:
         fish = _sb().table("fish").select("id,is_breeder,breeder_status,status,gender").execute().data or []
         tanks = _sb().table("tanks").select("id,status").execute().data or []
         spawns = _sb().table("spawns").select("id,status").execute().data or []
 
         total_tanks = len(tanks)
+
+        # Available = Empty / Idle only (Reserved excluded)
         available_tanks = sum(
             1 for t in tanks
-            if (t.get("status") or "").lower() in ("empty / idle", "empty", "idle", "available", "ready")
+            if (t.get("status") or "").lower() in ("empty / idle", "empty", "idle")
+        )
+
+        reserved_tanks = sum(
+            1 for t in tanks
+            if (t.get("status") or "").lower() == "reserved"
+        )
+
+        occupied_tanks = sum(
+            1 for t in tanks
+            if (t.get("status") or "").lower() == "occupied"
         )
 
         total_breeders = sum(1 for f in fish if f.get("is_breeder"))
@@ -619,6 +902,8 @@ def get_dashboard_counts() -> dict:
         return {
             "total_tanks": total_tanks,
             "available_tanks": available_tanks,
+            "reserved_tanks": reserved_tanks,
+            "occupied_tanks": occupied_tanks,
             "total_breeders": total_breeders,
             "male_breeders": males,
             "female_breeders": females,
