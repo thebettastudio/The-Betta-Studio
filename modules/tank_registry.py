@@ -3,25 +3,21 @@
 # Session 7 — Tank registry ported to Supabase.
 #
 # Session 26H.7 — Step 3 (this revision):
-#   • VALID_STATUSES now re-exported from database.py (5-value canonical list,
+#   • VALID_STATUSES re-exported from database.py (5-value canonical list,
 #     "Reserved" added, "Active" removed).
-#   • New occupant API:
-#       add_occupant_to_tank(), add_fry_batch_to_tank(), remove_occupant(),
-#       transfer_occupant()
-#   • New reservation API:
-#       reserve_tank(), cancel_reservation(), move_reservation()
-#   • New safe-delete:
-#       delete_tank_safely() — blocks occupied deletes unless transfers given
+#   • New occupant API: add_occupant_to_tank(), add_fry_batch_to_tank(),
+#     remove_occupant(), transfer_occupant().
+#   • New reservation API: reserve_tank(), cancel_reservation(),
+#     move_reservation(), get_expiring().
+#   • New safe-delete: delete_tank_safely() — blocks occupied deletes
+#     unless transfers are supplied.
 #   • New purpose change with tape regen:
-#       change_purpose_and_regenerate_code()
-#   • list_available_tanks() — Reserved is now excluded from availability.
+#     change_purpose_and_regenerate_code().
+#   • list_available_tanks() — Reserved excluded from availability.
 #   • get_tank_stats() — includes 'reserved'.
-#   • Backward-compat preserved:
-#       assign_fish_to_tank(), unassign_tank(), set_tank_status(),
-#       register_tank(), edit_tank(), delete_tank_and_media()
-#     All existing callers (views/tank_view.py, views/fish_registry_view.py,
-#     views/spawn_view.py, views/fry_batch_view.py, modules/spawn_manager.py,
-#     modules/fry_batch_manager.py) keep working.
+#   • Backward-compat preserved: assign_fish_to_tank(), unassign_tank(),
+#     set_tank_status(), register_tank(), edit_tank(),
+#     delete_tank_and_media().
 
 from __future__ import annotations
 
@@ -37,7 +33,7 @@ from database import (
     create_tank,
     update_tank,
     delete_tank,
-    delete_tank_safely,
+    delete_tank_safely_impl,
     # occupants
     assign_occupant,
     clear_occupant,
@@ -129,8 +125,7 @@ def list_available_tanks(
     Tanks that are Empty / Idle. Reserved tanks are EXCLUDED (Q2 rule:
     Available = Empty / Idle only).
 
-    include_active=True additionally includes Occupied tanks
-    (kept for backward-compat; prefer explicit status filters in new code).
+    include_active=True additionally includes Occupied tanks.
     """
     out = []
     allowed = {"Empty / Idle"}
@@ -158,9 +153,7 @@ def list_tanks_by_purpose(purpose: str) -> list[dict]:
 
 def get_tank_dropdown_items(purpose: Optional[str] = None) -> list[dict]:
     """
-    Dropdown items for spawning / assignment UIs.
-    Reserved tanks are excluded (they're spoken for).
-    Each item: {'id': uuid, 'label': '📍 JAR-0007 (Empi Glass/Jar)'}
+    Dropdown items for spawning / assignment UIs. Reserved tanks excluded.
     """
     out = []
     for t in list_available_tanks(purpose=purpose):
@@ -206,25 +199,14 @@ def register_tank(
     current_occupant_id: Optional[str] = None,
     notes: str = "",
 ) -> Optional[dict]:
-    """
-    Register a new tank.
-
-    - system_id is auto-generated (T00001)
-    - location_code (tape code) is auto-generated from PURPOSE
-      e.g. 'Jarring' -> JAR-0001, 'Spawning' -> SPN-0003
-    - status auto-detects from occupant
-    - Photo upload goes to Drive via photo_service
-    - QR code generated + uploaded to Drive
-    """
+    """Register a new tank. Auto-generates system_id + tape code."""
     system_id = generate_tank_system_id()
     location_code = generate_tape_code(purpose)
 
-    # Photo
     photo_id = None
     if photo_file is not None:
         photo_id = upload_photo(photo_file, entity_type="tank", entity_id=system_id)
 
-    # QR
     qr_id = None
     try:
         qr_bytes = _make_qr_png(location_code)
@@ -232,7 +214,6 @@ def register_tank(
     except Exception as e:
         st.warning(f"QR generation failed: {e}")
 
-    # Occupant + status
     occupant_id = current_occupant_id or None
     occupant_label = None
     status = "Empty / Idle"
@@ -258,7 +239,6 @@ def register_tank(
 
     saved = create_tank(record)
     if saved:
-        # If we set an occupant, also add the join row + mirror to fish
         if occupant_id:
             add_tank_occupant(saved["id"], "fish", occupant_id, role="primary")
             update_fish_location(occupant_id, location_code)
@@ -279,8 +259,8 @@ def register_tank(
 def edit_tank(tank_id: str, updates: dict) -> bool:
     """
     Update tank fields. If photo_file in updates, replaces photo.
-    NOTE: for a purpose change that should regenerate the tape code, use
-    change_purpose_and_regenerate_code() instead.
+    NOTE: for a purpose change that should regenerate the tape code,
+    use change_purpose_and_regenerate_code() instead.
     """
     photo_file = updates.pop("photo_file", None)
     if photo_file is not None:
@@ -306,10 +286,8 @@ def edit_tank(tank_id: str, updates: dict) -> bool:
 def change_purpose_and_regenerate_code(tank_id: str, new_purpose: str) -> Optional[tuple[str, str]]:
     """
     Change a tank's purpose and regenerate its tape code (Q4, Option C).
-
     Returns (old_code, new_code) or None on failure.
-    The caller (UI) is responsible for showing the warning modal + tape-rewrite
-    reminder. This function only performs the DB writes + activity log.
+    The caller (UI) shows the warning modal + tape-rewrite reminder.
     """
     tank = get_tank_by_id(tank_id)
     if not tank:
@@ -338,9 +316,7 @@ def change_purpose_and_regenerate_code(tank_id: str, new_purpose: str) -> Option
 
 
 def set_tank_status(tank_id: str, new_status: str) -> bool:
-    """
-    Change status. Does NOT auto-sync occupant — use assign/clear for that.
-    """
+    """Change status. Does NOT auto-sync occupant."""
     return update_tank(tank_id, {"status": new_status})
 
 
@@ -357,7 +333,7 @@ def add_occupant_to_tank(
 ) -> bool:
     """
     Add a fish or fry_batch occupant to a tank.
-    Auto-cancels any reservation (warning surfaced by database layer via
+    Auto-cancels any reservation (warning surfaced via
     st.session_state['_reservation_warnings']).
     """
     row = add_tank_occupant(
@@ -419,7 +395,7 @@ def remove_occupant(tank_id: str, occupant_type: str, occupant_id: str) -> bool:
     return ok
 
 
-def transfer_occupant_api(
+def transfer_occupant(
     occupant_type: str,
     occupant_id: str,
     from_tank_id: Optional[str],
@@ -427,8 +403,8 @@ def transfer_occupant_api(
     role: str = "primary",
 ) -> bool:
     """
-    Move an occupant to a different tank. Thin wrapper over
-    database.transfer_occupant() that adds the activity log entry.
+    Move an occupant to a different tank.
+    Thin wrapper over database.transfer_occupant() + activity log.
     """
     ok = db_transfer_occupant(
         fish_id=occupant_id,
@@ -451,14 +427,9 @@ def transfer_occupant_api(
 
 
 # ---------- Backward-compat occupant API ----------
-# Views + modules still call these names. Keep them forever or until
-# Step 5/7 explicitly rewrites callers.
 
 def assign_fish_to_tank(tank_id: str, fish_id: str) -> bool:
-    """
-    Assign a fish to a tank. Backward-compat wrapper over
-    add_occupant_to_tank(occupant_type='fish').
-    """
+    """Assign a fish to a tank. Wrapper over add_occupant_to_tank."""
     fish = get_fish_by_id(fish_id)
     if not fish:
         st.error(f"Fish {fish_id} not found.")
@@ -478,10 +449,7 @@ def assign_fish_to_tank(tank_id: str, fish_id: str) -> bool:
 
 
 def unassign_tank(tank_id: str) -> bool:
-    """
-    Remove ALL occupants from a tank. Backward-compat wrapper over
-    database.clear_occupant().
-    """
+    """Remove ALL occupants from a tank. Wrapper over database.clear_occupant()."""
     tank = get_tank_by_id(tank_id)
     if not tank:
         return False
@@ -498,7 +466,7 @@ def unassign_tank(tank_id: str) -> bool:
 
 
 # ============================================================
-# RESERVATION API (delegating)
+# RESERVATION API
 # ============================================================
 
 def reserve_tank(
@@ -586,9 +554,8 @@ def delete_tank_safely(
     if not tank:
         return False, "Tank not found."
 
-    ok, msg = delete_tank_safely_db(tank_id, transfers=transfers)
+    ok, msg = delete_tank_safely_impl(tank_id, transfers=transfers)
     if ok:
-        # Delete Drive media (best effort)
         for f_id in (tank.get("photo_id"), tank.get("qr_id")):
             if f_id:
                 delete_drive_file(f_id)
@@ -601,20 +568,13 @@ def delete_tank_safely(
     return ok, msg
 
 
-# We imported delete_tank_safely from database as the same name; give it
-# a local alias so we can call it without shadowing this function name.
-from database import delete_tank_safely as delete_tank_safely_db  # noqa: E402
-
-
 # ---------- Backward-compat delete ----------
 
 def delete_tank_and_media(tank_id: str) -> bool:
     """
     Legacy delete path used by views/tank_view.py.
-    For an occupied tank this now BLOCKS (Q3 Option D) — the view must
-    be updated (Step 4) to route through delete_tank_safely() with a
-    transfer dialog. Until then this wrapper refuses occupied deletes
-    rather than orphaning fish.
+    Occupied tanks are now BLOCKED (Q3 Option D). Step 4 will route
+    this through delete_tank_safely() with a transfer dialog.
     """
     occupants = get_tank_occupants(tank_id)
     if occupants:
@@ -646,7 +606,7 @@ def _fish_label(fish: dict) -> str:
 
 
 def _make_qr_png(data: str):
-    """Generate a QR code PNG as bytes. Matches old box_size/border for printed labels."""
+    """Generate a QR code PNG as bytes."""
     import io
     import qrcode
     qr = qrcode.QRCode(
