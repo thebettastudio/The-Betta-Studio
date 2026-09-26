@@ -13,6 +13,17 @@
 # Session 26C — Added video upload (auto frame scan).
 # Session 26D fix — Better video UX + best frame handling.
 # Session 26D round 2 — Stronger framing warning banner.
+#
+# Session 26H.7 — Step 5 (this revision):
+#   • ⭐ Star toggle in Manage popover (writes is_starred + starred_reason)
+#   • ⭐ badge on grid tiles + ⭐ column in table view
+#   • "⭐ Show starred only" filter checkbox
+#   • Tank assignment via new API:
+#       - register form uses get_tank_dropdown_items()
+#       - register submit uses add_occupant_to_tank()
+#       - manage popover uses remove_occupant() + add_occupant_to_tank()
+#       - delete fish uses remove_occupant() for each occupant
+#   • Tank badge on tile sourced from tank_occupants (not fish.location)
 
 import io
 import datetime
@@ -46,6 +57,8 @@ from database import (
     get_all_fish,
     get_milestones_for_fish,
     get_milestone_counts_by_fish,
+    get_occupants_for_fish,
+    get_tank_by_id,
 )
 from modules.fish_manager import (
     register_new_fish,
@@ -64,10 +77,10 @@ from modules.fish_manager import (
     _fish_label,
 )
 from modules.tank_registry import (
-    list_available_tanks,
+    get_tank_dropdown_items,
+    add_occupant_to_tank,
+    remove_occupant,
     find_tank,
-    assign_fish_to_tank,
-    unassign_tank,
 )
 from modules.id_generator import generate_fish_id
 from modules.photo_service import upload_photo, photo_url
@@ -216,15 +229,26 @@ def _delete_strain(name: str) -> bool:
 # TANK HELPERS
 # ============================================================
 
-def _tank_label(t: dict) -> str:
-    loc = t.get("location_code") or "?"
-    sysid = t.get("system_id") or t["id"]
-    ttype = t.get("tank_type") or ""
-    return f"{loc} ({sysid} | {ttype})"
-
-
 def _get_available_tank_options() -> list[dict]:
-    return [{"id": t["id"], "label": _tank_label(t)} for t in list_available_tanks()]
+    """Tank dropdown via the new registry API (Reserved excluded)."""
+    return get_tank_dropdown_items()
+
+
+def _get_current_tank_for_fish(fish_id: str) -> Optional[dict]:
+    """
+    Look up the tank a fish is currently in via tank_occupants (source of truth).
+    Returns the tank row or None.
+    """
+    try:
+        occupants = get_occupants_for_fish(fish_id)
+    except Exception:
+        return None
+    if not occupants:
+        return None
+    tank_id = occupants[0].get("tank_id")
+    if not tank_id:
+        return None
+    return get_tank_by_id(tank_id)
 
 
 # ============================================================
@@ -702,17 +726,7 @@ def render_register_tab():
         with col2:
             st.markdown("##### 🪣 Tank & Container Assignment")
             tank_opts = _get_available_tank_options()
-            tank_types = sorted({t["label"].split(" | ")[-1].rstrip(")") for t in tank_opts})
-            type_filter_options = ["All Types"] + tank_types
-
-            selected_type_filter = st.selectbox("Filter Tank Type", options=type_filter_options, key=f"ttype_{form_version}")
-
-            if selected_type_filter != "All Types":
-                filtered = [t for t in tank_opts if selected_type_filter in t["label"]]
-            else:
-                filtered = tank_opts
-
-            tank_dropdown = [{"id": None, "label": "Leave Unassigned"}] + filtered
+            tank_dropdown = [{"id": None, "label": "Leave Unassigned"}] + tank_opts
             selected_tank_idx = st.selectbox(
                 "Select Available Tank / Jar Location",
                 options=range(len(tank_dropdown)),
@@ -843,8 +857,9 @@ def render_register_tab():
     if patch:
         edit_fish(result["id"], patch)
 
+    # Tank assignment via new API
     if selected_tank_id:
-        assign_fish_to_tank(selected_tank_id, result["id"])
+        add_occupant_to_tank(selected_tank_id, "fish", result["id"], role="primary")
 
     st.session_state.pop("fish_photo_bytes", None)
     st.session_state.pop("fish_photo_raw", None)
@@ -854,6 +869,57 @@ def render_register_tab():
     st.balloons()
     st.success(f"🎉 Fish **#{result.get('system_id')}** registered!" + (" Colors saved." if color_primary else ""))
     st.rerun()
+
+
+# ============================================================
+# ⭐ STARRING
+# ============================================================
+
+def _render_star_section(fish: dict):
+    """
+    Inline star toggle inside the Manage popover.
+    Writes fish.is_starred + fish.starred_reason.
+    """
+    fish_uuid = fish["id"]
+    system_id = fish.get("system_id") or "?"
+    is_starred = bool(fish.get("is_starred"))
+    current_reason = fish.get("starred_reason") or ""
+
+    st.markdown("**⭐ Starring**")
+    st.caption("Star a fish to mark it as special / high-expectation. "
+               "The tank holding it will show a ⭐ automatically.")
+
+    new_starred = st.checkbox(
+        "Star this fish",
+        value=is_starred,
+        key=f"star_chk_{fish_uuid}",
+    )
+
+    new_reason = ""
+    if new_starred:
+        new_reason = st.text_input(
+            "Reason (optional)",
+            value=current_reason,
+            placeholder="e.g. Top caudal, promising line, breeder candidate",
+            key=f"star_reason_{fish_uuid}",
+        )
+
+    if st.button(
+        "Update Star",
+        key=f"star_save_{fish_uuid}",
+        type="primary",
+        use_container_width=True,
+    ):
+        ok = edit_fish(fish_uuid, {
+            "is_starred": new_starred,
+            "starred_reason": new_reason.strip() if new_starred else None,
+        })
+        if ok:
+            if new_starred:
+                st.success(f"⭐ {system_id} starred.")
+            else:
+                st.success(f"{system_id} unstarred.")
+            st.rerun()
 
 
 # ============================================================
@@ -1012,6 +1078,10 @@ def _render_card_actions(fish: dict):
     system_id = fish.get("system_id") or "?"
     current_status = (fish.get("status") or "").lower()
 
+    # ⭐ Star section at top
+    _render_star_section(fish)
+    st.divider()
+
     if st.button("🌳 View Lineage", key=f"lineage_{fish_uuid}", use_container_width=True):
         st.session_state["lineage_fish_id"] = fish_uuid
         st.toast(f"Selected {system_id}. Open the Lineage page to view the tree.")
@@ -1055,28 +1125,63 @@ def _render_card_actions(fish: dict):
                     st.success(f"{system_id} culled.")
                     st.rerun()
 
+    # Tank move via new API
     if current_status not in ("culled", "deceased", "retired"):
+        current_tank = _get_current_tank_for_fish(fish_uuid)
+        current_tank_id = current_tank.get("id") if current_tank else None
+        current_tank_loc = current_tank.get("location_code") if current_tank else None
+
         tank_opts = _get_available_tank_options()
-        if tank_opts:
-            dd = [{"id": None, "label": "— Leave / Clear Tank —"}] + tank_opts
-            selected_idx = st.selectbox(
-                "Move to Tank",
-                options=range(len(dd)),
-                format_func=lambda i: dd[i]["label"],
-                key=f"move_tank_{fish_uuid}",
-            )
-            new_tank_id = dd[selected_idx]["id"]
-            if st.button("📦 Apply Move", key=f"apply_move_{fish_uuid}", use_container_width=True):
-                if fish.get("tank_id"):
-                    unassign_tank(fish["tank_id"])
-                if new_tank_id:
-                    assign_fish_to_tank(new_tank_id, fish_uuid)
+        dd = [{"id": None, "label": "— Leave / Clear Tank —"}] + tank_opts
+
+        # Default index = current tank if present
+        default_idx = 0
+        if current_tank_id:
+            for i, t in enumerate(dd):
+                if t["id"] == current_tank_id:
+                    default_idx = i
+                    break
+
+        if current_tank_loc:
+            st.caption(f"🪣 Currently in: **{current_tank_loc}**")
+
+        selected_idx = st.selectbox(
+            "Move to Tank",
+            options=range(len(dd)),
+            index=default_idx,
+            format_func=lambda i: dd[i]["label"],
+            key=f"move_tank_{fish_uuid}",
+        )
+        new_tank_id = dd[selected_idx]["id"]
+
+        if st.button("📦 Apply Move", key=f"apply_move_{fish_uuid}", use_container_width=True):
+            moved = False
+            # Remove from current tank(s)
+            try:
+                for occ in get_occupants_for_fish(fish_uuid):
+                    remove_occupant(occ["tank_id"], "fish", fish_uuid)
+                    moved = True
+            except Exception:
+                pass
+            # Add to new (if any)
+            if new_tank_id:
+                if add_occupant_to_tank(new_tank_id, "fish", fish_uuid, role="primary"):
+                    moved = True
+            if moved:
                 st.success("Location updated.")
                 st.rerun()
+            else:
+                st.info("No change.")
 
     st.divider()
     confirm = st.checkbox("Confirm delete (removes fish + Drive photo)", key=f"del_confirm_{fish_uuid}")
     if st.button("🔥 Delete Fish", key=f"del_btn_{fish_uuid}", disabled=not confirm, use_container_width=True):
+        # Clear tank occupants first
+        try:
+            for occ in get_occupants_for_fish(fish_uuid):
+                remove_occupant(occ["tank_id"], "fish", fish_uuid)
+        except Exception:
+            pass
         if delete_fish_and_photos(fish_uuid):
             st.success(f"{system_id} deleted.")
             st.rerun()
@@ -1166,6 +1271,8 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
     system_id = fish.get("system_id") or "?"
     status = (fish.get("status") or "Active").lower()
     is_culled = status in ("culled", "deceased")
+    is_starred = bool(fish.get("is_starred"))
+    star_marker = "⭐ " if is_starred else ""
 
     badge_bg = grade_badge_color(fish.get("grade"))
     badge_fg = grade_badge_text_color(fish.get("grade"))
@@ -1187,7 +1294,10 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
             unsafe_allow_html=True,
         )
 
-        st.markdown(f"**{system_id}** · {gender_sym} {fish.get('variety') or '—'}")
+        st.markdown(f"**{star_marker}{system_id}** · {gender_sym} {fish.get('variety') or '—'}")
+
+        if is_starred and fish.get("starred_reason"):
+            st.caption(f"⭐ *{fish['starred_reason']}*")
 
         swatch_html = _color_swatch_row(fish)
         if swatch_html:
@@ -1202,8 +1312,12 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
             badges.append("⛔ Culled")
         if fish.get("iridescence_level") and fish["iridescence_level"] != "none":
             badges.append(f"✨ {fish['iridescence_level']}")
-        if fish.get("location"):
-            badges.append(f"🪣 {fish['location']}")
+
+        # Tank badge via join table
+        current_tank = _get_current_tank_for_fish(fish["id"])
+        if current_tank and current_tank.get("location_code"):
+            badges.append(f"🪣 {current_tank['location_code']}")
+
         if badges:
             st.caption(" · ".join(badges))
 
@@ -1225,7 +1339,12 @@ def _render_table_view(filtered: list[dict], milestone_counts: dict):
         age_days = get_fish_age_days(f)
         palette = f.get("color_palette") or {}
         palette_str = ", ".join(f"{k} {v:.0f}%" for k, v in sorted(palette.items(), key=lambda x: -x[1])[:3])
+
+        current_tank = _get_current_tank_for_fish(f["id"])
+        tank_loc = current_tank.get("location_code") if current_tank else "—"
+
         rows.append({
+            "⭐": "⭐" if f.get("is_starred") else "",
             "ID": f.get("system_id") or "?",
             "Gender": f.get("gender") or "—",
             "Variety": f.get("variety") or "—",
@@ -1234,7 +1353,7 @@ def _render_table_view(filtered: list[dict], milestone_counts: dict):
             "Gen": f.get("generation") or "—",
             "Colors": palette_str or "—",
             "Irid.": f.get("iridescence_level") or "—",
-            "Location": f.get("location") or "—",
+            "Location": tank_loc,
             "Status": f.get("status") or "—",
             "Age": format_fish_age(age_days),
             "Milestones": milestone_counts.get(f["id"], 0),
@@ -1244,6 +1363,7 @@ def _render_table_view(filtered: list[dict], milestone_counts: dict):
         use_container_width=True,
         hide_index=True,
         column_config={
+            "⭐": st.column_config.TextColumn("⭐", width="small"),
             "Milestones": st.column_config.NumberColumn("📸", width="small"),
             "Age": st.column_config.TextColumn("Age", width="small"),
         },
@@ -1271,11 +1391,14 @@ def render_list_tab():
         f for f in all_fish
         if (f.get("status") or "").lower() not in ("culled", "deceased")
     ]
-    m1, m2, m3, m4 = st.columns(4)
+    starred_count = sum(1 for f in all_fish if f.get("is_starred"))
+
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Total Fish", len(all_fish))
     m2.metric("Alive", len(alive))
     m3.metric("Males", sum(1 for f in alive if (f.get("gender") or "").lower() == "male"))
     m4.metric("Females", sum(1 for f in alive if (f.get("gender") or "").lower() == "female"))
+    m5.metric("⭐ Starred", starred_count)
 
     st.divider()
 
@@ -1311,7 +1434,12 @@ def render_list_tab():
         horizontal=True,
         label_visibility="collapsed",
     )
-    hide_culled = st.checkbox("Hide culled & deceased", value=True)
+
+    chk_col1, chk_col2 = st.columns(2)
+    with chk_col1:
+        hide_culled = st.checkbox("Hide culled & deceased", value=True)
+    with chk_col2:
+        starred_only = st.checkbox("⭐ Show starred only", key="fish_starred_only")
 
     filtered = all_fish
     if gender_filter:
@@ -1324,6 +1452,8 @@ def render_list_tab():
         filtered = [f for f in filtered if f.get("iridescence_level") in iri_filter]
     if hide_culled:
         filtered = [f for f in filtered if (f.get("status") or "").lower() not in ("culled", "deceased")]
+    if starred_only:
+        filtered = [f for f in filtered if f.get("is_starred")]
 
     st.caption(f"Showing {len(filtered)} of {len(all_fish)} fish.")
     st.markdown("---")
