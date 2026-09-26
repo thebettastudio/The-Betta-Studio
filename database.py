@@ -1,442 +1,504 @@
-# database.py
-# Betta Farm Management System — Supabase wrapper
-# Session 3  — replaces all Google Sheets access.
-# Session 11 — added delete_strain().
-# Session 15 — added fry batch read/delete helpers.
-# Session 20 — added fish_milestones CRUD.
-# Session 22 — added culled_count + female_count to FRY_BATCH_FIELDS.
-# Session 24C — added died_count to FRY_BATCH_FIELDS.
-# Session 26A — added color_primary, color_secondary, color_palette,
-#               pattern_hint, iridescence_level to FISH_FIELDS.
-# Session 26H.7 — Tank model redesign:
-#   • tank_occupants join table (multi-occupant support)
-#   • reservation fields (reserved_for/reason/until/ref_id)
-#   • "Active" status removed → "Occupied"
-#   • transfer_occupant(), reserve_tank(), cancel_reservation()
+# modules/tank_registry.py
+# Betta Farm Management System
+# Session 7 — Tank registry ported to Supabase.
+#
+# Session 26H.7 — Step 3 (this revision):
+#   • VALID_STATUSES now re-exported from database.py (5-value canonical list,
+#     "Reserved" added, "Active" removed).
+#   • New occupant API:
+#       add_occupant_to_tank(), add_fry_batch_to_tank(), remove_occupant(),
+#       transfer_occupant()
+#   • New reservation API:
+#       reserve_tank(), cancel_reservation(), move_reservation()
+#   • New safe-delete:
+#       delete_tank_safely() — blocks occupied deletes unless transfers given
+#   • New purpose change with tape regen:
+#       change_purpose_and_regenerate_code()
+#   • list_available_tanks() — Reserved is now excluded from availability.
+#   • get_tank_stats() — includes 'reserved'.
+#   • Backward-compat preserved:
+#       assign_fish_to_tank(), unassign_tank(), set_tank_status(),
+#       register_tank(), edit_tank(), delete_tank_and_media()
+#     All existing callers (views/tank_view.py, views/fish_registry_view.py,
+#     views/spawn_view.py, views/fry_batch_view.py, modules/spawn_manager.py,
+#     modules/fry_batch_manager.py) keep working.
 
 from __future__ import annotations
 
-import datetime as _dt
 from typing import Optional
 
 import streamlit as st
-from supabase import create_client, Client
 
-from modules.supabase_client import get_supabase_client
+from database import (
+    # reads
+    get_all_tanks,
+    get_tank_by_id,
+    # create / update / delete
+    create_tank,
+    update_tank,
+    delete_tank,
+    delete_tank_safely,
+    # occupants
+    assign_occupant,
+    clear_occupant,
+    add_tank_occupant,
+    remove_tank_occupant,
+    transfer_occupant as db_transfer_occupant,
+    get_tank_occupants,
+    # reservations
+    reserve_tank as db_reserve_tank,
+    cancel_reservation as db_cancel_reservation,
+    move_reservation as db_move_reservation,
+    get_expiring_reservations,
+    # tape code
+    regenerate_tape_code as db_regenerate_tape_code,
+    # other
+    get_all_fish,
+    get_fish_by_id,
+    log_activity,
+    VALID_STATUSES as DB_VALID_STATUSES,
+)
+from modules.id_generator import (
+    generate_tank_system_id,
+    generate_tape_code,
+    get_tank_prefix_for_purpose,
+    all_purposes,
+)
+from modules.photo_service import upload_photo, upload_qr, delete_drive_file
 
 
 # ============================================================
-# HELPERS
+# VALID VALUES
 # ============================================================
 
-def _sb() -> Client:
-    """Returns the shared Supabase client."""
-    return get_supabase_client()
+VALID_TANK_TYPES = [
+    "Grow-Out Planggana (Large)",
+    "Spawning Planggana (Small)",
+    "6-Liter Water Bottle",
+    "Empi Glass/Jar",
+    "Glass Aquarium",
+    "Sorority Basin",
+    "Quarantine Jar",
+    "Custom",
+]
 
+# Re-exported for backward compat (views import VALID_STATUSES from here).
+# Canonical list lives in database.py.
+VALID_STATUSES = DB_VALID_STATUSES
 
-def _today_iso() -> str:
-    return _dt.date.today().isoformat()
-
-
-def _now_iso() -> str:
-    return _dt.datetime.now().isoformat(timespec="seconds")
-
-
-# ============================================================
-# FISH
-# ============================================================
-
-FISH_FIELDS = [
-    "system_id", "origin", "batch_id", "line_code", "generation",
-    "sire_id", "dam_id", "gender", "variety", "strain", "form_type",
-    "grade", "body_shape", "form_score", "fin_checks",
-    "seller", "purchase_date", "purchase_cost",
-    "photo_id", "qr_id", "location", "tank_id",
-    "status", "is_breeder", "breeder_status",
-    "notes", "stage",
-    "color_primary", "color_secondary", "color_palette",
-    "pattern_hint", "iridescence_level",
+VALID_PURPOSES = [
+    "Jarring",
+    "Conditioning",
+    "Spawning",
+    "Fry Nursery",
+    "Grow-Out",
+    "Sorority",
+    "Quarantine",
+    "Sales Display",
+    "Storage",
+    "Other",
 ]
 
 
-def get_all_fish() -> list[dict]:
-    """Return every fish row, newest first."""
-    try:
-        res = _sb().table("fish").select("*").order("created_at", desc=True).execute()
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_all_fish failed: {e}")
-        return []
+# ============================================================
+# READ
+# ============================================================
+
+def list_all_tanks() -> list[dict]:
+    return get_all_tanks()
 
 
-def get_fish_by_id(fish_id: str) -> Optional[dict]:
-    """Fetch one fish by its uuid."""
-    try:
-        res = _sb().table("fish").select("*").eq("id", fish_id).limit(1).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"get_fish_by_id failed: {e}")
+def find_tank(identifier: str) -> Optional[dict]:
+    """Look up by uuid, system_id, or location_code."""
+    if not identifier:
         return None
+    ident = str(identifier).strip()
+    for t in get_all_tanks():
+        if t.get("id") == ident or \
+           t.get("system_id") == ident or \
+           t.get("location_code") == ident:
+            return t
+    return None
 
 
-def get_fish_by_system_id(system_id: str) -> Optional[dict]:
-    """Fetch one fish by its human-readable ID (e.g. FISH-0042)."""
+def list_available_tanks(
+    purpose: Optional[str] = None,
+    include_active: bool = False,
+) -> list[dict]:
+    """
+    Tanks that are Empty / Idle. Reserved tanks are EXCLUDED (Q2 rule:
+    Available = Empty / Idle only).
+
+    include_active=True additionally includes Occupied tanks
+    (kept for backward-compat; prefer explicit status filters in new code).
+    """
+    out = []
+    allowed = {"Empty / Idle"}
+    if include_active:
+        allowed |= {"Occupied"}
+
+    for t in get_all_tanks():
+        status = (t.get("status") or "").strip()
+        if status not in allowed:
+            continue
+        if purpose and (t.get("purpose") or "").strip() != purpose:
+            continue
+        out.append(t)
+    return out
+
+
+def list_reserved_tanks() -> list[dict]:
+    """All tanks currently in the Reserved state."""
+    return [t for t in get_all_tanks() if (t.get("status") or "").strip() == "Reserved"]
+
+
+def list_tanks_by_purpose(purpose: str) -> list[dict]:
+    return [t for t in get_all_tanks() if (t.get("purpose") or "") == purpose]
+
+
+def get_tank_dropdown_items(purpose: Optional[str] = None) -> list[dict]:
+    """
+    Dropdown items for spawning / assignment UIs.
+    Reserved tanks are excluded (they're spoken for).
+    Each item: {'id': uuid, 'label': '📍 JAR-0007 (Empi Glass/Jar)'}
+    """
+    out = []
+    for t in list_available_tanks(purpose=purpose):
+        loc = t.get("location_code") or t.get("system_id")
+        ttype = t.get("tank_type") or ""
+        label = f"📍 {loc}" + (f" ({ttype})" if ttype else "")
+        out.append({
+            "id": t["id"],
+            "system_id": t.get("system_id"),
+            "location_code": loc,
+            "label": label,
+        })
+    return out
+
+
+def get_tank_stats() -> dict:
+    """Dashboard-level counts. Available = Empty / Idle only."""
+    tanks = get_all_tanks()
+
+    def _c(label: str) -> int:
+        return sum(1 for t in tanks if (t.get("status") or "").strip() == label)
+
+    return {
+        "total":     len(tanks),
+        "available": _c("Empty / Idle"),
+        "reserved":  _c("Reserved"),
+        "occupied":  _c("Occupied"),
+        "cleaning":  _c("Cleaning / Quarantine"),
+        "retired":   _c("Retired"),
+    }
+
+
+# ============================================================
+# CREATE
+# ============================================================
+
+def register_tank(
+    *,
+    tank_type: str,
+    capacity_liters: float,
+    purpose: str = "Other",
+    photo_file=None,
+    current_occupant_id: Optional[str] = None,
+    notes: str = "",
+) -> Optional[dict]:
+    """
+    Register a new tank.
+
+    - system_id is auto-generated (T00001)
+    - location_code (tape code) is auto-generated from PURPOSE
+      e.g. 'Jarring' -> JAR-0001, 'Spawning' -> SPN-0003
+    - status auto-detects from occupant
+    - Photo upload goes to Drive via photo_service
+    - QR code generated + uploaded to Drive
+    """
+    system_id = generate_tank_system_id()
+    location_code = generate_tape_code(purpose)
+
+    # Photo
+    photo_id = None
+    if photo_file is not None:
+        photo_id = upload_photo(photo_file, entity_type="tank", entity_id=system_id)
+
+    # QR
+    qr_id = None
     try:
-        res = _sb().table("fish").select("*").eq("system_id", system_id).limit(1).execute()
-        return (res.data or [None])[0]
+        qr_bytes = _make_qr_png(location_code)
+        qr_id = upload_qr(qr_bytes, entity_type="tank", entity_id=system_id)
     except Exception as e:
-        st.error(f"get_fish_by_system_id failed: {e}")
-        return None
+        st.warning(f"QR generation failed: {e}")
+
+    # Occupant + status
+    occupant_id = current_occupant_id or None
+    occupant_label = None
+    status = "Empty / Idle"
+    if occupant_id:
+        fish = get_fish_by_id(occupant_id)
+        if fish:
+            occupant_label = _fish_label(fish)
+            status = "Occupied"
+
+    record = {
+        "system_id": system_id,
+        "tank_type": tank_type,
+        "location_code": location_code,
+        "capacity_liters": float(capacity_liters) if capacity_liters else None,
+        "status": status,
+        "purpose": purpose,
+        "occupant_fish_id": occupant_id,
+        "occupant_label": occupant_label,
+        "photo_id": photo_id,
+        "qr_id": qr_id,
+        "notes": notes,
+    }
+
+    saved = create_tank(record)
+    if saved:
+        # If we set an occupant, also add the join row + mirror to fish
+        if occupant_id:
+            add_tank_occupant(saved["id"], "fish", occupant_id, role="primary")
+            update_fish_location(occupant_id, location_code)
+
+        log_activity(
+            action_type="tank_registered",
+            description=f"Registered {location_code} ({tank_type}, {purpose})",
+            entity_type="tank",
+            entity_id=saved["id"],
+        )
+    return saved
 
 
-def create_fish(data: dict) -> Optional[dict]:
-    """Insert a new fish row. `data` keys must match FISH_FIELDS."""
-    payload = {k: data.get(k) for k in FISH_FIELDS if k in data}
-    try:
-        res = _sb().table("fish").insert(payload).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"create_fish failed: {e}")
-        return None
+# ============================================================
+# UPDATE
+# ============================================================
 
+def edit_tank(tank_id: str, updates: dict) -> bool:
+    """
+    Update tank fields. If photo_file in updates, replaces photo.
+    NOTE: for a purpose change that should regenerate the tape code, use
+    change_purpose_and_regenerate_code() instead.
+    """
+    photo_file = updates.pop("photo_file", None)
+    if photo_file is not None:
+        tank = get_tank_by_id(tank_id)
+        old = tank.get("photo_id") if tank else None
+        new_id = upload_photo(photo_file, entity_type="tank", entity_id=tank_id)
+        if new_id:
+            updates["photo_id"] = new_id
+            if old:
+                delete_drive_file(old)
 
-def update_fish(fish_id: str, updates: dict) -> bool:
-    """Update a fish row by uuid. Only FISH_FIELDS keys are accepted."""
-    payload = {k: v for k, v in updates.items() if k in FISH_FIELDS}
-    if not payload:
-        return False
-    try:
-        _sb().table("fish").update(payload).eq("id", fish_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"update_fish failed: {e}")
-        return False
-
-
-def delete_fish(fish_id: str) -> bool:
-    try:
-        _sb().table("fish").delete().eq("id", fish_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"delete_fish failed: {e}")
-        return False
-
-
-def promote_fish_to_breeder(fish_id: str, breeder_status: str = "Available") -> bool:
-    """Flip is_breeder=true and set breeder_status."""
-    return update_fish(fish_id, {
-        "is_breeder": True,
-        "breeder_status": breeder_status,
-        "status": "Conditioning",
-    })
-
-
-def retire_fish(fish_id: str, reason: str = "", extra_notes: str = "") -> bool:
-    """Retire a breeder — clears tank link, sets status."""
-    fish = get_fish_by_id(fish_id)
-    if not fish:
-        return False
-    tag = f"[Retired: {reason}]" if reason else "[Retired]"
-    new_notes = (fish.get("notes") or "").strip()
-    new_notes = f"{new_notes} | {tag} {extra_notes}".strip(" |") if new_notes else f"{tag} {extra_notes}".strip()
-
-    # Clear occupants from any tank
-    for occ in get_occupants_for_fish(fish_id):
-        remove_tank_occupant(occ["tank_id"], "fish", fish_id)
-
-    ok = update_fish(fish_id, {
-        "is_breeder": False,
-        "breeder_status": "Retired",
-        "status": "Retired",
-        "notes": new_notes,
-        "location": None,
-        "tank_id": None,
-    })
+    ok = update_tank(tank_id, updates)
+    if ok:
+        log_activity(
+            action_type="tank_updated",
+            description=f"Updated fields: {', '.join(updates.keys())}",
+            entity_type="tank",
+            entity_id=tank_id,
+        )
     return ok
 
 
-def get_available_breeders() -> list[dict]:
-    """Active breeders ready for pairing."""
-    try:
-        res = (_sb().table("fish")
-               .select("*")
-               .eq("is_breeder", True)
-               .in_("breeder_status", ["Available", "Conditioning", "Ready", "Idle"])
-               .execute())
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_available_breeders failed: {e}")
-        return []
+def change_purpose_and_regenerate_code(tank_id: str, new_purpose: str) -> Optional[tuple[str, str]]:
+    """
+    Change a tank's purpose and regenerate its tape code (Q4, Option C).
 
-
-def get_next_fish_sequence(prefix: str = "FISH-") -> str:
-    """Generate FISH-NNNN by counting existing system_ids with the prefix."""
-    try:
-        res = _sb().table("fish").select("system_id").like("system_id", f"{prefix}%").execute()
-        nums = []
-        for r in (res.data or []):
-            sid = r.get("system_id") or ""
-            tail = sid.replace(prefix, "").strip()
-            if tail.isdigit():
-                nums.append(int(tail))
-        nxt = (max(nums) + 1) if nums else 1
-        return f"{prefix}{nxt:04d}"
-    except Exception as e:
-        st.error(f"get_next_fish_sequence failed: {e}")
-        return f"{prefix}0001"
-
-
-# ============================================================
-# TANKS
-# ============================================================
-
-TANK_FIELDS = [
-    "system_id", "tank_type", "location_code", "capacity_liters",
-    "status", "purpose", "occupant_fish_id", "occupant_label",
-    "photo_id", "qr_id", "notes",
-    "reserved_for", "reserved_reason", "reserved_until", "reserved_ref_id",
-]
-
-
-def get_all_tanks() -> list[dict]:
-    try:
-        res = _sb().table("tanks").select("*").order("created_at", desc=True).execute()
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_all_tanks failed: {e}")
-        return []
-
-
-def get_tank_by_id(tank_id: str) -> Optional[dict]:
-    try:
-        res = _sb().table("tanks").select("*").eq("id", tank_id).limit(1).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"get_tank_by_id failed: {e}")
+    Returns (old_code, new_code) or None on failure.
+    The caller (UI) is responsible for showing the warning modal + tape-rewrite
+    reminder. This function only performs the DB writes + activity log.
+    """
+    tank = get_tank_by_id(tank_id)
+    if not tank:
         return None
 
-
-def create_tank(data: dict) -> Optional[dict]:
-    payload = {k: data.get(k) for k in TANK_FIELDS if k in data}
-    try:
-        res = _sb().table("tanks").insert(payload).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"create_tank failed: {e}")
+    old_purpose = tank.get("purpose") or "Other"
+    if new_purpose == old_purpose:
         return None
 
+    result = db_regenerate_tape_code(tank_id, new_purpose)
+    if not result:
+        return None
 
-def update_tank(tank_id: str, updates: dict) -> bool:
-    payload = {k: v for k, v in updates.items()
-               if k in TANK_FIELDS or k in ("date_registered",)}
-    if not payload:
-        return False
-    try:
-        _sb().table("tanks").update(payload).eq("id", tank_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"update_tank failed: {e}")
-        return False
+    old_code, new_code = result
 
-
-def delete_tank(tank_id: str) -> bool:
-    try:
-        _sb().table("tanks").delete().eq("id", tank_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"delete_tank failed: {e}")
-        return False
+    log_activity(
+        action_type="tank_purpose_changed",
+        description=(
+            f"{old_code} → {new_code}: purpose '{old_purpose}' → '{new_purpose}'. "
+            f"Re-write painter's tape."
+        ),
+        entity_type="tank",
+        entity_id=tank_id,
+    )
+    return (old_code, new_code)
 
 
-def get_next_tank_sequence() -> str:
-    """Sequential integer string ("1", "2", "3", ...)."""
-    try:
-        res = _sb().table("tanks").select("system_id").execute()
-        nums = [int(r["system_id"]) for r in (res.data or []) if str(r.get("system_id", "")).isdigit()]
-        return str((max(nums) + 1) if nums else 1)
-    except Exception as e:
-        st.error(f"get_next_tank_sequence failed: {e}")
-        return "1"
+def set_tank_status(tank_id: str, new_status: str) -> bool:
+    """
+    Change status. Does NOT auto-sync occupant — use assign/clear for that.
+    """
+    return update_tank(tank_id, {"status": new_status})
 
 
 # ============================================================
-# TANK OCCUPANTS (Session 26H.7 — join table)
+# OCCUPANT — NEW API
 # ============================================================
 
-def get_tank_occupants(tank_id: str) -> list[dict]:
-    """All occupants of a tank."""
-    try:
-        res = (_sb().table("tank_occupants")
-               .select("*")
-               .eq("tank_id", tank_id)
-               .order("added_at")
-               .execute())
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_tank_occupants failed: {e}")
-        return []
-
-
-def get_occupants_for_fish(fish_id: str) -> list[dict]:
-    """Find which tank(s) a fish is in."""
-    try:
-        res = (_sb().table("tank_occupants")
-               .select("*")
-               .eq("occupant_type", "fish")
-               .eq("occupant_id", fish_id)
-               .execute())
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_occupants_for_fish failed: {e}")
-        return []
-
-
-def get_occupants_for_fry_batch(batch_id: str) -> list[dict]:
-    """Find which tank(s) a fry batch is in."""
-    try:
-        res = (_sb().table("tank_occupants")
-               .select("*")
-               .eq("occupant_type", "fry_batch")
-               .eq("occupant_id", batch_id)
-               .execute())
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_occupants_for_fry_batch failed: {e}")
-        return []
-
-
-def add_tank_occupant(
+def add_occupant_to_tank(
     tank_id: str,
     occupant_type: str,
     occupant_id: str,
     role: str = "primary",
     spawn_id: Optional[str] = None,
-) -> Optional[dict]:
+) -> bool:
     """
-    Add an occupant to a tank.
-    Also updates the denormalized cache on tanks (occupant_fish_id/label)
-    and flips status to Occupied.
+    Add a fish or fry_batch occupant to a tank.
+    Auto-cancels any reservation (warning surfaced by database layer via
+    st.session_state['_reservation_warnings']).
     """
-    try:
-        record = {
-            "tank_id": tank_id,
-            "occupant_type": occupant_type,
-            "occupant_id": occupant_id,
-            "role": role,
-        }
-        if spawn_id:
-            record["spawn_id"] = spawn_id
-
-        res = _sb().table("tank_occupants").insert(record).execute()
-        new_row = (res.data or [None])[0]
-
-        # Refresh cache + status
-        _refresh_tank_cache(tank_id)
-
-        return new_row
-    except Exception as e:
-        st.error(f"add_tank_occupant failed: {e}")
-        return None
-
-
-def remove_tank_occupant(tank_id: str, occupant_type: str, occupant_id: str) -> bool:
-    """Remove an occupant from a tank."""
-    try:
-        (_sb().table("tank_occupants")
-         .delete()
-         .eq("tank_id", tank_id)
-         .eq("occupant_type", occupant_type)
-         .eq("occupant_id", occupant_id)
-         .execute())
-
-        # Refresh cache + status
-        _refresh_tank_cache(tank_id)
-        return True
-    except Exception as e:
-        st.error(f"remove_tank_occupant failed: {e}")
+    row = add_tank_occupant(
+        tank_id=tank_id,
+        occupant_type=occupant_type,
+        occupant_id=occupant_id,
+        role=role,
+        spawn_id=spawn_id,
+    )
+    if not row:
         return False
 
+    if occupant_type == "fish":
+        tank = get_tank_by_id(tank_id)
+        loc = tank.get("location_code") if tank else None
+        if loc:
+            update_fish_location(occupant_id, loc)
 
-def _refresh_tank_cache(tank_id: str) -> None:
-    """
-    Recompute occupant_fish_id / occupant_label / status for a tank
-    based on current tank_occupants rows.
-    """
-    try:
-        occupants = get_tank_occupants(tank_id)
-
-        primary_fish_id = None
-        primary_label = None
-        status = "Empty / Idle"
-
-        if occupants:
-            status = "Occupied"
-            # Pick the primary fish (role='primary' or first fish)
-            for occ in occupants:
-                if occ.get("occupant_type") == "fish":
-                    if occ.get("role") == "primary" or primary_fish_id is None:
-                        primary_fish_id = occ["occupant_id"]
-                        break
-
-            if primary_fish_id:
-                fish = get_fish_by_id(primary_fish_id)
-                if fish:
-                    primary_label = (
-                        f"{fish.get('system_id')} | "
-                        f"{fish.get('gender') or ''} | "
-                        f"{fish.get('variety') or ''}"
-                    ).strip(" |")
-            else:
-                # Only fry batches — use first batch label
-                for occ in occupants:
-                    if occ.get("occupant_type") == "fry_batch":
-                        primary_label = f"Fry batch ({occ['occupant_id'][:8]})"
-                        break
-
-        # Preserve reservation status if Reserved
-        current = get_tank_by_id(tank_id)
-        if current and current.get("status") == "Reserved" and not occupants:
-            status = "Reserved"
-
-        update_tank(tank_id, {
-            "occupant_fish_id": primary_fish_id,
-            "occupant_label": primary_label,
-            "status": status,
-        })
-    except Exception as e:
-        st.error(f"_refresh_tank_cache failed: {e}")
+    log_activity(
+        action_type="tank_assigned",
+        description=f"Added {occupant_type} {occupant_id[:8]} to tank {tank_id[:8]}",
+        entity_type="tank",
+        entity_id=tank_id,
+    )
+    return True
 
 
-def transfer_occupant(
-    fish_id: str,
+def add_fry_batch_to_tank(
+    tank_id: str,
+    batch_id: str,
+    role: str = "batch",
+    spawn_id: Optional[str] = None,
+) -> bool:
+    """Convenience wrapper for fry batches."""
+    return add_occupant_to_tank(
+        tank_id=tank_id,
+        occupant_type="fry_batch",
+        occupant_id=batch_id,
+        role=role,
+        spawn_id=spawn_id,
+    )
+
+
+def remove_occupant(tank_id: str, occupant_type: str, occupant_id: str) -> bool:
+    """Remove a specific occupant from a tank."""
+    if occupant_type == "fish":
+        tank = get_tank_by_id(tank_id)
+        if tank:
+            update_fish_location(occupant_id, None)
+
+    ok = remove_tank_occupant(tank_id, occupant_type, occupant_id)
+    if ok:
+        log_activity(
+            action_type="tank_unassigned",
+            description=f"Removed {occupant_type} {occupant_id[:8]} from tank {tank_id[:8]}",
+            entity_type="tank",
+            entity_id=tank_id,
+        )
+    return ok
+
+
+def transfer_occupant_api(
+    occupant_type: str,
+    occupant_id: str,
     from_tank_id: Optional[str],
     to_tank_id: str,
     role: str = "primary",
 ) -> bool:
     """
-    Move a fish from one tank to another.
-    Removes from old, adds to new, mirrors fish.location + tank_id.
+    Move an occupant to a different tank. Thin wrapper over
+    database.transfer_occupant() that adds the activity log entry.
     """
-    try:
-        # Remove from old
-        if from_tank_id:
-            remove_tank_occupant(from_tank_id, "fish", fish_id)
+    ok = db_transfer_occupant(
+        fish_id=occupant_id,
+        from_tank_id=from_tank_id,
+        to_tank_id=to_tank_id,
+        role=role,
+        occupant_type=occupant_type,
+    )
+    if ok:
+        log_activity(
+            action_type="tank_assigned",
+            description=(
+                f"Transferred {occupant_type} {occupant_id[:8]} "
+                f"from {from_tank_id or 'none'} to {to_tank_id[:8]}"
+            ),
+            entity_type="tank",
+            entity_id=to_tank_id,
+        )
+    return ok
 
-        # Add to new
-        add_tank_occupant(to_tank_id, "fish", fish_id, role=role)
 
-        # Mirror to fish
-        new_tank = get_tank_by_id(to_tank_id)
-        loc = new_tank.get("location_code") if new_tank else None
-        update_fish(fish_id, {"tank_id": to_tank_id, "location": loc})
-        return True
-    except Exception as e:
-        st.error(f"transfer_occupant failed: {e}")
+# ---------- Backward-compat occupant API ----------
+# Views + modules still call these names. Keep them forever or until
+# Step 5/7 explicitly rewrites callers.
+
+def assign_fish_to_tank(tank_id: str, fish_id: str) -> bool:
+    """
+    Assign a fish to a tank. Backward-compat wrapper over
+    add_occupant_to_tank(occupant_type='fish').
+    """
+    fish = get_fish_by_id(fish_id)
+    if not fish:
+        st.error(f"Fish {fish_id} not found.")
         return False
+
+    ok = add_occupant_to_tank(tank_id, "fish", fish_id, role="primary")
+    if ok:
+        tank = get_tank_by_id(tank_id)
+        loc = tank.get("location_code") if tank else None
+        log_activity(
+            action_type="tank_assigned",
+            description=f"Assigned {fish.get('system_id')} to {loc}",
+            entity_type="tank",
+            entity_id=tank_id,
+        )
+    return ok
+
+
+def unassign_tank(tank_id: str) -> bool:
+    """
+    Remove ALL occupants from a tank. Backward-compat wrapper over
+    database.clear_occupant().
+    """
+    tank = get_tank_by_id(tank_id)
+    if not tank:
+        return False
+
+    ok = clear_occupant(tank_id)
+    if ok:
+        log_activity(
+            action_type="tank_unassigned",
+            description=f"Cleared occupant(s) from {tank.get('location_code')}",
+            entity_type="tank",
+            entity_id=tank_id,
+        )
+    return ok
 
 
 # ============================================================
-# TANK RESERVATIONS (Session 26H.7)
+# RESERVATION API (delegating)
 # ============================================================
 
 def reserve_tank(
@@ -446,470 +508,157 @@ def reserve_tank(
     reserved_until: Optional[str] = None,
     reserved_ref_id: Optional[str] = None,
 ) -> bool:
-    """
-    Set a reservation on a tank.
-    Cannot reserve a tank that already has occupants.
-    """
-    try:
-        tank = get_tank_by_id(tank_id)
-        if not tank:
-            return False
-
-        occupants = get_tank_occupants(tank_id)
-        if occupants:
-            st.error(f"Cannot reserve — tank has {len(occupants)} occupant(s).")
-            return False
-
-        updates = {
-            "status": "Reserved",
-            "reserved_for": reserved_for,
-            "reserved_reason": reason,
-            "reserved_until": reserved_until,
-            "reserved_ref_id": reserved_ref_id,
-        }
-        return update_tank(tank_id, updates)
-    except Exception as e:
-        st.error(f"reserve_tank failed: {e}")
+    """Set a reservation. Reserved requires a reason (Q2)."""
+    if not reason or not reason.strip():
+        st.error("A reservation reason is required.")
         return False
+
+    ok = db_reserve_tank(
+        tank_id=tank_id,
+        reason=reason,
+        reserved_for=reserved_for,
+        reserved_until=reserved_until,
+        reserved_ref_id=reserved_ref_id,
+    )
+    if ok:
+        tank = get_tank_by_id(tank_id)
+        log_activity(
+            action_type="tank_reserved",
+            description=(
+                f"Reserved {tank.get('location_code') if tank else tank_id[:8]}"
+                + (f" for {reserved_for}" if reserved_for else "")
+                + (f" until {reserved_until}" if reserved_until else "")
+            ),
+            entity_type="tank",
+            entity_id=tank_id,
+        )
+    return ok
 
 
 def cancel_reservation(tank_id: str) -> bool:
-    """Clear reservation and flip to Empty / Idle."""
-    try:
-        return update_tank(tank_id, {
-            "status": "Empty / Idle",
-            "reserved_for": None,
-            "reserved_reason": None,
-            "reserved_until": None,
-            "reserved_ref_id": None,
-        })
-    except Exception as e:
-        st.error(f"cancel_reservation failed: {e}")
-        return False
+    """Clear a reservation and return to Empty / Idle."""
+    tank = get_tank_by_id(tank_id)
+    ok = db_cancel_reservation(tank_id)
+    if ok and tank:
+        log_activity(
+            action_type="tank_reservation_cancelled",
+            description=f"Cancelled reservation on {tank.get('location_code')}",
+            entity_type="tank",
+            entity_id=tank_id,
+        )
+    return ok
 
 
 def move_reservation(from_tank_id: str, to_tank_id: str) -> bool:
-    """Move a reservation from one tank to another."""
-    try:
-        src = get_tank_by_id(from_tank_id)
-        if not src or src.get("status") != "Reserved":
-            st.error("Source tank is not Reserved.")
-            return False
-
-        dst = get_tank_by_id(to_tank_id)
-        if not dst:
-            return False
-        if get_tank_occupants(to_tank_id):
-            st.error("Destination tank is occupied — cannot move reservation.")
-            return False
-
-        # Copy reservation fields
-        update_tank(to_tank_id, {
-            "status": "Reserved",
-            "reserved_for": src.get("reserved_for"),
-            "reserved_reason": src.get("reserved_reason"),
-            "reserved_until": src.get("reserved_until"),
-            "reserved_ref_id": src.get("reserved_ref_id"),
-        })
-
-        # Clear source
-        cancel_reservation(from_tank_id)
-        return True
-    except Exception as e:
-        st.error(f"move_reservation failed: {e}")
-        return False
+    """Move a reservation to another tank."""
+    ok = db_move_reservation(from_tank_id, to_tank_id)
+    if ok:
+        log_activity(
+            action_type="tank_reservation_moved",
+            description=f"Moved reservation from {from_tank_id[:8]} to {to_tank_id[:8]}",
+            entity_type="tank",
+            entity_id=to_tank_id,
+        )
+    return ok
 
 
-def get_expiring_reservations(days_ahead: int = 3) -> list[dict]:
+def get_expiring(days_ahead: int = 3) -> list[dict]:
+    """Convenience re-export for dashboards."""
+    return get_expiring_reservations(days_ahead=days_ahead)
+
+
+# ============================================================
+# SAFE DELETE (Q3 Option D)
+# ============================================================
+
+def delete_tank_safely(
+    tank_id: str,
+    transfers: Optional[dict] = None,
+) -> tuple[bool, str]:
     """
-    Reservations whose reserved_until is within `days_ahead` days
-    or already past.
+    Delete a tank only if:
+      - it has no occupants, OR
+      - `transfers` maps every occupant to a destination tank.
+
+    transfers: { (occupant_type, occupant_id): destination_tank_id }
     """
-    try:
-        today = _dt.date.today()
-        cutoff = today + _dt.timedelta(days=days_ahead)
-
-        res = (_sb().table("tanks")
-               .select("*")
-               .eq("status", "Reserved")
-               .not_.is_("reserved_until", "null")
-               .lte("reserved_until", cutoff.isoformat())
-               .execute())
-
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_expiring_reservations failed: {e}")
-        return []
-
-
-# ============================================================
-# SPAWNS
-# ============================================================
-
-SPAWN_FIELDS = [
-    "system_id", "spawn_code", "line_code", "generation",
-    "male_id", "female_id",
-    "pairing_date", "status",
-    "batch_name", "free_swimming_date", "jarring_date",
-    "estimated_fry_count", "fry_count",
-    "failure_reason", "tank_id", "line_goal", "notes",
-]
-
-
-def get_all_spawns() -> list[dict]:
-    try:
-        res = _sb().table("spawns").select("*").order("created_at", desc=True).execute()
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_all_spawns failed: {e}")
-        return []
-
-
-def get_spawn_by_id(spawn_id: str) -> Optional[dict]:
-    try:
-        res = _sb().table("spawns").select("*").eq("id", spawn_id).limit(1).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"get_spawn_by_id failed: {e}")
-        return None
-
-
-def create_spawn(data: dict) -> Optional[dict]:
-    payload = {k: data.get(k) for k in SPAWN_FIELDS if k in data}
-    try:
-        res = _sb().table("spawns").insert(payload).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"create_spawn failed: {e}")
-        return None
-
-
-def update_spawn(spawn_id: str, updates: dict) -> bool:
-    payload = {k: v for k, v in updates.items() if k in SPAWN_FIELDS}
-    if not payload:
-        return False
-    try:
-        _sb().table("spawns").update(payload).eq("id", spawn_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"update_spawn failed: {e}")
-        return False
-
-
-def delete_spawn(spawn_id: str) -> bool:
-    try:
-        _sb().table("spawns").delete().eq("id", spawn_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"delete_spawn failed: {e}")
-        return False
-
-
-def get_next_spawn_code() -> str:
-    """SPN-YY-NN, resetting per year."""
-    yy = _dt.date.today().strftime("%y")
-    prefix = f"SPN-{yy}-"
-    try:
-        res = _sb().table("spawns").select("system_id").like("system_id", f"{prefix}%").execute()
-        nums = []
-        for r in (res.data or []):
-            tail = (r.get("system_id") or "").replace(prefix, "").strip()
-            if tail.isdigit():
-                nums.append(int(tail))
-        nxt = (max(nums) + 1) if nums else 1
-        return f"{prefix}{nxt:02d}"
-    except Exception as e:
-        st.error(f"get_next_spawn_code failed: {e}")
-        return f"{prefix}01"
-
-
-# ============================================================
-# STRAINS
-# ============================================================
-
-def get_all_strains() -> list[dict]:
-    try:
-        res = _sb().table("strains").select("*").order("name").execute()
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_all_strains failed: {e}")
-        return []
-
-
-def create_strain(name: str, line_code: str = "", description: str = "") -> Optional[dict]:
-    try:
-        res = _sb().table("strains").insert({
-            "name": name, "line_code": line_code, "description": description,
-        }).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"create_strain failed: {e}")
-        return None
-
-
-def delete_strain(strain_id: str) -> bool:
-    """Delete a strain by uuid."""
-    try:
-        _sb().table("strains").delete().eq("id", strain_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"delete_strain failed: {e}")
-        return False
-
-
-# ============================================================
-# ACTIVITY LOG
-# ============================================================
-
-def log_activity(
-    action_type: str,
-    description: str,
-    entity_type: Optional[str] = None,
-    entity_id: Optional[str] = None,
-    photo_id: Optional[str] = None,
-    photo_url: Optional[str] = None,
-    metadata: Optional[dict] = None,
-) -> bool:
-    try:
-        _sb().table("activity_log").insert({
-            "action_type": action_type,
-            "description": description,
-            "entity_type": entity_type,
-            "entity_id": entity_id,
-            "photo_id": photo_id,
-            "photo_url": photo_url,
-            "metadata": metadata or {},
-        }).execute()
-        return True
-    except Exception as e:
-        print(f"log_activity failed: {e}")
-        return False
-
-
-def get_activity_log(limit: int = 200) -> list[dict]:
-    try:
-        res = (_sb().table("activity_log")
-               .select("*")
-               .order("ts", desc=True)
-               .limit(limit)
-               .execute())
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_activity_log failed: {e}")
-        return []
-
-
-# ============================================================
-# FRY BATCHES
-# ============================================================
-
-FRY_BATCH_FIELDS = [
-    "batch_tag", "batch_code", "spawn_id", "hatch_date", "jarring_date",
-    "initial_count", "current_count", "culled_count", "female_count",
-    "died_count",
-    "stage", "tank_id", "notes",
-]
-
-
-def get_all_fry_batches() -> list[dict]:
-    try:
-        res = _sb().table("fry_batches").select("*").order("created_at", desc=True).execute()
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_all_fry_batches failed: {e}")
-        return []
-
-
-def create_fry_batch(data: dict) -> Optional[dict]:
-    payload = {k: data.get(k) for k in FRY_BATCH_FIELDS if k in data}
-    try:
-        res = _sb().table("fry_batches").insert(payload).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"create_fry_batch failed: {e}")
-        return None
-
-
-def update_fry_batch(batch_id: str, updates: dict) -> bool:
-    payload = {k: v for k, v in updates.items() if k in FRY_BATCH_FIELDS}
-    if not payload:
-        return False
-    try:
-        _sb().table("fry_batches").update(payload).eq("id", batch_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"update_fry_batch failed: {e}")
-        return False
-
-
-def get_fry_batch_by_id(batch_id: str) -> Optional[dict]:
-    """Fetch one fry batch by uuid."""
-    try:
-        res = _sb().table("fry_batches").select("*").eq("id", batch_id).limit(1).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"get_fry_batch_by_id failed: {e}")
-        return None
-
-
-def get_fry_batches_for_spawn(spawn_id: str) -> list[dict]:
-    """All batches linked to a specific spawn."""
-    try:
-        res = (_sb().table("fry_batches")
-               .select("*")
-               .eq("spawn_id", spawn_id)
-               .order("created_at", desc=True)
-               .execute())
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_fry_batches_for_spawn failed: {e}")
-        return []
-
-
-def delete_fry_batch(batch_id: str) -> bool:
-    """Delete a fry batch by uuid."""
-    try:
-        _sb().table("fry_batches").delete().eq("id", batch_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"delete_fry_batch failed: {e}")
-        return False
-
-
-# ============================================================
-# FISH MILESTONES (Session 20)
-# ============================================================
-
-MILESTONE_FIELDS = [
-    "fish_id", "milestone_date", "photo_id",
-    "form_score", "body_shape", "fin_checks",
-    "notes",
-]
-
-
-def get_milestones_for_fish(fish_id: str) -> list[dict]:
-    """All milestones for a fish, newest first."""
-    try:
-        res = (_sb().table("fish_milestones")
-               .select("*")
-               .eq("fish_id", fish_id)
-               .order("milestone_date", desc=True)
-               .execute())
-        return res.data or []
-    except Exception as e:
-        st.error(f"get_milestones_for_fish failed: {e}")
-        return []
-
-
-def get_milestone_by_id(milestone_id: str) -> Optional[dict]:
-    """Fetch one milestone by uuid."""
-    try:
-        res = _sb().table("fish_milestones").select("*").eq("id", milestone_id).limit(1).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"get_milestone_by_id failed: {e}")
-        return None
-
-
-def create_milestone(data: dict) -> Optional[dict]:
-    """Insert a milestone. `data` keys must match MILESTONE_FIELDS."""
-    payload = {k: data.get(k) for k in MILESTONE_FIELDS if k in data}
-    try:
-        res = _sb().table("fish_milestones").insert(payload).execute()
-        return (res.data or [None])[0]
-    except Exception as e:
-        st.error(f"create_milestone failed: {e}")
-        return None
-
-
-def update_milestone(milestone_id: str, updates: dict) -> bool:
-    """Update a milestone. Only MILESTONE_FIELDS keys are accepted."""
-    payload = {k: v for k, v in updates.items() if k in MILESTONE_FIELDS}
-    if not payload:
-        return False
-    try:
-        _sb().table("fish_milestones").update(payload).eq("id", milestone_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"update_milestone failed: {e}")
-        return False
-
-
-def delete_milestone(milestone_id: str) -> bool:
-    """Delete a milestone by uuid."""
-    try:
-        _sb().table("fish_milestones").delete().eq("id", milestone_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"delete_milestone failed: {e}")
-        return False
-
-
-def get_milestone_counts_by_fish() -> dict:
-    """Returns { fish_id: count } for all fish that have milestones."""
-    try:
-        res = _sb().table("fish_milestones").select("fish_id").execute()
-        counts: dict[str, int] = {}
-        for row in (res.data or []):
-            fid = row.get("fish_id")
-            if fid:
-                counts[fid] = counts.get(fid, 0) + 1
-        return counts
-    except Exception as e:
-        st.error(f"get_milestone_counts_by_fish failed: {e}")
-        return {}
-
-
-# ============================================================
-# DASHBOARD AGGREGATES
-# ============================================================
-
-def get_dashboard_counts() -> dict:
-    """Returns the KPI numbers the dashboard needs in one call."""
-    try:
-        fish = _sb().table("fish").select("id,is_breeder,breeder_status,status,gender").execute().data or []
-        tanks = _sb().table("tanks").select("id,status").execute().data or []
-        spawns = _sb().table("spawns").select("id,status").execute().data or []
-
-        total_tanks = len(tanks)
-
-        # Available = Empty / Idle only (Reserved excluded)
-        available_tanks = sum(
-            1 for t in tanks
-            if (t.get("status") or "").lower() in ("empty / idle", "empty", "idle")
+    tank = get_tank_by_id(tank_id)
+    if not tank:
+        return False, "Tank not found."
+
+    ok, msg = delete_tank_safely_db(tank_id, transfers=transfers)
+    if ok:
+        # Delete Drive media (best effort)
+        for f_id in (tank.get("photo_id"), tank.get("qr_id")):
+            if f_id:
+                delete_drive_file(f_id)
+
+        log_activity(
+            action_type="tank_deleted",
+            description=f"Deleted {tank.get('location_code')}",
+            entity_type="tank",
         )
+    return ok, msg
 
-        reserved_tanks = sum(
-            1 for t in tanks
-            if (t.get("status") or "").lower() == "reserved"
+
+# We imported delete_tank_safely from database as the same name; give it
+# a local alias so we can call it without shadowing this function name.
+from database import delete_tank_safely as delete_tank_safely_db  # noqa: E402
+
+
+# ---------- Backward-compat delete ----------
+
+def delete_tank_and_media(tank_id: str) -> bool:
+    """
+    Legacy delete path used by views/tank_view.py.
+    For an occupied tank this now BLOCKS (Q3 Option D) — the view must
+    be updated (Step 4) to route through delete_tank_safely() with a
+    transfer dialog. Until then this wrapper refuses occupied deletes
+    rather than orphaning fish.
+    """
+    occupants = get_tank_occupants(tank_id)
+    if occupants:
+        st.error(
+            f"Cannot delete — tank has {len(occupants)} occupant(s). "
+            "Transfer occupants first (use the transfer dialog)."
         )
+        return False
 
-        occupied_tanks = sum(
-            1 for t in tanks
-            if (t.get("status") or "").lower() == "occupied"
-        )
+    ok, _msg = delete_tank_safely(tank_id, transfers=None)
+    return ok
 
-        total_breeders = sum(1 for f in fish if f.get("is_breeder"))
-        males = sum(1 for f in fish if f.get("is_breeder") and (f.get("gender") or "").lower() == "male")
-        females = sum(1 for f in fish if f.get("is_breeder") and (f.get("gender") or "").lower() == "female")
 
-        active_spawn_states = {"in pairing", "pending (success)", "free swimming", "pairing", "eggs"}
-        active_spawns = sum(
-            1 for s in spawns
-            if (s.get("status") or "").lower() in active_spawn_states
-        )
+# ============================================================
+# INTERNAL HELPERS
+# ============================================================
 
-        return {
-            "total_tanks": total_tanks,
-            "available_tanks": available_tanks,
-            "reserved_tanks": reserved_tanks,
-            "occupied_tanks": occupied_tanks,
-            "total_breeders": total_breeders,
-            "male_breeders": males,
-            "female_breeders": females,
-            "total_spawns": len(spawns),
-            "active_spawns": active_spawns,
-        }
-    except Exception as e:
-        st.error(f"get_dashboard_counts failed: {e}")
-        return {}
+def update_fish_location(fish_id: str, location: Optional[str]) -> bool:
+    """Mirror the tank tape code onto the fish row."""
+    from database import update_fish
+    return update_fish(fish_id, {"location": location})
+
+
+def _fish_label(fish: dict) -> str:
+    parts = [fish.get("system_id") or "?"]
+    if fish.get("gender"):  parts.append(fish["gender"])
+    if fish.get("variety"): parts.append(fish["variety"])
+    return " | ".join(str(p) for p in parts)
+
+
+def _make_qr_png(data: str):
+    """Generate a QR code PNG as bytes. Matches old box_size/border for printed labels."""
+    import io
+    import qrcode
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(str(data))
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf.getvalue()
