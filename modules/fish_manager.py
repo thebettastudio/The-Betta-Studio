@@ -5,6 +5,12 @@
 # Session 22 — Added cull_fish() and restore_fish_from_culled().
 # Session 23 — Added get_fish_age_days() and grade color helper.
 # breeder_registry.py is retired; all breeder logic lives here.
+#
+# Session 26H.7 — Step 7 (this revision):
+#   • change_location() rewritten to use the new tank_occupants API
+#     (remove_occupant + add_occupant_to_tank + find_tank) instead of
+#     the old assign_occupant/clear_occupant wrappers, and to match
+#     tanks by uuid lookup rather than scanning location_code strings.
 
 from __future__ import annotations
 
@@ -79,10 +85,7 @@ CULL_REASONS = [
 # ============================================================
 
 def grade_badge_color(grade: Optional[str]) -> str:
-    """
-    Return a hex color for a grade badge.
-    Used by the fish list grid tiles.
-    """
+    """Return a hex color for a grade badge."""
     g = (grade or "").strip().lower()
     if "show" in g:
         return "#FFD700"      # gold
@@ -110,10 +113,7 @@ def grade_badge_text_color(grade: Optional[str]) -> str:
 
 
 def get_fish_age_days(fish: dict) -> Optional[int]:
-    """
-    Days since the fish row was created (registration date).
-    Returns None if created_at is missing or unparseable.
-    """
+    """Days since the fish row was created (registration date)."""
     created = fish.get("created_at")
     if not created:
         return None
@@ -153,9 +153,7 @@ def list_fish_by_location(location_code: str) -> list[dict]:
 
 
 def find_fish(identifier: str) -> Optional[dict]:
-    """
-    Look up a fish by uuid (id) OR human-readable system_id.
-    """
+    """Look up a fish by uuid (id) OR human-readable system_id."""
     if not identifier:
         return None
     fish = get_fish_by_system_id(identifier)
@@ -165,9 +163,7 @@ def find_fish(identifier: str) -> Optional[dict]:
 
 
 def get_fish_dropdown_items() -> list[dict]:
-    """
-    Lightweight list for dropdowns. Excludes Deceased / Sold / Retired / Culled.
-    """
+    """Lightweight list for dropdowns. Excludes Deceased / Sold / Retired / Culled."""
     out = []
     for f in get_all_fish():
         status = (f.get("status") or "").lower()
@@ -218,10 +214,7 @@ def register_new_fish(
     generation: str = "P1",
     status: str = "Active",
 ) -> Optional[dict]:
-    """
-    Register a manually-acquired fish (purchased or unknown origin).
-    Generates FISH-NNNN system_id.
-    """
+    """Register a manually-acquired fish (purchased or unknown origin)."""
     system_id = generate_fish_id()
 
     photo_id = None
@@ -275,9 +268,7 @@ def register_fish_from_spawn(
     notes: str = "",
     photo_file=None,
 ) -> Optional[dict]:
-    """
-    Register a jarred fry from a spawn. Inherits lineage.
-    """
+    """Register a jarred fry from a spawn. Inherits lineage."""
     spawn = next((s for s in get_all_spawns() if s["id"] == spawn_id), None)
     if not spawn:
         st.error(f"Spawn {spawn_id} not found.")
@@ -356,26 +347,42 @@ def edit_fish(fish_id: str, updates: dict) -> bool:
 
 
 def change_location(fish_id: str, new_location: str) -> bool:
-    """Move a fish to a new tank/jar (tape code)."""
+    """
+    Move a fish to a new tank (by tape code).
+    Session 26H.7 Step 7: rewritten to use the tank_occupants join
+    table as source of truth.
+       1. Remove the fish from all current tanks (join rows).
+       2. Look up the destination tank by tape code.
+       3. Add the fish as primary occupant.
+       4. Mirror the new tape code onto fish.location.
+    """
     fish = get_fish_by_id(fish_id)
     if not fish:
         return False
 
-    old_loc = fish.get("location")
-    if old_loc:
-        for t in get_all_tanks():
-            if t.get("location_code") == old_loc and t.get("occupant_fish_id") == fish_id:
-                from database import clear_occupant
-                clear_occupant(t["id"])
-                break
+    from database import get_occupants_for_fish
+    from modules.tank_registry import (
+        add_occupant_to_tank,
+        remove_occupant,
+        find_tank,
+    )
 
+    # 1. Clear from all current tanks via join table
+    try:
+        for occ in get_occupants_for_fish(fish_id):
+            remove_occupant(occ["tank_id"], "fish", fish_id)
+    except Exception as e:
+        st.warning(f"Could not clear previous tank occupants: {e}")
+
+    # 2-3. Assign to new tank if a matching tape code exists
     if new_location:
-        for t in get_all_tanks():
-            if t.get("location_code") == new_location:
-                from database import assign_occupant
-                assign_occupant(t["id"], fish_id, _fish_label(fish))
-                break
+        tank = find_tank(new_location)
+        if tank:
+            add_occupant_to_tank(tank["id"], "fish", fish_id, role="primary")
+        else:
+            st.warning(f"No tank found with tape code '{new_location}'. Fish location field updated anyway.")
 
+    # 4. Mirror tape code onto fish row
     return update_fish(fish_id, {"location": new_location})
 
 
@@ -409,10 +416,7 @@ def delete_fish_and_photos(fish_id: str) -> bool:
 # ============================================================
 
 def cull_fish(fish_id: str, reason: str = "", notes: str = "") -> bool:
-    """
-    Mark a fish as culled. Clears tank link, sets status='Culled',
-    appends reason to notes with a [Culled: reason] tag.
-    """
+    """Mark a fish as culled. Clears tank link, sets status='Culled'."""
     fish = get_fish_by_id(fish_id)
     if not fish:
         return False
@@ -449,9 +453,7 @@ def cull_fish(fish_id: str, reason: str = "", notes: str = "") -> bool:
 
 
 def restore_fish_from_culled(fish_id: str, new_status: str = "Active") -> bool:
-    """
-    Undo a cull — useful if you culled by mistake.
-    """
+    """Undo a cull — useful if you culled by mistake."""
     fish = get_fish_by_id(fish_id)
     if not fish:
         return False
@@ -509,9 +511,7 @@ def register_breeder(
     body_shape: str = "",
     fin_checks: Optional[dict] = None,
 ) -> Optional[dict]:
-    """
-    Convenience wrapper: register a new fish AND immediately promote to breeder.
-    """
+    """Convenience wrapper: register a new fish AND immediately promote to breeder."""
     from modules.id_generator import _sanitize
 
     line_code = _sanitize(lineage, max_len=16) if lineage else "UNK"
@@ -610,9 +610,7 @@ def get_breeder_stats() -> dict:
 
 
 def sync_breeder_status(fish_id: str, new_status: str) -> bool:
-    """
-    Called by spawn_manager when a pairing starts/ends.
-    """
+    """Called by spawn_manager when a pairing starts/ends."""
     return update_fish(fish_id, {"breeder_status": new_status})
 
 
