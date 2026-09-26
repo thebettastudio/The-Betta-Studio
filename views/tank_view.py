@@ -3,26 +3,18 @@
 # Session 10 — Ported to Supabase via tank_registry + fish_manager.
 #
 # Session 26H.7 — Step 4 (this revision): full UX rewrite.
-#   • Expander-based tank list (compact row → click to expand)
-#     - Sortable: Type→Number (default), Status→Number, ⭐ Starred first,
-#       Number only, Recently added
-#     - Filter bar: search, purpose, type, ⭐ starred only
-#     - Clickable KPI row (Total / Empty / Reserved / Occupied / Cleaning / Retired)
-#   • Status dot + badge color-coded per status
-#   • Reservation yellow badge with reason + expiry + "expiring soon" banner
-#   • ⭐ Starred indicator inherited from fish.is_starred (via tank_occupants)
-#   • Occupant chips (fish + fry batch) with tooltips
-#   • Assign modal: 2 tabs (Fish / Fry Batch)
-#   • Reserve modal: reason required + reserved_for autocomplete +
-#     big quick-pick buttons (+1d/+3d/+1w/+2w/+1mo/No expiry) + large calendar
-#   • Transfer-on-delete modal (Q3 Option D) for occupied tanks
-#   • Change-purpose modal with old→new tape code preview + tape rewrite prompt
-#   • Reservation-warning toasts (reads st.session_state['_reservation_warnings'])
-#   • Custom tank types are saved implicitly — the dropdown merges
-#     VALID_TANK_TYPES with distinct tank_type values already in the DB,
-#     so newly-registered custom types reappear as reusable options.
-#   • Backward-compat: all calls now go through modules/tank_registry.py's
-#     new API (no direct database.py imports for tank mutations).
+#   • Column-list tank layout (compact row, colored left stripe, click to expand)
+#   • Status colors:  Empty grey · Reserved yellow · Occupied green ·
+#                     Cleaning orange · Retired dark
+#   • KPI row: clickable chips (single row, no bloat)
+#   • Filter bar: search + sort always visible; advanced filters in expander
+#   • Expanded card: 3-column layout (photo | details | occupants + actions)
+#   • ⭐ Starred indicator inherited from fish.is_starred
+#   • Modals: Assign (Fish/Fry Batch tabs), Reserve (quick-picks),
+#     Change Purpose, Transfer-on-delete
+#   • Reservation warning toasts + expiring banner
+#   • Custom tank types are remembered (merged from existing DB values)
+#   • All mutations go through modules/tank_registry.py
 
 from __future__ import annotations
 
@@ -34,7 +26,6 @@ import streamlit as st
 from modules.tank_registry import (
     # read
     list_all_tanks,
-    find_tank,
     list_available_tanks,
     list_reserved_tanks,
     get_tank_stats,
@@ -50,7 +41,6 @@ from modules.tank_registry import (
     remove_occupant,
     transfer_occupant,
     # backward-compat
-    assign_fish_to_tank,
     unassign_tank,
     # reservation API
     reserve_tank,
@@ -74,16 +64,16 @@ from modules.photo_service import photo_url
 # ============================================================
 
 PURPOSE_LABELS = {
-    "Jarring":       "🫙 Jarring — Individual male/female jar",
-    "Conditioning":  "🥩 Conditioning — Pre-spawn breeder conditioning",
-    "Spawning":      "🥚 Spawning — Breeding pair setup",
-    "Fry Nursery":   "🌿 Fry Nursery — Free-swimming fry container",
-    "Grow-Out":      "🪴 Grow-Out — Fry / juvenile grow-out",
-    "Sorority":      "👑 Sorority — Female colony tank",
-    "Quarantine":    "🏥 Quarantine — Medical / treatment",
-    "Sales Display": "🛒 Sales Display — Showcase / grooming",
-    "Storage":       "📦 Storage — Empty / multi-purpose",
-    "Other":         "❔ Other — Custom purpose",
+    "Jarring":       "🫙 Jarring",
+    "Conditioning":  "🥩 Conditioning",
+    "Spawning":      "🥚 Spawning",
+    "Fry Nursery":   "🌿 Fry Nursery",
+    "Grow-Out":      "🪴 Grow-Out",
+    "Sorority":      "👑 Sorority",
+    "Quarantine":    "🏥 Quarantine",
+    "Sales Display": "🛒 Sales Display",
+    "Storage":       "📦 Storage",
+    "Other":         "❔ Other",
 }
 
 PURPOSE_ICONS = {
@@ -100,25 +90,25 @@ PURPOSE_ICONS = {
 }
 
 TANK_TYPE_LABELS = {
-    "Grow-Out Planggana (Large)":     "Grow-Out Planggana (Large)",
-    "Spawning Planggana (Small)":     "Spawning Planggana (Small)",
+    "Grow-Out Planggana (Large)":     "Grow-Out Planggana",
+    "Spawning Planggana (Small)":     "Spawning Planggana",
     "6-Liter Water Bottle":           "6-Liter Water Bottle",
-    "Empi Glass/Jar":                 "Empi (Emperador) Glass / Jar",
+    "Empi Glass/Jar":                 "Empi Glass / Jar",
     "Glass Aquarium":                 "Glass Aquarium",
-    "Sorority Basin":                 "Sorority / Female Basin",
-    "Quarantine Jar":                 "Quarantine / Treatment Jar",
-    "Custom":                         "➕ Other / Custom Container...",
+    "Sorority Basin":                 "Sorority Basin",
+    "Quarantine Jar":                 "Quarantine Jar",
+    "Custom":                         "➕ Other / Custom...",
 }
 
 CUSTOM_TANK_SENTINEL = "Custom"
 
-# Status visual config: (dot emoji, badge bg, badge fg)
+# Status visual config: (stripe color, dot emoji, badge bg, badge fg, short label)
 STATUS_STYLE = {
-    "Empty / Idle":         ("⚪", "#E5E7EB", "#374151"),
-    "Reserved":             ("🟡", "#FEF3C7", "#92400E"),
-    "Occupied":             ("🟢", "#D1FAE5", "#065F46"),
-    "Cleaning / Quarantine":("🟠", "#FED7AA", "#9A3412"),
-    "Retired":              ("⚫", "#E5E7EB", "#6B7280"),
+    "Empty / Idle":          ("#9CA3AF", "⚪", "#F3F4F6", "#374151", "Empty"),
+    "Reserved":              ("#F59E0B", "🟡", "#FEF3C7", "#92400E", "Reserved"),
+    "Occupied":              ("#10B981", "🟢", "#D1FAE5", "#065F46", "Occupied"),
+    "Cleaning / Quarantine": ("#F97316", "🟠", "#FED7AA", "#9A3412", "Cleaning"),
+    "Retired":               ("#4B5563", "⚫", "#E5E7EB", "#6B7280", "Retired"),
 }
 
 
@@ -134,21 +124,21 @@ def _tank_type_label(t: str) -> str:
     return TANK_TYPE_LABELS.get(t, t)
 
 
-def _status_dot(status: str) -> str:
-    return STATUS_STYLE.get(status or "Empty / Idle", ("⚪", "#E5E7EB", "#374151"))[0]
+def _status_parts(status: str):
+    return STATUS_STYLE.get(status or "Empty / Idle",
+                            ("#9CA3AF", "⚪", "#F3F4F6", "#374151", "Empty"))
 
 
 def _status_badge_html(status: str) -> str:
-    _dot, bg, fg = STATUS_STYLE.get(status or "Empty / Idle", ("⚪", "#E5E7EB", "#374151"))
+    _stripe, _dot, bg, fg, short = _status_parts(status)
     return (
         f'<span style="display:inline-block;background:{bg};color:{fg};'
-        f'font-size:12px;font-weight:600;padding:2px 10px;border-radius:10px;">'
-        f'{status or "Empty / Idle"}</span>'
+        f'font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;'
+        f'letter-spacing:0.3px;">{short.upper()}</span>'
     )
 
 
 def _numeric_tail(code: str) -> int:
-    """Extract trailing number from a tape code (JAR-0007 → 7)."""
     if not code:
         return 999999
     tail = ""
@@ -161,7 +151,6 @@ def _numeric_tail(code: str) -> int:
 
 
 def _is_starred_occupant(occupant_type: str, occupant_id: str, fish_index: dict) -> bool:
-    """Return True if this occupant is a starred fish."""
     if occupant_type != "fish":
         return False
     fish = fish_index.get(occupant_id)
@@ -169,15 +158,10 @@ def _is_starred_occupant(occupant_type: str, occupant_id: str, fish_index: dict)
 
 
 # ============================================================
-# RESERVATION WARNING TOASTS (reads session_state stash)
+# RESERVATION WARNING TOASTS
 # ============================================================
 
 def _drain_reservation_warnings():
-    """
-    Pop and display one-shot reservation-cancellation warnings
-    stashed by database.assign_occupant() / add_tank_occupant().
-    Call once near the top of the page render.
-    """
     warnings = st.session_state.pop("_reservation_warnings", [])
     for w in warnings:
         loc = w.get("location_code") or "?"
@@ -191,22 +175,16 @@ def _drain_reservation_warnings():
 
 
 # ============================================================
-# CUSTOM TANK TYPE MERGING (Option A)
+# CUSTOM TANK TYPE MERGING
 # ============================================================
 
 def _get_tank_type_options() -> list[str]:
-    """
-    Merge hardcoded VALID_TANK_TYPES with any custom tank_type values
-    already in the DB, so newly-registered custom types become reusable.
-    """
     try:
         existing = {t.get("tank_type") for t in list_all_tanks() if t.get("tank_type")}
     except Exception:
         existing = set()
 
-    merged = []
-    for t in VALID_TANK_TYPES:
-        merged.append(t)
+    merged = list(VALID_TANK_TYPES)
     for t in sorted(existing):
         if t not in merged:
             merged.append(t)
@@ -218,22 +196,11 @@ def _get_tank_type_options() -> list[str]:
 # ============================================================
 
 def _fish_options_for_assign(current_tank_id: str) -> list[dict]:
-    """
-    Fish dropdown for the assign modal.
-    Excludes deceased / sold / retired / culled.
-    Includes: unassigned fish + fish already in THIS tank (so user sees them).
-    """
-    out = []
-    for f in get_fish_dropdown_items():
-        out.append({
-            "id": f["id"],
-            "label": f.get("label") or f.get("system_id") or "?",
-        })
-    return out
+    return [{"id": f["id"], "label": f.get("label") or f.get("system_id") or "?"}
+            for f in get_fish_dropdown_items()]
 
 
 def _fry_batch_options(current_tank_id: str) -> list[dict]:
-    """Active fry batches for the assign modal."""
     out = []
     try:
         for item in list_active_batches():
@@ -255,8 +222,6 @@ def _fry_batch_options(current_tank_id: str) -> list[dict]:
 # ============================================================
 
 def _render_registration_form():
-    st.subheader("Register New Tank or Container")
-
     tank_type_options = _get_tank_type_options()
 
     with st.form("tank_register_form", clear_on_submit=True):
@@ -267,16 +232,15 @@ def _render_registration_form():
                 "Container / Tank Type",
                 options=tank_type_options,
                 format_func=_tank_type_label,
-                help="Pick an existing type or choose 'Other / Custom' to add a new one. "
-                     "New types are remembered for next time.",
+                help="Pick a type or choose 'Other / Custom' to add a new one.",
             )
 
             custom_type = ""
             if selected_type == CUSTOM_TANK_SENTINEL:
                 custom_type = st.text_input(
-                    "✏️ Enter Custom Container Name",
-                    placeholder="e.g. 1.5L Jarring Bottle, 20L Storage Box",
-                    help="This name will be saved and appear in the dropdown next time.",
+                    "✏️ Custom Container Name",
+                    placeholder="e.g. 1.5L Jarring Bottle",
+                    help="Saved for next time — appears in the dropdown.",
                 )
 
             capacity = st.number_input(
@@ -285,7 +249,7 @@ def _render_registration_form():
             )
 
             purpose = st.selectbox(
-                "Container Purpose / Role",
+                "Purpose / Role",
                 options=VALID_PURPOSES,
                 format_func=_purpose_label,
             )
@@ -296,7 +260,7 @@ def _render_registration_form():
                 "Current Occupant (Optional)",
                 options=range(len(fish_opts)),
                 format_func=lambda i: fish_opts[i].get("label") or "?",
-                help="Any active fish can be assigned. Leave as None for empty containers.",
+                help="Leave as None for empty containers.",
             )
             selected_fish_id = fish_opts[selected_fish_idx]["id"]
 
@@ -305,11 +269,11 @@ def _render_registration_form():
                 type=["jpg", "jpeg", "png"],
             )
             notes = st.text_area(
-                "Notes / Setup Details",
-                placeholder="e.g. Almond leaf tea water, sponge filter installed",
+                "Notes / Setup",
+                placeholder="e.g. Almond leaf tea water, sponge filter",
             )
 
-        submit = st.form_submit_button("🏷️ Register Container & Generate Tape Tag", type="primary")
+        submit = st.form_submit_button("🏷️ Register Container", type="primary", use_container_width=True)
 
     if not submit:
         return
@@ -320,7 +284,7 @@ def _render_registration_form():
 
     final_type = custom_type.strip() if selected_type == CUSTOM_TANK_SENTINEL else selected_type
 
-    with st.spinner("Generating tape tag & registering container..."):
+    with st.spinner("Generating tape tag & registering..."):
         res = register_tank(
             tank_type=final_type,
             capacity_liters=capacity,
@@ -336,19 +300,26 @@ def _render_registration_form():
 
     st.success("Container registered!")
     st.markdown(f"""
-    <div style="background-color: #FEF3C7; border: 2px dashed #D97706; padding: 16px; border-radius: 12px; text-align: center; margin: 12px 0;">
-        <span style="font-size: 14px; color: #92400E; font-weight: bold; text-transform: uppercase;">✍️ WRITE THIS ON PAINTER'S TAPE:</span>
-        <h1 style="font-size: 42px; color: #B45309; margin: 8px 0; font-family: monospace; letter-spacing: 2px;">{res['location_code']}</h1>
-        <span style="font-size: 12px; color: #B45309;">System ID: {res['system_id']}</span>
+    <div style="background-color: #FEF3C7; border: 2px dashed #D97706;
+                padding: 16px; border-radius: 12px; text-align: center; margin: 12px 0;">
+        <span style="font-size: 13px; color: #92400E; font-weight: bold;
+                     text-transform: uppercase; letter-spacing: 0.5px;">
+            ✍️ WRITE THIS ON PAINTER'S TAPE
+        </span>
+        <h1 style="font-size: 40px; color: #B45309; margin: 8px 0;
+                   font-family: monospace; letter-spacing: 3px;">
+            {res['location_code']}
+        </h1>
+        <span style="font-size: 11px; color: #B45309;">System ID: {res['system_id']}</span>
     </div>
     """, unsafe_allow_html=True)
 
     if res.get("photo_id"):
-        st.image(photo_url(res["photo_id"]), caption="Container Photo", width=250)
+        st.image(photo_url(res["photo_id"]), caption="Container Photo", width=220)
 
 
 # ============================================================
-# MODAL: ASSIGN OCCUPANT (2 tabs — Fish / Fry Batch)
+# MODAL: ASSIGN OCCUPANT
 # ============================================================
 
 @st.dialog("📥 Assign Occupant")
@@ -370,7 +341,8 @@ def _modal_assign_occupant(tank: dict):
                 format_func=lambda i: fish_opts[i]["label"],
                 key=f"assign_fish_{tank_id}",
             )
-            if st.button("Assign Fish", type="primary", use_container_width=True, key=f"assign_fish_btn_{tank_id}"):
+            if st.button("Assign Fish", type="primary", use_container_width=True,
+                         key=f"assign_fish_btn_{tank_id}"):
                 fid = fish_opts[idx]["id"]
                 if add_occupant_to_tank(tank_id, "fish", fid, role="primary"):
                     st.success("Fish assigned.")
@@ -387,7 +359,8 @@ def _modal_assign_occupant(tank: dict):
                 format_func=lambda i: batch_opts[i]["label"],
                 key=f"assign_batch_{tank_id}",
             )
-            if st.button("Assign Fry Batch", type="primary", use_container_width=True, key=f"assign_batch_btn_{tank_id}"):
+            if st.button("Assign Fry Batch", type="primary", use_container_width=True,
+                         key=f"assign_batch_btn_{tank_id}"):
                 bid = batch_opts[idx]["id"]
                 if add_fry_batch_to_tank(tank_id, bid):
                     st.success("Fry batch assigned.")
@@ -395,11 +368,10 @@ def _modal_assign_occupant(tank: dict):
 
 
 # ============================================================
-# MODAL: RESERVE TANK (big date picker + quick-picks + autocomplete)
+# MODAL: RESERVE TANK
 # ============================================================
 
 def _suggest_reserved_for() -> list[str]:
-    """Suggest values for reserved_for: spawn codes, line codes."""
     suggestions = set()
     try:
         from database import get_all_spawns
@@ -426,21 +398,18 @@ def _modal_reserve(tank: dict):
         help="Required. Helps you remember later.",
     )
 
-    # Autocomplete via datalist-like selectbox OR free text
-    suggested_for = _suggest_reserved_for()
     reserved_for = st.text_input(
         "Reserved for (optional)",
         placeholder="e.g. SPN-AVT-F1-01, Line AVT",
         key=f"res_for_{tank_id}",
-        help="Free text — type anything. Suggestions below if you want to reuse one.",
     )
+    suggested_for = _suggest_reserved_for()
     if suggested_for:
         with st.expander("💡 Suggestions", expanded=False):
             st.caption(" · ".join(suggested_for))
 
-    st.markdown("**Expiry date** — quick pick or choose a custom date:")
+    st.markdown("**Expiry date** — quick pick or custom:")
 
-    # Quick-pick buttons
     today = _dt.date.today()
     qc1, qc2, qc3 = st.columns(3)
     qc4, qc5, qc6 = st.columns(3)
@@ -468,7 +437,6 @@ def _modal_reserve(tank: dict):
 
     st.session_state[f"res_quick_{tank_id}"] = quick_choice
 
-    # Determine default date for the calendar
     if quick_choice == "none":
         st.info("No expiry set — reservation stays until manually cancelled.")
         chosen_date = None
@@ -484,7 +452,8 @@ def _modal_reserve(tank: dict):
         )
 
     st.divider()
-    if st.button("Confirm Reservation", type="primary", use_container_width=True, key=f"res_confirm_{tank_id}"):
+    if st.button("Confirm Reservation", type="primary", use_container_width=True,
+                 key=f"res_confirm_{tank_id}"):
         if not reason.strip():
             st.error("A reservation reason is required.")
             return
@@ -501,7 +470,7 @@ def _modal_reserve(tank: dict):
 
 
 # ============================================================
-# MODAL: CHANGE PURPOSE (+ tape regen)
+# MODAL: CHANGE PURPOSE
 # ============================================================
 
 @st.dialog("🔄 Change Purpose & Regenerate Tape Code", width="large")
@@ -511,8 +480,8 @@ def _modal_change_purpose(tank: dict):
     old_code = tank.get("location_code") or "?"
 
     st.warning(
-        f"Changing purpose regenerates the tape code. You'll need to "
-        f"re-write the painter's tape on the physical container.",
+        "Changing purpose regenerates the tape code. You'll need to "
+        "re-write the painter's tape on the physical container.",
         icon="⚠️",
     )
     st.markdown(f"**Current:** `{old_code}` — purpose: *{old_purpose}*")
@@ -525,7 +494,6 @@ def _modal_change_purpose(tank: dict):
         key=f"cp_purpose_{tank_id}",
     )
 
-    # Preview new code by peeking at the generator
     try:
         from modules.id_generator import generate_tape_code
         preview = generate_tape_code(new_purpose)
@@ -535,7 +503,7 @@ def _modal_change_purpose(tank: dict):
     if new_purpose != old_purpose:
         st.info(f"**Old → New tape code:** `{old_code}` → `{preview}`")
     else:
-        st.caption("No change — pick a different purpose to regenerate.")
+        st.caption("No change — pick a different purpose.")
 
     confirm = st.checkbox(
         "I understand the tape code will change and I'll re-write the label.",
@@ -559,7 +527,7 @@ def _modal_change_purpose(tank: dict):
 
 
 # ============================================================
-# MODAL: TRANSFER-ON-DELETE (Q3 Option D)
+# MODAL: TRANSFER-ON-DELETE
 # ============================================================
 
 @st.dialog("🗑️ Delete Tank — Transfer Occupants", width="large")
@@ -573,7 +541,6 @@ def _modal_delete_with_transfer(tank: dict, occupants: list[dict], fish_index: d
         icon="⚠️",
     )
 
-    # Other tanks available as destinations
     other_tanks = [t for t in list_all_tanks() if t["id"] != tank_id]
     dest_opts = [{"id": None, "label": "— Pick destination —"}] + [
         {"id": t["id"], "label": f"{t.get('location_code')} ({t.get('tank_type')})"}
@@ -619,26 +586,23 @@ def _modal_delete_with_transfer(tank: dict, occupants: list[dict], fish_index: d
 
 
 # ============================================================
-# OCCUPANT CHIP RENDERING
+# OCCUPANT CHIP TEXT
 # ============================================================
 
 def _occupant_chip_text(occ: dict, fish_index: dict) -> str:
-    """Return a human-readable label for one tank_occupants row."""
     otype = occ.get("occupant_type")
     oid = occ.get("occupant_id")
-    role = occ.get("role") or ""
 
     if otype == "fish":
         fish = fish_index.get(oid)
         if not fish:
-            return f"🐟 (unknown fish {str(oid)[:8]})"
+            return f"🐟 (unknown {str(oid)[:8]})"
         star = "⭐ " if fish.get("is_starred") else ""
         sid = fish.get("system_id") or "?"
         gender = fish.get("gender") or "?"
         variety = fish.get("variety") or "—"
         return f"{star}🐟 {sid} · {gender} · {variety}"
     elif otype == "fry_batch":
-        # Try to enrich with batch tag via database lookup (lightweight)
         try:
             from database import get_fry_batch_by_id
             batch = get_fry_batch_by_id(oid)
@@ -647,28 +611,6 @@ def _occupant_chip_text(occ: dict, fish_index: dict) -> str:
             tag = str(oid)[:8]
         return f"🐣 Fry batch: {tag}"
     return f"{otype} {str(oid)[:8]}"
-
-
-def _render_occupant_chips(occupants: list[dict], fish_index: dict):
-    if not occupants:
-        st.caption("_No occupants._")
-        return
-    for occ in occupants:
-        text = _occupant_chip_text(occ, fish_index)
-        role = occ.get("role") or ""
-        role_note = f"  `{role}`" if role and role != "primary" else ""
-        col_chip, col_action = st.columns([5, 1])
-        with col_chip:
-            st.markdown(f"**{text}**{role_note}")
-        with col_action:
-            if st.button(
-                "Remove",
-                key=f"rm_occ_{occ['tank_id']}_{occ['occupant_type']}_{occ['occupant_id'][:8]}",
-                use_container_width=True,
-            ):
-                if remove_occupant(occ["tank_id"], occ["occupant_type"], occ["occupant_id"]):
-                    st.success("Removed.")
-                    st.rerun()
 
 
 # ============================================================
@@ -686,20 +628,8 @@ def _is_expiring_soon(tank: dict, days: int = 3) -> bool:
         return False
 
 
-def _reservation_summary(tank: dict) -> str:
-    reason = tank.get("reserved_reason") or "reserved"
-    rfor = tank.get("reserved_for")
-    until = tank.get("reserved_until")
-    parts = [reason]
-    if rfor:
-        parts.append(f"for {rfor}")
-    if until:
-        parts.append(f"until {until}")
-    return " · ".join(parts)
-
-
 # ============================================================
-# COLLAPSED ROW / EXPANDED CARD
+# COLLAPSED ROW (column-list layout with colored left stripe)
 # ============================================================
 
 def _render_tank_row(tank: dict, fish_index: dict):
@@ -709,122 +639,187 @@ def _render_tank_row(tank: dict, fish_index: dict):
     status = tank.get("status") or "Empty / Idle"
     purpose = tank.get("purpose") or "Other"
 
+    stripe_color, _dot, _bg, _fg, _short = _status_parts(status)
+
     occupants = tank.get("_occupants") or []
-    starred = any(_is_starred_occupant(o["occupant_type"], o["occupant_id"], fish_index) for o in occupants)
+    starred = any(_is_starred_occupant(o["occupant_type"], o["occupant_id"], fish_index)
+                  for o in occupants)
 
-    # ---- Collapsed row header ----
-    dot = _status_dot(status)
-    star_marker = "⭐ " if starred else ""
-    header = f"{dot} {star_marker}`{loc}`  ·  {ttype}  ·  {status}"
-
-    # Occupant / reservation summary
+    # Summary column text
     if occupants:
         if len(occupants) == 1:
-            summary = _occupant_chip_text(occupants[0], fish_index)
+            occ_summary = _occupant_chip_text(occupants[0], fish_index)
         else:
-            summary = f"{len(occupants)} occupants"
+            occ_summary = f"{len(occupants)} occupants"
     elif status == "Reserved":
-        summary = _reservation_summary(tank)
+        occ_summary = tank.get("reserved_reason") or "reserved"
     else:
-        summary = "—"
+        occ_summary = ""
 
-    header_full = f"{header}  ·  {_purpose_icon(purpose)} {summary}"
+    # ---- Collapsed header (single-line, clean columns) ----
+    star_prefix = "⭐ " if starred else ""
+    badge_html = _status_badge_html(status)
+    purpose_str = _purpose_label(purpose)
 
-    with st.expander(header_full, expanded=False):
-        # ---- Expanded content ----
-        col_img, col_info = st.columns([1, 2])
+    header_cols = st.columns([3, 4, 3, 2])
+    with header_cols[0]:
+        st.markdown(
+            f'<div style="border-left:6px solid {stripe_color};'
+            f'padding:6px 10px;border-radius:4px;background:#FAFAFA;">'
+            f'<span style="font-family:monospace;font-weight:700;font-size:15px;">'
+            f'{star_prefix}{loc}</span></div>',
+            unsafe_allow_html=True,
+        )
+    with header_cols[1]:
+        st.markdown(
+            f'<div style="padding:8px 0;color:#4B5563;font-size:13px;">'
+            f'{ttype}</div>',
+            unsafe_allow_html=True,
+        )
+    with header_cols[2]:
+        st.markdown(
+            f'<div style="padding:8px 0;color:#4B5563;font-size:13px;">'
+            f'{purpose_str}</div>',
+            unsafe_allow_html=True,
+        )
+    with header_cols[3]:
+        st.markdown(
+            f'<div style="padding:6px 0;text-align:right;">{badge_html}</div>',
+            unsafe_allow_html=True,
+        )
 
-        with col_img:
+    # Occupant summary line, if present, as a thin caption
+    if occ_summary:
+        st.caption(f"　　└─ {occ_summary}")
+
+    # Expand toggle
+    toggle_key = f"_expand_{tank_id}"
+    is_open = st.session_state.get(toggle_key, False)
+
+    btn_col1, btn_col2, btn_col3 = st.columns([1, 3, 1])
+    with btn_col1:
+        label = "▲ Close" if is_open else "▼ Details"
+        if st.button(label, key=f"tog_{tank_id}", use_container_width=True):
+            st.session_state[toggle_key] = not is_open
+            st.rerun()
+
+    if not is_open:
+        st.markdown(
+            '<hr style="margin:6px 0 14px 0;border:none;border-top:1px solid #E5E7EB;">',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ---- Expanded card ----
+    with st.container(border=True):
+        col_photo, col_details, col_actions = st.columns([2, 3, 3])
+
+        # ---- Column 1: photo + QR ----
+        with col_photo:
             if tank.get("photo_id"):
                 st.image(photo_url(tank["photo_id"]), use_container_width=True)
             else:
-                st.caption("📷 *No photo*")
-
+                st.markdown(
+                    '<div style="width:100%;aspect-ratio:4/3;background:#F3F4F6;'
+                    'border-radius:10px;display:flex;align-items:center;'
+                    'justify-content:center;color:#9CA3AF;font-size:13px;">'
+                    'No Photo</div>',
+                    unsafe_allow_html=True,
+                )
             if tank.get("qr_id"):
                 with st.expander("QR Code", expanded=False):
                     st.image(photo_url(tank["qr_id"]), use_container_width=True)
 
-        with col_info:
-            st.markdown(f"### {star_marker}🏷️ `{loc}`")
-            st.markdown(_status_badge_html(status), unsafe_allow_html=True)
+        # ---- Column 2: details ----
+        with col_details:
+            st.markdown(f"##### 📋 Details")
             st.caption(f"System ID: `{tank.get('system_id')}`")
-            st.write(f"🪣 **Type:** {ttype}")
-            st.write(f"🎯 **Purpose:** {_purpose_label(purpose)}")
-            st.write(f"🧪 **Capacity:** {tank.get('capacity_liters') or '—'} L")
+            st.markdown(f"**Type:** {ttype}")
+            st.markdown(f"**Purpose:** {purpose_str}")
+            st.markdown(f"**Capacity:** {tank.get('capacity_liters') or '—'} L")
 
-            # Reservation detail
             if status == "Reserved":
                 st.markdown("---")
                 st.markdown("**🟡 Reservation**")
-                st.write(f"Reason: **{tank.get('reserved_reason') or '—'}**")
+                st.markdown(f"**Reason:** {tank.get('reserved_reason') or '—'}")
                 if tank.get("reserved_for"):
-                    st.write(f"For: `{tank.get('reserved_for')}`")
+                    st.markdown(f"**For:** `{tank.get('reserved_for')}`")
                 if tank.get("reserved_until"):
                     until = tank.get("reserved_until")
                     if _is_expiring_soon(tank):
-                        st.warning(f"⏰ Expiring soon — {until}", icon="⚠️")
+                        st.warning(f"⏰ Expires soon — {until}", icon="⚠️")
                     else:
-                        st.write(f"Until: `{until}`")
+                        st.markdown(f"**Until:** `{until}`")
                 else:
                     st.caption("No expiry set")
 
             if tank.get("notes"):
-                st.caption(f"📝 {tank['notes']}")
+                st.markdown("---")
+                st.markdown(f"**📝 Notes:** {tank['notes']}")
 
-        # ---- Occupants ----
-        st.markdown("---")
-        st.markdown(f"**🐟 Occupants ({len(occupants)})**")
-        _render_occupant_chips(occupants, fish_index)
-
-        # ---- Action buttons ----
-        st.markdown("---")
-        st.markdown("**Actions**")
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        with c1:
-            if st.button("📥 Assign", key=f"act_assign_{tank_id}", use_container_width=True):
-                _modal_assign_occupant(tank)
-
-        with c2:
-            if status == "Reserved":
-                if st.button("❌ Cancel Reservation", key=f"act_cancel_{tank_id}", use_container_width=True):
-                    if cancel_reservation(tank_id):
-                        st.success("Reservation cancelled.")
-                        st.rerun()
+        # ---- Column 3: occupants + actions ----
+        with col_actions:
+            st.markdown(f"##### 🐟 Occupants ({len(occupants)})")
+            if not occupants:
+                st.caption("_None_")
             else:
-                if st.button("🟡 Reserve", key=f"act_reserve_{tank_id}", use_container_width=True):
-                    _modal_reserve(tank)
+                for occ in occupants:
+                    text = _occupant_chip_text(occ, fish_index)
+                    row_c1, row_c2 = st.columns([5, 1])
+                    with row_c1:
+                        st.markdown(text)
+                    with row_c2:
+                        if st.button(
+                            "✕",
+                            key=f"rm_occ_{occ['tank_id']}_{occ['occupant_type']}_{occ['occupant_id'][:8]}",
+                            help="Remove this occupant",
+                        ):
+                            if remove_occupant(occ["tank_id"], occ["occupant_type"], occ["occupant_id"]):
+                                st.success("Removed.")
+                                st.rerun()
 
-        with c3:
-            if st.button("🔄 Change Purpose", key=f"act_purpose_{tank_id}", use_container_width=True):
-                _modal_change_purpose(tank)
+            st.markdown("---")
+            st.markdown("##### ⚡ Actions")
 
-        with c4:
-            if st.button("⚙️ More", key=f"act_more_{tank_id}", use_container_width=True):
-                st.session_state[f"_show_more_{tank_id}"] = not st.session_state.get(f"_show_more_{tank_id}", False)
+            a1, a2 = st.columns(2)
+            with a1:
+                if st.button("📥 Assign", key=f"act_assign_{tank_id}", use_container_width=True):
+                    _modal_assign_occupant(tank)
+            with a2:
+                if status == "Reserved":
+                    if st.button("❌ Cancel Rsv", key=f"act_cancel_{tank_id}", use_container_width=True):
+                        if cancel_reservation(tank_id):
+                            st.success("Reservation cancelled.")
+                            st.rerun()
+                else:
+                    if st.button("🟡 Reserve", key=f"act_reserve_{tank_id}", use_container_width=True):
+                        _modal_reserve(tank)
 
-        # More options drawer
-        if st.session_state.get(f"_show_more_{tank_id}"):
-            with st.container(border=True):
-                st.markdown("**More options**")
-                m1, m2, m3 = st.columns(3)
+            a3, a4 = st.columns(2)
+            with a3:
+                if st.button("🔄 Change Purpose", key=f"act_purpose_{tank_id}", use_container_width=True):
+                    _modal_change_purpose(tank)
+            with a4:
+                if st.button("⚙️ More", key=f"act_more_{tank_id}", use_container_width=True):
+                    st.session_state[f"_show_more_{tank_id}"] = not st.session_state.get(f"_show_more_{tank_id}", False)
+                    st.rerun()
 
-                with m1:
+            if st.session_state.get(f"_show_more_{tank_id}"):
+                with st.container(border=True):
+                    st.markdown("**More options**")
+
                     new_photo = st.file_uploader(
                         "Replace photo",
                         type=["jpg", "jpeg", "png"],
                         key=f"more_photo_{tank_id}",
                     )
                     if new_photo and st.button("Save photo", key=f"more_photo_save_{tank_id}", use_container_width=True):
-                        ok = edit_tank(tank_id, {"photo_file": new_photo})
-                        if ok:
+                        if edit_tank(tank_id, {"photo_file": new_photo}):
                             st.success("Photo updated.")
                             st.rerun()
 
-                with m2:
                     new_status = st.selectbox(
-                        "Set status (manual)",
+                        "Set status",
                         options=VALID_STATUSES,
                         index=VALID_STATUSES.index(status) if status in VALID_STATUSES else 0,
                         key=f"more_status_{tank_id}",
@@ -834,7 +829,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
                             st.success("Status updated.")
                             st.rerun()
 
-                with m3:
                     if st.button("📤 Unassign all", key=f"more_unassign_{tank_id}", use_container_width=True):
                         if unassign_tank(tank_id):
                             st.success("All occupants removed.")
@@ -843,7 +837,7 @@ def _render_tank_row(tank: dict, fish_index: dict):
                     st.divider()
                     st.caption("**Danger zone**")
                     if occupants:
-                        if st.button("🗑️ Delete Tank (transfer first)", key=f"more_del_{tank_id}", use_container_width=True):
+                        if st.button("🗑️ Delete (transfer first)", key=f"more_del_{tank_id}", use_container_width=True):
                             _modal_delete_with_transfer(tank, occupants, fish_index)
                     else:
                         confirm_del = st.checkbox("Confirm delete", key=f"more_del_confirm_{tank_id}")
@@ -860,13 +854,17 @@ def _render_tank_row(tank: dict, fish_index: dict):
                             else:
                                 st.error(msg)
 
+    st.markdown(
+        '<hr style="margin:6px 0 14px 0;border:none;border-top:1px solid #E5E7EB;">',
+        unsafe_allow_html=True,
+    )
+
 
 # ============================================================
-# INVENTORY LIST
+# SORT FACTORY
 # ============================================================
 
 def _sort_key_factory(sort_mode: str):
-    """Return a key function for sorting tanks."""
     if sort_mode == "Status → Number":
         return lambda t: (
             VALID_STATUSES.index(t.get("status")) if t.get("status") in VALID_STATUSES else 99,
@@ -881,39 +879,35 @@ def _sort_key_factory(sort_mode: str):
     if sort_mode == "Number only":
         return lambda t: _numeric_tail(t.get("location_code") or "")
     if sort_mode == "Recently added":
-        return lambda t: str(t.get("created_at") or ""),  # reverse below
-    # Default: Type → Number
+        return lambda t: str(t.get("created_at") or "")
     return lambda t: (
         t.get("tank_type") or "",
         _numeric_tail(t.get("location_code") or ""),
     )
 
 
-def _render_inventory():
-    st.subheader("Container Inventory")
+# ============================================================
+# INVENTORY
+# ============================================================
 
+def _render_inventory():
     all_tanks = list_all_tanks()
     if not all_tanks:
         st.info("No containers registered yet. Use the Register tab to add your first one.")
         return
 
-    # ---- Build fish index for occupant lookups ----
-    fish_index = {f["id"]: f for f in (get_fish_dropdown_items() and
-                                        [{"id": x["id"], "system_id": x.get("system_id"),
-                                          "gender": None, "variety": None,
-                                          "is_starred": False} for x in get_fish_dropdown_items()]
-                                        or [])}
-    # The lightweight dropdown items don't include is_starred, so load full fish
+    # ---- Load full fish index (includes is_starred) ----
+    fish_index = {}
     try:
         from database import get_all_fish
         fish_index = {f["id"]: f for f in get_all_fish()}
     except Exception:
         pass
 
-    # ---- Attach occupants + starred flag to each tank ----
+    # ---- Attach occupants + starred flag ----
+    from database import get_tank_occupants
     for t in all_tanks:
         try:
-            from database import get_tank_occupants
             occupants = get_tank_occupants(t["id"])
         except Exception:
             occupants = []
@@ -923,17 +917,42 @@ def _render_inventory():
             for o in occupants
         )
 
-    # ---- KPI row (clickable filters) ----
-    stats = get_tank_stats()
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Total",     stats.get("total", 0))
-    k2.metric("⚪ Empty",   stats.get("available", 0))
-    k3.metric("🟡 Reserved", stats.get("reserved", 0))
-    k4.metric("🟢 Occupied", stats.get("occupied", 0))
-    k5.metric("🟠 Cleaning", stats.get("cleaning", 0))
-    k6.metric("⚫ Retired",  stats.get("retired", 0))
+    # ---- Compute counts from the SAME list we render (can't drift) ----
+    counts = {s: 0 for s in VALID_STATUSES}
+    for t in all_tanks:
+        s = t.get("status") or "Empty / Idle"
+        if s in counts:
+            counts[s] += 1
+    total = len(all_tanks)
 
-    # ---- Expiring reservations banner ----
+    # ---- KPI row: clickable chips ----
+    selected_kpi = st.session_state.get("_inv_kpi", "All")
+
+    kpi_cols = st.columns(6)
+    chips = [
+        ("All", f"📦 All {total}", "#E5E7EB", "#374151"),
+        ("Empty / Idle", f"⚪ Empty {counts['Empty / Idle']}", "#F3F4F6", "#374151"),
+        ("Reserved", f"🟡 Reserved {counts['Reserved']}", "#FEF3C7", "#92400E"),
+        ("Occupied", f"🟢 Occupied {counts['Occupied']}", "#D1FAE5", "#065F46"),
+        ("Cleaning / Quarantine", f"🟠 Cleaning {counts['Cleaning / Quarantine']}", "#FED7AA", "#9A3412"),
+        ("Retired", f"⚫ Retired {counts['Retired']}", "#E5E7EB", "#6B7280"),
+    ]
+    for col, (key, label, bg, fg) in zip(kpi_cols, chips):
+        with col:
+            is_active = (selected_kpi == key)
+            border = "2px solid #111827" if is_active else "1px solid #E5E7EB"
+            st.markdown(
+                f'<div style="background:{bg};color:{fg};border:{border};'
+                f'border-radius:10px;padding:10px 8px;text-align:center;'
+                f'font-size:13px;font-weight:600;">{label}</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Select", key=f"kpi_{key}", use_container_width=True,
+                         label_visibility="collapsed"):
+                st.session_state["_inv_kpi"] = key
+                st.rerun()
+
+    # ---- Expiring banner ----
     expiring = get_expiring(days_ahead=3)
     if expiring:
         locs = ", ".join(t.get("location_code") or "?" for t in expiring[:5])
@@ -943,47 +962,51 @@ def _render_inventory():
             icon="⚠️",
         )
 
-    st.markdown("---")
+    st.markdown("")
 
-    # ---- Filter bar ----
-    f1, f2, f3, f4, f5 = st.columns([2, 1, 1, 1, 1])
+    # ---- Filter bar: search + sort always visible ----
+    f1, f2 = st.columns([4, 2])
     with f1:
         query = st.text_input(
             "🔍 Search",
             placeholder="Tape code, system ID, type, purpose, occupant, notes...",
             key="inv_search",
+            label_visibility="collapsed",
         ).strip().lower()
     with f2:
-        purpose_filter = st.selectbox(
-            "Purpose",
-            options=["All"] + VALID_PURPOSES,
-            format_func=lambda p: "All" if p == "All" else _purpose_label(p),
-            key="inv_purpose",
-        )
-    with f3:
-        type_options = sorted({t.get("tank_type") for t in all_tanks if t.get("tank_type")})
-        type_filter = st.selectbox(
-            "Type",
-            options=["All"] + type_options,
-            key="inv_type",
-        )
-    with f4:
-        status_filter = st.selectbox(
-            "Status",
-            options=["All"] + VALID_STATUSES,
-            key="inv_status",
-        )
-    with f5:
         sort_mode = st.selectbox(
             "Sort",
-            options=["Type → Number", "Status → Number", "⭐ Starred first", "Number only", "Recently added"],
+            options=["Type → Number", "Status → Number", "⭐ Starred first",
+                     "Number only", "Recently added"],
             key="inv_sort",
+            label_visibility="collapsed",
         )
 
-    starred_only = st.checkbox("⭐ Show starred only", key="inv_star_only")
+    # ---- Advanced filters in expander ----
+    with st.expander("🎛️ Advanced filters", expanded=False):
+        af1, af2, af3 = st.columns(3)
+        with af1:
+            purpose_filter = st.selectbox(
+                "Purpose",
+                options=["All"] + VALID_PURPOSES,
+                format_func=lambda p: "All" if p == "All" else _purpose_label(p),
+                key="inv_purpose",
+            )
+        with af2:
+            type_options = sorted({t.get("tank_type") for t in all_tanks if t.get("tank_type")})
+            type_filter = st.selectbox(
+                "Type",
+                options=["All"] + type_options,
+                key="inv_type",
+            )
+        with af3:
+            starred_only = st.checkbox("⭐ Show starred only", key="inv_star_only")
 
     # ---- Apply filters ----
     filtered = all_tanks
+
+    if selected_kpi != "All":
+        filtered = [t for t in filtered if (t.get("status") or "Empty / Idle") == selected_kpi]
 
     if query:
         def _matches(t):
@@ -999,7 +1022,6 @@ def _render_inventory():
             ]).lower()
             if query in hay:
                 return True
-            # Also search occupant fish system_ids
             for occ in t.get("_occupants") or []:
                 if occ["occupant_type"] == "fish":
                     fish = fish_index.get(occ["occupant_id"])
@@ -1014,13 +1036,9 @@ def _render_inventory():
     if type_filter != "All":
         filtered = [t for t in filtered if (t.get("tank_type") or "") == type_filter]
 
-    if status_filter != "All":
-        filtered = [t for t in filtered if (t.get("status") or "") == status_filter]
-
     if starred_only:
         filtered = [t for t in filtered if t.get("_has_star")]
 
-    # ---- Sort ----
     reverse = (sort_mode == "Recently added")
     try:
         filtered.sort(key=_sort_key_factory(sort_mode), reverse=reverse)
