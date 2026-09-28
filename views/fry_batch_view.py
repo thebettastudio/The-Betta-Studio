@@ -7,13 +7,13 @@
 # Session 28A/B2 — Jar Fry popover: Jarring Date picker; batch's
 #   jarring_date updated; passed to jar_fry_bulk for birth_date.
 #
-# Session 29 (this revision) — Fry batch fixes:
-#   • Parent thumbnails (♂ + ♀) rendered inline with the spawn
-#     caption using get_batch_parents().
-#   • Jarring failures surfaced (jar_fry_bulk now returns
-#     (created, failed)).
-#   • _render_list_section() fetches list_all_batches() once and
-#     filters locally — no re-fetch per filter branch.
+# Session 29 (this revision) — Fry batch fixes + M/F layout:
+#   • Parent thumbnails removed from card header.
+#   • New M/F showcase panel (right column) with rounded-square
+#     parent photos, details below, and "View fish →" link.
+#   • Batch Outcome panel moved to left column, unchanged content.
+#   • Jarring failures surfaced (jar_fry_bulk returns (created, failed)).
+#   • _render_list_section() fetches list_all_batches() once.
 #   • "Stage due?" hint when fry/free_swimming batch is older
 #     than STAGE_DUE_DAYS.
 
@@ -24,8 +24,6 @@ import streamlit as st
 
 from modules.fry_batch_manager import (
     list_all_batches,
-    list_active_batches,
-    list_mature_batches,
     get_batch_stats,
     get_spawns_available_for_batch,
     suggest_batch_tag,
@@ -41,10 +39,14 @@ from modules.fry_batch_manager import (
     ACTIVE_STAGES,
 )
 from modules.tank_registry import get_tank_dropdown_items
-from modules.fish_manager import VALID_GENDERS, VALID_GRADES
+from modules.fish_manager import (
+    VALID_GRADES,
+    get_fish_age_days,
+    format_fish_age,
+    variety_of,
+)
 from modules.photo_service import photo_url
 from modules.spawn_outcome import (
-    compute_spawn_outcome,
     compute_all_spawn_outcomes,
     verdict_badge_html,
     grade_breakdown_short,
@@ -66,11 +68,12 @@ STAGE_ICONS = {
     "adult":         "🌳",
 }
 
-# If a batch has been in fry/free_swimming for this many days since
-# hatch, show a soft "may be ready to advance" hint.
 STAGE_DUE_DAYS = 60
 
-PARENT_THUMB_SIZE = 56
+# M/F showcase
+PARENT_PHOTO_SIZE = 140          # px, square
+PARENT_PHOTO_RADIUS = 24         # px, rounded-square
+PARENT_PHOTO_BORDER = "#E5E7EB"
 
 
 # ============================================================
@@ -106,47 +109,6 @@ def _days_since(date_iso) -> Optional[int]:
         return None
 
 
-def _parent_thumb_html(fish: Optional[dict], gender_sym: str) -> str:
-    """
-    Small rounded thumbnail for a parent fish. Falls back to a gray
-    circle with the gender symbol if no photo_id.
-    """
-    if fish and fish.get("photo_id"):
-        url = photo_url(fish["photo_id"])
-        return (
-            f'<div style="display:inline-block;text-align:center;margin-right:8px;">'
-            f'<div style="width:{PARENT_THUMB_SIZE}px;height:{PARENT_THUMB_SIZE}px;'
-            f'border-radius:10px;overflow:hidden;background:#F3F4F6;'
-            f'border:1px solid #E5E7EB;">'
-            f'<img src="{url}" style="width:100%;height:100%;object-fit:cover;display:block;" />'
-            f'</div>'
-            f'<div style="font-size:10px;color:#6B7280;margin-top:2px;">{gender_sym}</div>'
-            f'</div>'
-        )
-    # Fallback: gray circle with gender symbol
-    return (
-        f'<div style="display:inline-block;text-align:center;margin-right:8px;">'
-        f'<div style="width:{PARENT_THUMB_SIZE}px;height:{PARENT_THUMB_SIZE}px;'
-        f'border-radius:10px;background:#F3F4F6;border:1px solid #E5E7EB;'
-        f'display:flex;align-items:center;justify-content:center;'
-        f'color:#9CA3AF;font-size:22px;">{gender_sym}</div>'
-        f'<div style="font-size:10px;color:#9CA3AF;margin-top:2px;">'
-        f'{fish.get("system_id") if fish else "—"}</div>'
-        f'</div>'
-    )
-
-
-def _render_parent_photos(parents: dict):
-    """Render ♂ + ♀ thumbnails inline (right-aligned)."""
-    html = (
-        f'<div style="display:flex;align-items:flex-start;justify-content:flex-end;">'
-        + _parent_thumb_html(parents.get("male"), "♂")
-        + _parent_thumb_html(parents.get("female"), "♀")
-        + '</div>'
-    )
-    st.markdown(html, unsafe_allow_html=True)
-
-
 def _stage_due_hint(batch: dict) -> Optional[str]:
     """Return a soft warning if this batch may be ready to advance."""
     stage = (batch.get("stage") or "").lower()
@@ -159,6 +121,115 @@ def _stage_due_hint(batch: dict) -> Optional[str]:
         f"⏰ This batch hatched **{days}d** ago and is still marked "
         f"`{stage}` — may be ready to advance or jar."
     )
+
+
+# ============================================================
+# M/F SHOWCASE
+# ============================================================
+
+def _parent_photo_html(fish: Optional[dict], gender_sym: str) -> str:
+    """Big rounded-square photo for a parent fish."""
+    common_style = (
+        f"width:{PARENT_PHOTO_SIZE}px;height:{PARENT_PHOTO_SIZE}px;"
+        f"border-radius:{PARENT_PHOTO_RADIUS}px;"
+        f"border:1px solid {PARENT_PHOTO_BORDER};"
+        f"background:#F3F4F6;"
+        f"display:flex;align-items:center;justify-content:center;"
+        f"overflow:hidden;margin:0 auto;"
+    )
+    if fish and fish.get("photo_id"):
+        url = photo_url(fish["photo_id"])
+        inner = (
+            f'<img src="{url}" '
+            f'style="width:100%;height:100%;object-fit:cover;display:block;" />'
+        )
+    else:
+        inner = (
+            f'<div style="color:#9CA3AF;font-size:52px;line-height:1;">'
+            f'{gender_sym}</div>'
+        )
+    return f'<div style="{common_style}">{inner}</div>'
+
+
+def _parent_details_html(fish: Optional[dict], gender_sym: str, label: str) -> str:
+    """Details block beneath the photo."""
+    if not fish:
+        return (
+            f'<div style="text-align:center;margin-top:10px;">'
+            f'<div style="font-weight:700;font-size:15px;color:#374151;">'
+            f'{gender_sym} {label}</div>'
+            f'<div style="font-size:12px;color:#9CA3AF;margin-top:2px;">'
+            f'Unknown</div>'
+            f'</div>'
+        )
+
+    sid = fish.get("system_id") or "?"
+    grade = fish.get("grade") or "—"
+    variety = variety_of(fish) or "—"
+    age_days = get_fish_age_days(fish)
+    age_txt = format_fish_age(age_days) if age_days is not None else "—"
+
+    return (
+        f'<div style="text-align:center;margin-top:10px;">'
+        f'<div style="font-weight:700;font-size:15px;color:#374151;line-height:1.3;">'
+        f'{gender_sym} {label}</div>'
+        f'<div style="font-size:13px;color:#111827;margin-top:4px;font-family:monospace;">'
+        f'{sid}</div>'
+        f'<div style="font-size:12px;color:#6B7280;margin-top:4px;line-height:1.5;">'
+        f'{grade} · {age_txt}<br/>{variety}</div>'
+        f'</div>'
+    )
+
+
+def _render_mf_showcase(parents: dict):
+    """
+    Right-column panel: two side-by-side M & F rounded-square photos
+    with details below each. Includes 'View fish' links.
+    """
+    st.markdown("##### 🧬 Parents")
+
+    male = parents.get("male")
+    female = parents.get("female")
+
+    col_m, col_f = st.columns(2)
+
+    with col_m:
+        st.markdown(_parent_photo_html(male, "♂"), unsafe_allow_html=True)
+        st.markdown(
+            _parent_details_html(male, "♂", "Male"),
+            unsafe_allow_html=True,
+        )
+        if male and male.get("id"):
+            if st.button(
+                "View fish →",
+                key=f"view_male_{male['id']}",
+                use_container_width=True,
+            ):
+                st.session_state["fish_registry_focus_id"] = male["id"]
+                st.session_state["_nav_to"] = "fish_registry"
+                st.toast(
+                    f"Open Fish Registry to view {male.get('system_id')}.",
+                    icon="🐠",
+                )
+
+    with col_f:
+        st.markdown(_parent_photo_html(female, "♀"), unsafe_allow_html=True)
+        st.markdown(
+            _parent_details_html(female, "♀", "Female"),
+            unsafe_allow_html=True,
+        )
+        if female and female.get("id"):
+            if st.button(
+                "View fish →",
+                key=f"view_female_{female['id']}",
+                use_container_width=True,
+            ):
+                st.session_state["fish_registry_focus_id"] = female["id"]
+                st.session_state["_nav_to"] = "fish_registry"
+                st.toast(
+                    f"Open Fish Registry to view {female.get('system_id')}.",
+                    icon="🐠",
+                )
 
 
 # ============================================================
@@ -197,7 +268,6 @@ def _render_create_section():
         suggested_tag = suggest_batch_tag(selected_spawn) if selected_spawn else ""
         default_count = int(selected_spawn.get("estimated_fry_count") or 0) if selected_spawn else 0
 
-        # Default hatch date = free_swimming_date - 3 days
         default_hatch = datetime.date.today()
         if selected_spawn and selected_spawn.get("free_swimming_date"):
             try:
@@ -254,11 +324,11 @@ def _render_create_section():
 
 
 # ============================================================
-# OUTCOME PANEL (4-row layout)
+# OUTCOME PANEL (left column, unchanged)
 # ============================================================
 
 def _render_outcome_panel(outcome: dict):
-    st.markdown("**📊 Batch Outcome**")
+    st.markdown("##### 📊 Batch Outcome")
 
     initial   = outcome.get("initial_count", 0)
     current   = outcome.get("current_count", 0)
@@ -472,26 +542,20 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
     stage = (batch.get("stage") or "fry").lower()
     icon = _stage_icon(stage)
 
-    # Session 29 — fetch parents once per card
     parents = get_batch_parents(batch)
 
     with st.container(border=True):
-        col_h, col_thumbs = st.columns([3, 2])
+        # ---- Header: title + spawn caption (NO thumbs anymore) ----
+        st.markdown(f"### {icon} `{batch_tag}`")
+        if spawn:
+            st.caption(
+                f"From spawn **{spawn.get('system_id')}** — "
+                f"Line: `{spawn.get('line_code')}` (`{spawn.get('generation')}`)"
+            )
+        else:
+            st.caption("_No linked spawn._")
 
-        with col_h:
-            st.markdown(f"### {icon} `{batch_tag}`")
-            if spawn:
-                st.caption(
-                    f"From spawn **{spawn.get('system_id')}** — "
-                    f"Line: `{spawn.get('line_code')}` (`{spawn.get('generation')}`)"
-                )
-            else:
-                st.caption("_No linked spawn._")
-
-        with col_thumbs:
-            _render_parent_photos(parents)
-
-        # Stage selector row
+        # ---- Stage selector row ----
         new_stage = st.selectbox(
             "Stage",
             options=VALID_STAGES,
@@ -505,17 +569,19 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
                     st.success(f"Stage → {new_stage}")
                     st.rerun()
 
-        # Stage-due hint
+        # ---- Stage-due hint ----
         hint = _stage_due_hint(batch)
         if hint:
             st.info(hint, icon="⏰")
 
+        # ---- Metric row ----
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Initial", batch.get("initial_count") or 0)
         col2.metric("Current", batch.get("current_count") or 0)
         col3.metric("Survival", _survival_label(survival))
         col4.metric("Stage", f"{icon} {stage}")
 
+        # ---- Metadata caption ----
         culled_pre_n = batch.get("culled_count") or 0
         died_n = batch.get("died_count") or 0
         female_n = batch.get("female_count") or 0
@@ -529,12 +595,21 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         if batch.get("notes"):
             st.info(batch["notes"])
 
+        # ---- Two-column: BLUE (outcome) | RED (M/F showcase) ----
         if outcome and outcome.get("verdict_key") not in ("unknown",):
             st.divider()
-            _render_outcome_panel(outcome)
+            col_outcome, col_mf = st.columns([1, 1])
+
+            with col_outcome:
+                _render_outcome_panel(outcome)
+
+            with col_mf:
+                with st.container(border=True):
+                    _render_mf_showcase(parents)
 
         st.divider()
 
+        # ---- Action bar ----
         col_a, col_b, col_c, col_d = st.columns(4)
 
         with col_a:
@@ -621,7 +696,6 @@ def _render_list_section():
             key="batch_filter",
         )
 
-    # Session 29 — fetch once, filter locally.
     all_items = list_all_batches()
 
     if view_filter == "Active only":
@@ -679,7 +753,7 @@ def render_fry_batch_page():
     c1.metric("Total Batches", stats["total_batches"])
     c2.metric("Active", stats["active_batches"])
     c3.metric("Mature", stats["mature_batches"])
-    c4.metric("Fry Alive", stats["total_fry_alive"])
+    c4.metric("Total Fry Alive", stats["total_fry_alive"])
 
     st.markdown("---")
 
