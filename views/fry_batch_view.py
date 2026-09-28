@@ -1,8 +1,13 @@
 # views/fry_batch_view.py
 # Betta Farm Management System
 # Session 15 — Fry batch tracking UI.
-# Session 24B — Outcome panel + culled/female count editors on batch cards.
-# Session 24C — 4-row outcome layout + reconciliation badge + died count field.
+# Session 24B — Outcome panel + culled/female count editors.
+# Session 24C — 4-row outcome layout + reconciliation badge.
+#
+# Session 28A/B2 (this revision):
+#   • Jar Fry popover: Jarring Date picker (defaults today)
+#   • Batch jarring_date updated when jarring confirmed
+#   • Passes jarring_date to jar_fry_bulk for per-fish birth_date
 
 import datetime
 from typing import Optional
@@ -140,17 +145,10 @@ def _render_create_section():
 
 
 # ============================================================
-# OUTCOME PANEL (4-row layout — Session 24C)
+# OUTCOME PANEL (4-row layout)
 # ============================================================
 
 def _render_outcome_panel(outcome: dict):
-    """
-    4-row layout:
-      Row 1: Inventory (Current / Jarred / Total Alive)
-      Row 2: Losses (Culled pre / Culled jarred / Died)
-      Row 3: Quality (Survival % / Verdict / Reconciliation)
-      Row 4: Grades + Best fish
-    """
     st.markdown("**📊 Batch Outcome**")
 
     initial   = outcome.get("initial_count", 0)
@@ -162,14 +160,12 @@ def _render_outcome_panel(outcome: dict):
     females   = outcome.get("female_count", 0)
     total_alive = current + jarred
 
-    # Row 1 — Inventory
     st.caption(f"**📦 Inventory** — Initial: {initial}")
     col1, col2, col3 = st.columns(3)
     col1.metric("Current (unjarred)", current)
     col2.metric("Jarred alive", jarred)
     col3.metric("Total alive", total_alive)
 
-    # Row 2 — Losses
     st.caption("**💀 Losses**")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Culled (pre-jar)", culled_pre)
@@ -177,7 +173,6 @@ def _render_outcome_panel(outcome: dict):
     col3.metric("Died", died)
     col4.metric("♀ Females kept", females)
 
-    # Row 3 — Quality
     st.caption("**📈 Quality**")
     surv = outcome.get("survival")
     col1, col2, col3 = st.columns(3)
@@ -195,7 +190,6 @@ def _render_outcome_panel(outcome: dict):
 
     st.caption(f"_{outcome.get('verdict_reason', '')}_")
 
-    # Row 4 — Grades + best fish
     breakdown = grade_breakdown_short(outcome)
     if breakdown and breakdown != "—":
         st.caption(f"**🏅 Grades:** {breakdown}")
@@ -253,6 +247,14 @@ def _render_jar_popover(batch: dict):
             key=f"jar_location_{batch_uuid}",
         )
 
+        jarring_date = st.date_input(
+            "Jarring Date",
+            value=datetime.date.today(),
+            key=f"jar_date_{batch_uuid}",
+            help="Backdate if jarring happened earlier. This date becomes "
+                 "each jarred fish's birth_date for age/stage computation.",
+        )
+
         if st.button(
             "Confirm Jar",
             type="primary",
@@ -265,6 +267,7 @@ def _render_jar_popover(batch: dict):
                 gender=gender,
                 grade=grade,
                 location=location.strip(),
+                jarring_date=str(jarring_date),
             )
             if created:
                 new_count = max(0, (batch.get("current_count") or 0) - len(created))
@@ -274,9 +277,6 @@ def _render_jar_popover(batch: dict):
 
 
 def _render_counts_popover(batch: dict):
-    """
-    Popover to edit current_count, culled_count, died_count, female_count.
-    """
     batch_uuid = batch["id"]
 
     with st.popover("🔢 Update Counts", use_container_width=True):
@@ -346,7 +346,6 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
     icon = _stage_icon(stage)
 
     with st.container(border=True):
-        # Header
         col_h, col_actions = st.columns([3, 2])
 
         with col_h:
@@ -371,14 +370,12 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
                         st.success(f"Stage → {new_stage}")
                         st.rerun()
 
-        # Counts row
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Initial", batch.get("initial_count") or 0)
         col2.metric("Current", batch.get("current_count") or 0)
         col3.metric("Survival", _survival_label(survival))
         col4.metric("Stage", f"{icon} {stage}")
 
-        # Dates + quick counts
         culled_pre_n = batch.get("culled_count") or 0
         died_n = batch.get("died_count") or 0
         female_n = batch.get("female_count") or 0
@@ -392,14 +389,12 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         if batch.get("notes"):
             st.info(batch["notes"])
 
-        # ---- Outcome panel ----
         if outcome and outcome.get("verdict_key") not in ("unknown",):
             st.divider()
             _render_outcome_panel(outcome)
 
         st.divider()
 
-        # Action row
         col_a, col_b, col_c, col_d = st.columns(4)
 
         with col_a:
