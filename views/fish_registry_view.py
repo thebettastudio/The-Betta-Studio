@@ -13,16 +13,15 @@
 # Session 26C — Added video upload (auto frame scan).
 # Session 26D fix — Better video UX + best frame handling.
 # Session 26D round 2 — Stronger framing warning banner.
-#
 # Session 26H.7 — Step 5: ⭐ star toggle + new tank API.
+# Session 27B — Round 2A: status cleanup, stage + breeder_status.
 #
-# Session 27B — Round 2A (this revision):
-#   • Import stage_of, variety_of from fish_manager
-#   • Grid tile: show computed stage + breeder_status badges
-#   • Grid tile + table + highlight strip: variety display
-#     uses variety_of() (variety_4mo > variety_3mo > variety)
-#   • Table view: new "Stage" and "Breeder Status" columns
-#   • Side photos + molt checkpoints come in Round 2B
+# Session 27B — Round 2B (this revision):
+#   • New popover: 🖼️ Photos — side A/B photos with auto-analysis
+#   • New popover: 🎨 Molt Checks — 3mo / 4mo variety readings
+#   • Auto-flag when a molt check is due (age-based)
+#   • Upload side photo: single-pass analysis (no tap-to-select)
+#   • Pick any side photo as fish.photo_id profile
 
 import io
 import datetime
@@ -58,6 +57,10 @@ from database import (
     get_milestone_counts_by_fish,
     get_occupants_for_fish,
     get_tank_by_id,
+    get_fish_photos,
+    add_fish_photo,
+    set_profile_photo,
+    delete_fish_photo,
 )
 from modules.fish_manager import (
     register_new_fish,
@@ -84,7 +87,7 @@ from modules.tank_registry import (
     find_tank,
 )
 from modules.id_generator import generate_fish_id
-from modules.photo_service import upload_photo, photo_url
+from modules.photo_service import upload_photo, delete_drive_file, photo_url
 from modules.fish_milestones import (
     add_milestone,
     edit_milestone,
@@ -119,13 +122,15 @@ VIDEO_SAMPLE_EVERY = 5
 VIDEO_MAX_FRAMES = 30
 VIDEO_MAX_MB = 150
 
-# Breeder statuses that are worth showing on a tile badge
 BREEDER_STATUS_BADGES = {
     "Recovering":   ("🟡", "#FEF3C7", "#92400E"),
     "Conditioning": ("🟠", "#FED7AA", "#9A3412"),
     "In Pairing":   ("🔵", "#DBEAFE", "#1E40AF"),
     "Ready":        ("🟢", "#D1FAE5", "#065F46"),
 }
+
+MOLT_3MO_DAYS = 90
+MOLT_4MO_DAYS = 120
 
 
 # ============================================================
@@ -239,15 +244,10 @@ def _delete_strain(name: str) -> bool:
 # ============================================================
 
 def _get_available_tank_options() -> list[dict]:
-    """Tank dropdown via the new registry API (Reserved excluded)."""
     return get_tank_dropdown_items()
 
 
 def _get_current_tank_for_fish(fish_id: str) -> Optional[dict]:
-    """
-    Look up the tank a fish is currently in via tank_occupants (source of truth).
-    Returns the tank row or None.
-    """
     try:
         occupants = get_occupants_for_fish(fish_id)
     except Exception:
@@ -261,7 +261,7 @@ def _get_current_tank_for_fish(fish_id: str) -> Optional[dict]:
 
 
 # ============================================================
-# COLOR CAPTURE — PHOTO + VIDEO
+# COLOR CAPTURE — PHOTO + VIDEO (registration flow)
 # ============================================================
 
 def _reset_color_session(version_key: str):
@@ -315,12 +315,9 @@ def _render_color_capture_ui(version_key: str):
         label_visibility="collapsed",
     )
 
-    # ============================================================
-    # METHOD A — PHOTO UPLOAD + TAP-TO-SELECT
-    # ============================================================
     if method.startswith("📸"):
         if not _TAP_AVAILABLE:
-            st.error("Tap coordinate widget missing. Run: `py -m pip install streamlit-image-coordinates`")
+            st.error("Tap coordinate widget missing.")
             return
 
         uploaded_files = st.file_uploader(
@@ -401,34 +398,17 @@ def _render_color_capture_ui(version_key: str):
         if not samples and not pending:
             st.info("👆 Upload photos above to start.")
 
-    # ============================================================
-    # METHOD B — VIDEO UPLOAD + AUTO SCAN
-    # ============================================================
     else:
         st.warning(
-            "📏 **Get CLOSE.** The fish should fill **40–60% of the frame**. "
-            "If the whole tank is visible, detection fails — the app picks up "
-            "glass and water instead of the fish."
+            "📏 **Get CLOSE.** The fish should fill **40–60% of the frame**."
         )
-        with st.expander("📋 Recording tips (tap to expand)", expanded=False):
+        with st.expander("📋 Recording tips", expanded=False):
             st.markdown(
                 "**✅ Do:**\n"
                 "- Point at **ONE fish** — get close (10–15 cm away)\n"
                 "- Fish fills 40–60% of the frame\n"
                 "- Record 5–10 seconds, keep fish centered\n"
                 "- Even lighting, minimal glare\n"
-                "\n"
-                "**🎯 Mirror setup:** the app picks the **largest fish** each "
-                "frame. The real fish is bigger than its reflection, so it wins.\n"
-                "\n"
-                "**❌ Don't:**\n"
-                "- Capture the whole tank\n"
-                "- Multiple fish in frame\n"
-                "- Fish cut off by frame edges\n"
-                "- Camera shake / very dark / very bright\n"
-                "\n"
-                "**Recommended recording:** 1080p @ 60fps, 5–10 seconds, "
-                "H.264 codec if possible (most compatible)."
             )
 
         video_file = st.file_uploader(
@@ -443,15 +423,12 @@ def _render_color_capture_ui(version_key: str):
             size_mb = len(video_bytes) / (1024 * 1024)
 
             if size_mb > VIDEO_MAX_MB:
-                st.warning(
-                    f"⚠️ Video is {size_mb:.0f} MB. For best results, keep videos under "
-                    f"{VIDEO_MAX_MB} MB (roughly 10 seconds at 1080p)."
-                )
+                st.warning(f"⚠️ Video is {size_mb:.0f} MB. Keep under {VIDEO_MAX_MB} MB.")
             else:
                 st.caption(f"Video size: {size_mb:.1f} MB — ready to analyze.")
 
             if st.button("🔍 Analyze video", type="primary", use_container_width=True, key=f"analyze_video_{version_key}"):
-                with st.spinner(f"Extracting frames and analyzing... this takes ~10–20s"):
+                with st.spinner("Extracting frames and analyzing... this takes ~10–20s"):
                     result = analyze_video(
                         video_bytes,
                         sample_every=VIDEO_SAMPLE_EVERY,
@@ -478,7 +455,6 @@ def _render_color_capture_ui(version_key: str):
                     st.success(f"✓ Analyzed {len(analyses)} frames from video.")
                     st.rerun()
 
-    # ---- Samples taken so far ----
     if samples:
         st.markdown("---")
         st.markdown(f"**📊 Samples taken: {len(samples)}**")
@@ -494,10 +470,6 @@ def _render_color_capture_ui(version_key: str):
             consensus_preview = merge_analyses(samples)
             st.markdown("**Live consensus:**")
             st.markdown(palette_html(consensus_preview.get("palette", {})), unsafe_allow_html=True)
-            st.caption(
-                f"Pattern: `{consensus_preview.get('pattern_hint')}` · "
-                f"Iridescence: `{consensus_preview.get('iridescence_level')}`"
-            )
             if st.button("✅ Done — use these results", type="primary", use_container_width=True, key=f"done_{version_key}"):
                 st.session_state[f"{session_prefix}_done"] = True
                 st.session_state[f"{session_prefix}_consensus"] = consensus_preview
@@ -535,10 +507,6 @@ def _render_color_result(version_key: str):
         )
 
     st.markdown(f"**Pattern:** `{consensus.get('pattern_hint') or '—'}`")
-    st.markdown(
-        f"**✨ Iridescence:** `{consensus.get('iridescence_level') or 'none'}` "
-        f"(score {consensus.get('iridescence_score') or 0})"
-    )
 
     best_snap = _get_best_snapshot_bytes(version_key)
     if best_snap:
@@ -692,7 +660,7 @@ def render_register_tab():
 
     st.markdown("---")
     st.markdown("##### 📷 Profile Photo")
-    st.caption("Optional — takes the best color-analysis photo by default. Upload only if you want a different one.")
+    st.caption("Optional — takes the best color-analysis photo by default.")
 
     uploaded_photo = st.file_uploader(
         "Upload a different photo (optional)",
@@ -866,7 +834,6 @@ def render_register_tab():
     if patch:
         edit_fish(result["id"], patch)
 
-    # Tank assignment via new API
     if selected_tank_id:
         add_occupant_to_tank(selected_tank_id, "fish", result["id"], role="primary")
 
@@ -885,18 +852,13 @@ def render_register_tab():
 # ============================================================
 
 def _render_star_section(fish: dict):
-    """
-    Inline star toggle inside the Manage popover.
-    Writes fish.is_starred + fish.starred_reason.
-    """
     fish_uuid = fish["id"]
     system_id = fish.get("system_id") or "?"
     is_starred = bool(fish.get("is_starred"))
     current_reason = fish.get("starred_reason") or ""
 
     st.markdown("**⭐ Starring**")
-    st.caption("Star a fish to mark it as special / high-expectation. "
-               "The tank holding it will show a ⭐ automatically.")
+    st.caption("Star a fish to mark it as special / high-expectation.")
 
     new_starred = st.checkbox(
         "Star this fish",
@@ -909,7 +871,7 @@ def _render_star_section(fish: dict):
         new_reason = st.text_input(
             "Reason (optional)",
             value=current_reason,
-            placeholder="e.g. Top caudal, promising line, breeder candidate",
+            placeholder="e.g. Top caudal, promising line",
             key=f"star_reason_{fish_uuid}",
         )
 
@@ -929,6 +891,298 @@ def _render_star_section(fish: dict):
             else:
                 st.success(f"{system_id} unstarred.")
             st.rerun()
+
+
+# ============================================================
+# 🖼️ SIDE PHOTOS POPOVER (Round 2B)
+# ============================================================
+
+def _photo_analysis_summary(analysis: dict) -> str:
+    """Small one-line summary of a photo analysis dict."""
+    if not analysis:
+        return ""
+    parts = []
+    primary = analysis.get("primary")
+    if primary:
+        parts.append(f"🎨 {primary}")
+    pat = analysis.get("pattern_hint")
+    if pat:
+        parts.append(pat)
+    iri = analysis.get("iridescence_level")
+    if iri and iri != "none":
+        parts.append(f"✨ {iri}")
+    q = (analysis.get("quality") or {}).get("score")
+    if q:
+        parts.append(f"Q{q}")
+    return " · ".join(parts)
+
+
+def _render_side_photos_popover(fish: dict):
+    fish_uuid = fish["id"]
+    system_id = fish.get("system_id") or "?"
+
+    with st.popover("🖼️ Photos", use_container_width=True):
+        st.markdown(f"### 🖼️ Side Photos — {system_id}")
+        st.caption(
+            "Upload left and/or right side photos over time. "
+            "Each photo is analyzed once. Pick any as the profile picture."
+        )
+
+        # ---- Existing photos ----
+        photos = get_fish_photos(fish_uuid)
+        if photos:
+            st.markdown(f"**Existing photos ({len(photos)})**")
+            for p in photos:
+                row_key = f"photo_{p['id']}"
+                with st.container(border=True):
+                    col_img, col_info = st.columns([1, 2])
+
+                    with col_img:
+                        if p.get("photo_id"):
+                            st.image(photo_url(p["photo_id"]), use_container_width=True)
+
+                    with col_info:
+                        side = (p.get("side") or "?").upper()
+                        date = p.get("captured_at") or "—"
+                        is_prof = bool(p.get("is_profile"))
+                        profile_marker = " ⭐ PROFILE" if is_prof else ""
+                        st.markdown(f"**{side} side** · `{date}`{profile_marker}")
+
+                        summary = _photo_analysis_summary(p.get("analysis") or {})
+                        if summary:
+                            st.caption(summary)
+                        if p.get("notes"):
+                            st.caption(f"📝 {p['notes']}")
+
+                        b1, b2 = st.columns(2)
+                        with b1:
+                            if not is_prof:
+                                if st.button(
+                                    "Set as profile",
+                                    key=f"set_prof_{p['id']}",
+                                    use_container_width=True,
+                                ):
+                                    if set_profile_photo(fish_uuid, p["photo_id"]):
+                                        st.success("Profile updated.")
+                                        st.rerun()
+                        with b2:
+                            if st.button(
+                                "🗑️ Delete",
+                                key=f"del_photo_{p['id']}",
+                                use_container_width=True,
+                            ):
+                                if delete_fish_photo(p["id"]):
+                                    # also delete Drive file (best effort)
+                                    try:
+                                        delete_drive_file(p["photo_id"])
+                                    except Exception:
+                                        pass
+                                    st.success("Photo deleted.")
+                                    st.rerun()
+        else:
+            st.caption("_No side photos yet._")
+
+        st.divider()
+
+        # ---- Upload new ----
+        st.markdown("**➕ Upload new side photo**")
+
+        upload_key = f"side_upload_{fish_uuid}"
+        side_key = f"side_pick_{fish_uuid}"
+        note_key = f"side_note_{fish_uuid}"
+
+        side_choice = st.radio(
+            "Side",
+            options=["left", "right"],
+            horizontal=True,
+            key=side_key,
+        )
+
+        new_file = st.file_uploader(
+            "Choose a photo",
+            type=["jpg", "jpeg", "png", "heic", "heif"],
+            accept_multiple_files=False,
+            key=upload_key,
+        )
+
+        new_notes = st.text_input(
+            "Notes (optional)",
+            placeholder="e.g. Pre-molt, after 3mo",
+            key=note_key,
+        )
+
+        if st.button(
+            "Upload & Analyze",
+            type="primary",
+            use_container_width=True,
+            key=f"side_save_{fish_uuid}",
+        ):
+            if not new_file:
+                st.error("Please choose a photo first.")
+                return
+
+            raw = new_file.getvalue()
+
+            with st.spinner("Uploading to Drive..."):
+                drive_id = upload_photo(
+                    raw,
+                    entity_type="fish",
+                    entity_id=f"{system_id}_{side_choice}",
+                )
+
+            if not drive_id:
+                st.error("Upload failed. Check Drive credentials.")
+                return
+
+            analysis = {}
+            with st.spinner("Analyzing..."):
+                try:
+                    result = analyze_photo(raw)
+                    if result and result.get("ok"):
+                        analysis = result
+                except Exception as e:
+                    st.warning(f"Analysis skipped: {e}")
+
+            row = add_fish_photo(
+                fish_id=fish_uuid,
+                photo_id=drive_id,
+                side=side_choice,
+                photo_type="profile_side",
+                captured_at=datetime.date.today().isoformat(),
+                analysis=analysis,
+                notes=new_notes.strip(),
+            )
+
+            if row:
+                st.success(f"✅ {side_choice.capitalize()} side photo uploaded.")
+                st.rerun()
+            else:
+                st.error("Failed to save photo record.")
+
+
+# ============================================================
+# 🎨 MOLT CHECKS POPOVER (Round 2B)
+# ============================================================
+
+def _molt_status_banner(fish: dict, age_days: Optional[int]):
+    """Show a yellow banner if a molt check is due and not yet recorded."""
+    if age_days is None:
+        return
+    has_3mo = bool(fish.get("variety_3mo"))
+    has_4mo = bool(fish.get("variety_4mo"))
+
+    if age_days >= MOLT_4MO_DAYS and not has_4mo:
+        st.warning(
+            f"⏰ **Due for 4-month molt check** — fish is {age_days} days old "
+            f"(threshold {MOLT_4MO_DAYS}d). Record the final variety.",
+            icon="⚠️",
+        )
+    elif age_days >= MOLT_3MO_DAYS and not has_3mo:
+        st.info(
+            f"⏰ **Due for 3-month molt check** — fish is {age_days} days old "
+            f"(threshold {MOLT_3MO_DAYS}d).",
+            icon="⏰",
+        )
+
+
+def _render_molt_checks_popover(fish: dict):
+    fish_uuid = fish["id"]
+    system_id = fish.get("system_id") or "?"
+    age_days = get_fish_age_days(fish)
+
+    with st.popover("🎨 Molt Checks", use_container_width=True):
+        st.markdown(f"### 🎨 Molt Checks — {system_id}")
+        st.caption(
+            "Variety starts as a placeholder (parent cross). "
+            "Record 3-month and 4-month readings as the fish colors up."
+        )
+
+        _molt_status_banner(fish, age_days)
+
+        # ---- Current state ----
+        st.markdown("---")
+        st.markdown("**📋 Current readings**")
+
+        initial = fish.get("variety") or "—"
+        v3 = fish.get("variety_3mo") or "—"
+        d3 = fish.get("variety_3mo_date") or ""
+        v4 = fish.get("variety_4mo") or "—"
+        d4 = fish.get("variety_4mo_date") or ""
+
+        st.markdown(f"**Initial (registration):** `{initial}`")
+        st.markdown(f"**3-month reading:** `{v3}` {'— ' + str(d3) if d3 else ''}")
+        st.markdown(f"**4-month reading:** `{v4}` {'— ' + str(d4) if d4 else ''}")
+        st.markdown(f"**Displayed variety:** **{variety_of(fish)}**")
+
+        # ---- Record 3-month ----
+        st.markdown("---")
+        st.markdown("**📝 Record 3-month reading**")
+        with st.form(f"molt_3mo_{fish_uuid}"):
+            strains = _get_strain_names()
+            default_idx = 0
+            cur3 = fish.get("variety_3mo")
+            if cur3 and cur3 in strains:
+                default_idx = strains.index(cur3)
+
+            new_v3 = st.selectbox(
+                "Variety (3mo)",
+                options=strains if strains else ["No Strains Available"],
+                index=default_idx if strains else 0,
+                key=f"molt3_v_{fish_uuid}",
+            )
+            new_d3 = st.date_input(
+                "Date (3mo)",
+                value=datetime.date.today(),
+                key=f"molt3_d_{fish_uuid}",
+            )
+            save3 = st.form_submit_button("Save 3-month reading", type="primary", use_container_width=True)
+
+        if save3:
+            if not strains:
+                st.error("No strains available. Add one first.")
+            else:
+                ok = edit_fish(fish_uuid, {
+                    "variety_3mo": new_v3,
+                    "variety_3mo_date": str(new_d3),
+                })
+                if ok:
+                    st.success(f"3-month reading saved: {new_v3}")
+                    st.rerun()
+
+        # ---- Record 4-month ----
+        st.markdown("---")
+        st.markdown("**📝 Record 4-month reading**")
+        with st.form(f"molt_4mo_{fish_uuid}"):
+            strains = _get_strain_names()
+            default_idx = 0
+            cur4 = fish.get("variety_4mo")
+            if cur4 and cur4 in strains:
+                default_idx = strains.index(cur4)
+
+            new_v4 = st.selectbox(
+                "Variety (4mo)",
+                options=strains if strains else ["No Strains Available"],
+                index=default_idx if strains else 0,
+                key=f"molt4_v_{fish_uuid}",
+            )
+            new_d4 = st.date_input(
+                "Date (4mo)",
+                value=datetime.date.today(),
+                key=f"molt4_d_{fish_uuid}",
+            )
+            save4 = st.form_submit_button("Save 4-month reading", type="primary", use_container_width=True)
+
+        if save4:
+            if not strains:
+                st.error("No strains available. Add one first.")
+            else:
+                ok = edit_fish(fish_uuid, {
+                    "variety_4mo": new_v4,
+                    "variety_4mo_date": str(new_d4),
+                })
+                if ok:
+                    st.success(f"4-month reading saved: {new_v4}")
+                    st.rerun()
 
 
 # ============================================================
@@ -1087,7 +1341,6 @@ def _render_card_actions(fish: dict):
     system_id = fish.get("system_id") or "?"
     current_status = (fish.get("status") or "").lower()
 
-    # ⭐ Star section at top
     _render_star_section(fish)
     st.divider()
 
@@ -1106,7 +1359,7 @@ def _render_card_actions(fish: dict):
             st.markdown("**Restore this fish?**")
             restore_status = st.selectbox(
                 "Restore to status",
-                options=["Active", "Jarred", "For Sale"],
+                options=["Active", "For Sale", "Retired"],
                 key=f"restore_status_{fish_uuid}",
             )
             if st.button("Confirm Restore", key=f"restore_btn_{fish_uuid}", type="primary", use_container_width=True):
@@ -1134,7 +1387,6 @@ def _render_card_actions(fish: dict):
                     st.success(f"{system_id} culled.")
                     st.rerun()
 
-    # Tank move via new API
     if current_status not in ("culled", "deceased", "retired"):
         current_tank = _get_current_tank_for_fish(fish_uuid)
         current_tank_id = current_tank.get("id") if current_tank else None
@@ -1143,7 +1395,6 @@ def _render_card_actions(fish: dict):
         tank_opts = _get_available_tank_options()
         dd = [{"id": None, "label": "— Leave / Clear Tank —"}] + tank_opts
 
-        # Default index = current tank if present
         default_idx = 0
         if current_tank_id:
             for i, t in enumerate(dd):
@@ -1223,7 +1474,6 @@ def _color_swatch_row(fish: dict) -> str:
 
 
 def _breeder_status_badge_html(breeder_status: Optional[str]) -> str:
-    """Return an HTML badge for a breeder_status, or empty string if not badge-worthy."""
     if not breeder_status:
         return ""
     style = BREEDER_STATUS_BADGES.get(breeder_status)
@@ -1342,7 +1592,6 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
         if fish.get("iridescence_level") and fish["iridescence_level"] != "none":
             badges.append(f"✨ {fish['iridescence_level']}")
 
-        # Tank badge via join table
         current_tank = _get_current_tank_for_fish(fish["id"])
         if current_tank and current_tank.get("location_code"):
             badges.append(f"🪣 {current_tank['location_code']}")
@@ -1350,19 +1599,32 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
         if badges:
             st.caption(" · ".join(badges))
 
-        # Breeder status badge (below, more prominent)
         if breeder_badge:
             st.markdown(
                 f'<div style="margin-top:4px;">{breeder_badge}</div>',
                 unsafe_allow_html=True,
             )
 
-        with st.popover("⚙️ Manage", use_container_width=True):
-            _render_card_actions(fish)
+        # ---- Action popovers ----
+        # Row 1: Manage + Milestones
+        r1c1, r1c2 = st.columns(2)
+        with r1c1:
+            with st.popover("⚙️ Manage", use_container_width=True):
+                _render_card_actions(fish)
+        with r1c2:
+            with st.popover(
+                "📸 Milestones" + (f" ({milestone_count})" if milestone_count else ""),
+                use_container_width=True,
+            ):
+                milestones = get_milestones_for_fish(fish["id"])
+                _render_milestones_section(fish, milestones)
 
-        with st.popover("📸 Milestones" + (f" ({milestone_count})" if milestone_count else ""), use_container_width=True):
-            milestones = get_milestones_for_fish(fish["id"])
-            _render_milestones_section(fish, milestones)
+        # Row 2: Photos + Molt Checks (NEW in Round 2B)
+        r2c1, r2c2 = st.columns(2)
+        with r2c1:
+            _render_side_photos_popover(fish)
+        with r2c2:
+            _render_molt_checks_popover(fish)
 
 
 # ============================================================
