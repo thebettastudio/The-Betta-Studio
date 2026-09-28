@@ -4,19 +4,15 @@
 # Session 9  — Added list_breeders() and register_breeder() for breeder_view.
 # Session 22 — Added cull_fish() and restore_fish_from_culled().
 # Session 23 — Added get_fish_age_days() and grade color helper.
-# breeder_registry.py is retired; all breeder logic lives here.
-#
 # Session 26H.7 — Step 7: change_location uses new tank API.
+# Session 27B — Round 1: 6-status list, Recovering, process_breeder_transitions.
 #
-# Session 27B — Round 1 (this revision):
-#   • VALID_STATUSES narrowed to 6 values (Jarred + Conditioning removed)
-#   • VALID_BREEDER_STATUSES gains "Recovering"
-#   • VALID_STAGES deleted (stage is now computed from age)
-#   • register_fish_from_spawn uses generate_fish_id() (single format)
-#   • register_breeder sets status="Active", breeder_status="Conditioning"
-#   • strain parameter removed from register_new_fish
-#   • New: stage_of(fish), variety_of(fish)
-#   • New: process_breeder_transitions() — auto-flip pass
+# Session 28A (this revision):
+#   • get_fish_age_days() prefers birth_date (fallback: created_at)
+#   • register_new_fish() accepts optional birth_date
+#   • register_fish_from_spawn() accepts optional birth_date
+#     (falls back to spawn's free_swimming_date)
+#   • sync_breeder_status() accepts optional timestamp for backdating
 
 from __future__ import annotations
 
@@ -62,9 +58,6 @@ VALID_GRADES = [
     "Pet Grade",
 ]
 
-# Session 27B — narrowed from 8 values to 6.
-#   - "Jarred"       removed (a location fact, not a life status)
-#   - "Conditioning" removed (moved entirely to breeder_status)
 VALID_STATUSES = [
     "Active",
     "For Sale",
@@ -74,7 +67,6 @@ VALID_STATUSES = [
     "Retired",
 ]
 
-# Session 27B — added "Recovering" for post-spawn male + female.
 VALID_BREEDER_STATUSES = [
     "Available",
     "Conditioning",
@@ -84,9 +76,6 @@ VALID_BREEDER_STATUSES = [
     "Retired",
     "Inactive",
 ]
-
-# Session 27B — VALID_STAGES deleted. Stage is now computed
-# from age via database.compute_stage().
 
 VALID_ORIGINS = ["Purchased", "Batch Spawn"]
 
@@ -110,40 +99,59 @@ def grade_badge_color(grade: Optional[str]) -> str:
     """Return a hex color for a grade badge."""
     g = (grade or "").strip().lower()
     if "show" in g:
-        return "#FFD700"      # gold
+        return "#FFD700"
     if "high" in g:
-        return "#C0C0C0"      # silver
+        return "#C0C0C0"
     if "breeder" in g:
-        return "#CD7F32"      # bronze
+        return "#CD7F32"
     if "material" in g:
-        return "#9CA3AF"      # grey
+        return "#9CA3AF"
     if "pet" in g:
-        return "#E5E7EB"      # light grey
-    return "#E5E7EB"          # default
+        return "#E5E7EB"
+    return "#E5E7EB"
 
 
 def grade_badge_text_color(grade: Optional[str]) -> str:
     """Text color that contrasts well with the badge background."""
     g = (grade or "").strip().lower()
     if "show" in g:
-        return "#4A3800"      # dark brown on gold
+        return "#4A3800"
     if "high" in g:
-        return "#333333"      # dark on silver
+        return "#333333"
     if "breeder" in g:
-        return "#FFFFFF"      # white on bronze
-    return "#1F2937"          # dark grey
+        return "#FFFFFF"
+    return "#1F2937"
+
+
+def _age_date(fish: dict) -> Optional[_dt.date]:
+    """
+    Return the date to use for age computation.
+    Prefers birth_date (may be backdated); falls back to created_at.
+    """
+    birth = fish.get("birth_date")
+    if birth:
+        try:
+            return _dt.date.fromisoformat(str(birth)[:10])
+        except Exception:
+            pass
+    created = fish.get("created_at")
+    if created:
+        try:
+            return _dt.date.fromisoformat(str(created)[:10])
+        except Exception:
+            pass
+    return None
 
 
 def get_fish_age_days(fish: dict) -> Optional[int]:
-    """Days since the fish row was created (registration date)."""
-    created = fish.get("created_at")
-    if not created:
+    """
+    Days since the fish's birth date.
+    Session 28A — prefers birth_date; falls back to created_at.
+    """
+    d = _age_date(fish)
+    if d is None:
         return None
-    try:
-        d = _dt.date.fromisoformat(str(created)[:10])
-        return (_dt.date.today() - d).days
-    except Exception:
-        return None
+    return (_dt.date.today() - d).days
 
 
 def format_fish_age(days: Optional[int]) -> str:
@@ -158,19 +166,12 @@ def format_fish_age(days: Optional[int]) -> str:
 
 
 def stage_of(fish: dict) -> Optional[str]:
-    """
-    Return the computed growth stage for a fish.
-    Session 27B — wrapper around database.compute_stage().
-    Values: fry | juvenile | sub_adult | adult | senior
-    """
+    """Return the computed growth stage for a fish."""
     return compute_stage(fish)
 
 
 def variety_of(fish: dict) -> str:
-    """
-    Return the variety to display.
-    Session 27B — prefers variety_4mo > variety_3mo > variety.
-    """
+    """Return the variety to display (variety_4mo > variety_3mo > variety)."""
     return display_variety(fish)
 
 
@@ -181,12 +182,8 @@ def variety_of(fish: dict) -> str:
 def process_breeder_transitions() -> int:
     """
     Walk every fish with a breeder_status and auto-flip any that
-    have exceeded their duration.
-
-    Call this once per app load (or on demand) to keep breeder
-    statuses in sync with time.
-
-    Returns: number of fish whose status was flipped.
+    have exceeded their duration. Call once per app load.
+    Returns: number of fish flipped.
     """
     flipped = 0
     try:
@@ -293,8 +290,13 @@ def register_new_fish(
     line_code: str = "UNK",
     generation: str = "P1",
     status: str = "Active",
+    birth_date: Optional[str] = None,
 ) -> Optional[dict]:
-    """Register a manually-acquired fish (purchased or unknown origin)."""
+    """
+    Register a manually-acquired fish (purchased or unknown origin).
+    Session 28A — accepts optional birth_date (ISO string 'YYYY-MM-DD').
+    If omitted, age falls back to created_at.
+    """
     system_id = generate_fish_id()
 
     photo_id = None
@@ -325,6 +327,7 @@ def register_new_fish(
         "status": status,
         "is_breeder": False,
         "breeder_status": None,
+        "birth_date": birth_date,
     }
 
     saved = create_fish(record)
@@ -346,11 +349,13 @@ def register_fish_from_spawn(
     location: str = "",
     notes: str = "",
     photo_file=None,
+    birth_date: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Register a jarred fry from a spawn. Inherits lineage.
-    Session 27B — uses generate_fish_id() (single FISH-NNNN format).
-    Session 27B — status defaults to "Active" (Jarred removed from statuses).
+    Session 28A — accepts optional birth_date; falls back to the
+    spawn's free_swimming_date so backdated spawns produce
+    correctly-aged fry.
     """
     spawn = next((s for s in get_all_spawns() if s["id"] == spawn_id), None)
     if not spawn:
@@ -359,6 +364,9 @@ def register_fish_from_spawn(
 
     spawn_sys = spawn.get("system_id") or "SPN-UNK-P1-01"
     system_id = generate_fish_id()
+
+    # Resolve birth_date: explicit → spawn's free_swimming_date → None
+    resolved_birth_date = birth_date or spawn.get("free_swimming_date")
 
     photo_id = None
     if photo_file is not None:
@@ -386,6 +394,7 @@ def register_fish_from_spawn(
         "status": "Active",
         "is_breeder": False,
         "breeder_status": None,
+        "birth_date": resolved_birth_date,
     }
 
     saved = create_fish(record)
@@ -583,8 +592,6 @@ def register_breeder(
     """
     Convenience wrapper: register a new fish AND immediately promote
     to breeder.
-    Session 27B — status is now "Active" (not "Conditioning");
-    breeder_status carries the Conditioning signal.
     """
     from modules.id_generator import _sanitize
 
@@ -684,14 +691,24 @@ def get_breeder_stats() -> dict:
     }
 
 
-def sync_breeder_status(fish_id: str, new_status: str) -> bool:
+def sync_breeder_status(
+    fish_id: str,
+    new_status: str,
+    timestamp: Optional[str] = None,
+) -> bool:
     """
     Called by spawn_manager when a pairing starts/ends.
-    Session 27B — also stamps breeder_status_started_at.
+    Session 28A — accepts an optional timestamp so backdated
+    free-swimming events correctly stamp the countdown start.
+
+    Args:
+        fish_id:    the fish uuid
+        new_status: e.g. "In Pairing", "Recovering", "Available"
+        timestamp:  ISO datetime string; defaults to now
     """
     return update_fish(fish_id, {
         "breeder_status": new_status,
-        "breeder_status_started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "breeder_status_started_at": timestamp or _dt.datetime.now().isoformat(timespec="seconds"),
     })
 
 
