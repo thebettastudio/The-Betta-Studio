@@ -3,10 +3,16 @@
 # Session 11 — Ported to Supabase.
 # ... (through Session 27B)
 #
-# Session 28A/B3 (this revision):
-#   • Register form: Birth Date picker (defaults today)
-#   • Passes birth_date to register_new_fish()
-#   • Description updated for backdating
+# Session 28A/B3 — Register form: Birth Date picker (defaults today);
+#   passes birth_date to register_new_fish().
+#
+# Session 28B — Round 3 (this revision): PERFORMANCE
+#   • Batched fish→tank location map (get_all_occupants_for_fish +
+#     cached get_all_tanks) replaces per-tile/per-row DB calls.
+#   • _get_available_tank_options() now @st.cache_data(ttl=45).
+#   • Grid tiles, table rows, and Manage popovers all read from
+#     the pre-built map instead of N+1 queries.
+#   • No visible behavior change.
 
 import io
 import datetime
@@ -38,6 +44,8 @@ from database import (
     create_strain,
     delete_strain,
     get_all_fish,
+    get_all_tanks,
+    get_all_occupants_for_fish,
     get_milestones_for_fish,
     get_milestone_counts_by_fish,
     get_occupants_for_fish,
@@ -106,6 +114,8 @@ DISPLAY_WIDTH = 480
 VIDEO_SAMPLE_EVERY = 5
 VIDEO_MAX_FRAMES = 30
 VIDEO_MAX_MB = 150
+
+CACHE_TTL = 45
 
 BREEDER_STATUS_BADGES = {
     "Recovering":   ("🟡", "#FEF3C7", "#92400E"),
@@ -228,11 +238,47 @@ def _delete_strain(name: str) -> bool:
 # TANK HELPERS
 # ============================================================
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def _get_available_tank_options() -> list[dict]:
+    """Cached (Session 28B) — was hitting DB on every call, including
+    once per fish tile inside the Manage popover."""
     return get_tank_dropdown_items()
 
 
+def _build_fish_location_map() -> dict[str, dict]:
+    """
+    Session 28B — build { fish_id: tank_row } in two queries total.
+
+    Replaces N calls to _get_current_tank_for_fish() in grid tiles,
+    table rows, and Manage popovers.
+    """
+    try:
+        occupants_by_fish = get_all_occupants_for_fish()
+    except Exception:
+        occupants_by_fish = {}
+    try:
+        tanks_by_id = {t["id"]: t for t in get_all_tanks()}
+    except Exception:
+        tanks_by_id = {}
+
+    out: dict[str, dict] = {}
+    for fid, rows in occupants_by_fish.items():
+        if not rows:
+            continue
+        tid = rows[0].get("tank_id")
+        if not tid:
+            continue
+        tank = tanks_by_id.get(tid)
+        if tank:
+            out[fid] = tank
+    return out
+
+
 def _get_current_tank_for_fish(fish_id: str) -> Optional[dict]:
+    """
+    Slow-path fallback (unchanged). Grid/table/actions no longer call
+    this in a loop — they receive a pre-built map instead.
+    """
     try:
         occupants = get_occupants_for_fish(fish_id)
     except Exception:
@@ -1324,7 +1370,12 @@ def _render_milestones_section(fish: dict, milestones: list[dict]):
 # CARD ACTIONS
 # ============================================================
 
-def _render_card_actions(fish: dict):
+def _render_card_actions(fish: dict, fish_location: Optional[dict] = None):
+    """
+    Session 28B — accepts optional fish_location (tank row) so we
+    don't hit the DB again per tile. Falls back to the slow path if
+    called standalone.
+    """
     fish_uuid = fish["id"]
     system_id = fish.get("system_id") or "?"
     current_status = (fish.get("status") or "").lower()
@@ -1376,7 +1427,12 @@ def _render_card_actions(fish: dict):
                     st.rerun()
 
     if current_status not in ("culled", "deceased", "retired"):
-        current_tank = _get_current_tank_for_fish(fish_uuid)
+        # Session 28B — use pre-built location map when provided.
+        if fish_location is not None:
+            current_tank = fish_location
+        else:
+            current_tank = _get_current_tank_for_fish(fish_uuid)
+
         current_tank_id = current_tank.get("id") if current_tank else None
         current_tank_loc = current_tank.get("location_code") if current_tank else None
 
@@ -1526,7 +1582,12 @@ def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
 # GRID TILE
 # ============================================================
 
-def _render_grid_tile(fish: dict, milestone_count: int = 0):
+def _render_grid_tile(fish: dict, milestone_count: int = 0,
+                      fish_location: Optional[dict] = None):
+    """
+    Session 28B — accepts optional fish_location (tank row) so we
+    don't hit the DB per tile. Falls back to slow path if absent.
+    """
     system_id = fish.get("system_id") or "?"
     status = (fish.get("status") or "Active").lower()
     is_culled = status in ("culled", "deceased")
@@ -1580,7 +1641,12 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
         if fish.get("iridescence_level") and fish["iridescence_level"] != "none":
             badges.append(f"✨ {fish['iridescence_level']}")
 
-        current_tank = _get_current_tank_for_fish(fish["id"])
+        # Session 28B — use pre-built location map when provided.
+        if fish_location is not None:
+            current_tank = fish_location
+        else:
+            current_tank = _get_current_tank_for_fish(fish["id"])
+
         if current_tank and current_tank.get("location_code"):
             badges.append(f"🪣 {current_tank['location_code']}")
 
@@ -1596,7 +1662,7 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
         r1c1, r1c2 = st.columns(2)
         with r1c1:
             with st.popover("⚙️ Manage", use_container_width=True):
-                _render_card_actions(fish)
+                _render_card_actions(fish, fish_location=fish_location)
         with r1c2:
             with st.popover(
                 "📸 Milestones" + (f" ({milestone_count})" if milestone_count else ""),
@@ -1616,14 +1682,23 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
 # TABLE VIEW
 # ============================================================
 
-def _render_table_view(filtered: list[dict], milestone_counts: dict):
+def _render_table_view(filtered: list[dict], milestone_counts: dict,
+                       location_map: Optional[dict] = None):
+    """
+    Session 28B — accepts optional location_map {fish_id: tank_row}
+    so we don't fire N per-row DB calls.
+    """
+    location_map = location_map or {}
     rows = []
     for f in filtered:
         age_days = get_fish_age_days(f)
         palette = f.get("color_palette") or {}
         palette_str = ", ".join(f"{k} {v:.0f}%" for k, v in sorted(palette.items(), key=lambda x: -x[1])[:3])
 
-        current_tank = _get_current_tank_for_fish(f["id"])
+        current_tank = location_map.get(f["id"])
+        if current_tank is None and not location_map:
+            # Only fall back to slow path when no map was provided at all.
+            current_tank = _get_current_tank_for_fish(f["id"])
         tank_loc = current_tank.get("location_code") if current_tank else "—"
 
         stage = stage_of(f) or "—"
@@ -1675,6 +1750,9 @@ def render_list_tab():
         return
 
     milestone_counts = get_milestone_counts_by_fish()
+
+    # Session 28B — one batched location map for the whole page.
+    location_map = _build_fish_location_map()
 
     alive = [
         f for f in all_fish
@@ -1752,7 +1830,7 @@ def render_list_tab():
         return
 
     if view_mode == "📊 Table":
-        _render_table_view(filtered, milestone_counts)
+        _render_table_view(filtered, milestone_counts, location_map=location_map)
         return
 
     total_pages = max(1, (len(filtered) + CARD_PAGE_SIZE - 1) // CARD_PAGE_SIZE)
@@ -1771,7 +1849,11 @@ def render_list_tab():
     cols = st.columns(3)
     for idx, fish in enumerate(page_items):
         with cols[idx % 3]:
-            _render_grid_tile(fish, milestone_count=milestone_counts.get(fish["id"], 0))
+            _render_grid_tile(
+                fish,
+                milestone_count=milestone_counts.get(fish["id"], 0),
+                fish_location=location_map.get(fish["id"]),
+            )
 
 
 # ============================================================
