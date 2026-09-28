@@ -1,27 +1,12 @@
 # views/fish_registry_view.py
 # Betta Farm Management System
 # Session 11 — Ported to Supabase.
-# Session 16 — View Lineage button.
-# Session 18 — Strains DB-managed.
-# Session 20 — Milestone tracking.
-# Session 22 — Cull Fish button.
-# Session 23 — Visual Grid + Table + Highlight strip.
-# Session 23b — Uniform 4:3 rounded images.
-# Session 24A — Photo cropper + form reset.
-# Session 26A — Multi-shot color capture (photo-based).
-# Session 26B — Multi-photo upload + tap-to-select region analysis.
-# Session 26C — Added video upload (auto frame scan).
-# Session 26D fix — Better video UX + best frame handling.
-# Session 26D round 2 — Stronger framing warning banner.
-# Session 26H.7 — Step 5: ⭐ star toggle + new tank API.
-# Session 27B — Round 2A: status cleanup, stage + breeder_status.
+# ... (through Session 27B)
 #
-# Session 27B — Round 2B (this revision):
-#   • New popover: 🖼️ Photos — side A/B photos with auto-analysis
-#   • New popover: 🎨 Molt Checks — 3mo / 4mo variety readings
-#   • Auto-flag when a molt check is due (age-based)
-#   • Upload side photo: single-pass analysis (no tap-to-select)
-#   • Pick any side photo as fish.photo_id profile
+# Session 28A/B3 (this revision):
+#   • Register form: Birth Date picker (defaults today)
+#   • Passes birth_date to register_new_fish()
+#   • Description updated for backdating
 
 import io
 import datetime
@@ -700,6 +685,14 @@ def render_register_tab():
             purchase_date = st.date_input("Purchase Date", datetime.date.today(), key=f"pdate_{form_version}")
             purchase_cost = st.number_input("Purchase Cost (₱)", min_value=0.0, value=0.0, step=50.0, key=f"pcost_{form_version}")
 
+            birth_date = st.date_input(
+                "Birth Date",
+                value=datetime.date.today(),
+                key=f"birth_date_{form_version}",
+                help="Backdate if you're recording an older fish. "
+                     "Age, stage, and molt check timing all compute from this.",
+            )
+
         with col2:
             st.markdown("##### 🪣 Tank & Container Assignment")
             tank_opts = _get_available_tank_options()
@@ -811,6 +804,7 @@ def render_register_tab():
         line_code="UNK",
         generation="P1",
         status="Active",
+        birth_date=str(birth_date),
     )
 
     if not result:
@@ -894,7 +888,7 @@ def _render_star_section(fish: dict):
 
 
 # ============================================================
-# 🖼️ SIDE PHOTOS POPOVER (Round 2B)
+# 🖼️ SIDE PHOTOS POPOVER
 # ============================================================
 
 def _photo_analysis_summary(analysis: dict) -> str:
@@ -928,7 +922,6 @@ def _render_side_photos_popover(fish: dict):
             "Each photo is analyzed once. Pick any as the profile picture."
         )
 
-        # ---- Existing photos ----
         photos = get_fish_photos(fish_uuid)
         if photos:
             st.markdown(f"**Existing photos ({len(photos)})**")
@@ -972,7 +965,6 @@ def _render_side_photos_popover(fish: dict):
                                 use_container_width=True,
                             ):
                                 if delete_fish_photo(p["id"]):
-                                    # also delete Drive file (best effort)
                                     try:
                                         delete_drive_file(p["photo_id"])
                                     except Exception:
@@ -984,7 +976,6 @@ def _render_side_photos_popover(fish: dict):
 
         st.divider()
 
-        # ---- Upload new ----
         st.markdown("**➕ Upload new side photo**")
 
         upload_key = f"side_upload_{fish_uuid}"
@@ -1061,7 +1052,7 @@ def _render_side_photos_popover(fish: dict):
 
 
 # ============================================================
-# 🎨 MOLT CHECKS POPOVER (Round 2B)
+# 🎨 MOLT CHECKS POPOVER
 # ============================================================
 
 def _molt_status_banner(fish: dict, age_days: Optional[int]):
@@ -1099,7 +1090,6 @@ def _render_molt_checks_popover(fish: dict):
 
         _molt_status_banner(fish, age_days)
 
-        # ---- Current state ----
         st.markdown("---")
         st.markdown("**📋 Current readings**")
 
@@ -1114,7 +1104,6 @@ def _render_molt_checks_popover(fish: dict):
         st.markdown(f"**4-month reading:** `{v4}` {'— ' + str(d4) if d4 else ''}")
         st.markdown(f"**Displayed variety:** **{variety_of(fish)}**")
 
-        # ---- Record 3-month ----
         st.markdown("---")
         st.markdown("**📝 Record 3-month reading**")
         with st.form(f"molt_3mo_{fish_uuid}"):
@@ -1149,7 +1138,6 @@ def _render_molt_checks_popover(fish: dict):
                     st.success(f"3-month reading saved: {new_v3}")
                     st.rerun()
 
-        # ---- Record 4-month ----
         st.markdown("---")
         st.markdown("**📝 Record 4-month reading**")
         with st.form(f"molt_4mo_{fish_uuid}"):
@@ -1605,8 +1593,6 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
                 unsafe_allow_html=True,
             )
 
-        # ---- Action popovers ----
-        # Row 1: Manage + Milestones
         r1c1, r1c2 = st.columns(2)
         with r1c1:
             with st.popover("⚙️ Manage", use_container_width=True):
@@ -1619,7 +1605,6 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
                 milestones = get_milestones_for_fish(fish["id"])
                 _render_milestones_section(fish, milestones)
 
-        # Row 2: Photos + Molt Checks (NEW in Round 2B)
         r2c1, r2c2 = st.columns(2)
         with r2c1:
             _render_side_photos_popover(fish)
