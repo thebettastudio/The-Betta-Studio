@@ -4,11 +4,15 @@
 #
 # Session 26H.7 — Step 4 v2: compact single-line rows.
 #
-# Session 27B — Round 2C (this revision):
-#   • _occupant_short(): append breeder_status badge when
-#     Recovering / Conditioning / In Pairing / Ready
-#   • _occupant_chip_text(): same badge in the expanded card
-#   Nothing else changes.
+# Session 27B — Round 2C: _occupant_short() and _occupant_chip_text()
+#   append breeder_status badge.
+#
+# Session 28B — Round 2 (this revision): PERFORMANCE
+#   • _render_inventory() uses one batched get_all_tank_occupants()
+#     call instead of N per-tank queries.
+#   • _occupant_short()/_occupant_chip_text() use a pre-built
+#     batch_index for fry-batch lookups (was N+1 inside card).
+#   • No visible behavior change; every UI element is unchanged.
 
 from __future__ import annotations
 
@@ -556,7 +560,8 @@ def _modal_change_purpose(tank: dict):
 # ============================================================
 
 @st.dialog("🗑️ Delete Tank — Transfer Occupants", width="large")
-def _modal_delete_with_transfer(tank: dict, occupants: list[dict], fish_index: dict):
+def _modal_delete_with_transfer(tank: dict, occupants: list[dict], fish_index: dict,
+                                batch_index: Optional[dict] = None):
     tank_id = tank["id"]
     loc = tank.get("location_code") or "?"
 
@@ -574,7 +579,7 @@ def _modal_delete_with_transfer(tank: dict, occupants: list[dict], fish_index: d
 
     transfers = {}
     for occ in occupants:
-        label = _occupant_chip_text(occ, fish_index)
+        label = _occupant_chip_text(occ, fish_index, batch_index=batch_index)
         key = (occ["occupant_type"], occ["occupant_id"])
         with st.container(border=True):
             st.markdown(f"**{label}**")
@@ -611,10 +616,11 @@ def _modal_delete_with_transfer(tank: dict, occupants: list[dict], fish_index: d
 
 
 # ============================================================
-# OCCUPANT CHIP TEXT (Session 27B Round 2C updated)
+# OCCUPANT CHIP TEXT (Session 28B — accepts optional batch_index)
 # ============================================================
 
-def _occupant_chip_text(occ: dict, fish_index: dict) -> str:
+def _occupant_chip_text(occ: dict, fish_index: dict,
+                        batch_index: Optional[dict] = None) -> str:
     """Full occupant label for the expanded card."""
     otype = occ.get("occupant_type")
     oid = occ.get("occupant_id")
@@ -631,17 +637,23 @@ def _occupant_chip_text(occ: dict, fish_index: dict) -> str:
         # Session 27B Round 2C — append breeder_status badge
         return base + _breeder_status_badge_full(fish)
     elif otype == "fry_batch":
-        try:
-            from database import get_fry_batch_by_id
-            batch = get_fry_batch_by_id(oid)
-            tag = batch.get("batch_tag") if batch else str(oid)[:8]
-        except Exception:
-            tag = str(oid)[:8]
+        tag = None
+        if batch_index is not None:
+            batch = batch_index.get(oid)
+            tag = batch.get("batch_tag") if batch else None
+        if tag is None:
+            try:
+                from database import get_fry_batch_by_id
+                batch = get_fry_batch_by_id(oid)
+                tag = batch.get("batch_tag") if batch else str(oid)[:8]
+            except Exception:
+                tag = str(oid)[:8]
         return f"🐣 Fry batch: {tag}"
     return f"{otype} {str(oid)[:8]}"
 
 
-def _occupant_short(occ: dict, fish_index: dict) -> str:
+def _occupant_short(occ: dict, fish_index: dict,
+                    batch_index: Optional[dict] = None) -> str:
     """Very short occupant label for the collapsed row."""
     otype = occ.get("occupant_type")
     oid = occ.get("occupant_id")
@@ -655,12 +667,17 @@ def _occupant_short(occ: dict, fish_index: dict) -> str:
         # Session 27B Round 2C — append short breeder_status badge
         return base + _breeder_status_badge_short(fish)
     elif otype == "fry_batch":
-        try:
-            from database import get_fry_batch_by_id
-            batch = get_fry_batch_by_id(oid)
-            tag = batch.get("batch_tag") if batch else str(oid)[:8]
-        except Exception:
-            tag = str(oid)[:8]
+        tag = None
+        if batch_index is not None:
+            batch = batch_index.get(oid)
+            tag = batch.get("batch_tag") if batch else None
+        if tag is None:
+            try:
+                from database import get_fry_batch_by_id
+                batch = get_fry_batch_by_id(oid)
+                tag = batch.get("batch_tag") if batch else str(oid)[:8]
+            except Exception:
+                tag = str(oid)[:8]
         return f"🐣 {tag}"
     return str(oid)[:8]
 
@@ -684,7 +701,8 @@ def _is_expiring_soon(tank: dict, days: int = 3) -> bool:
 # COMPACT ROW + EXPANDED CARD
 # ============================================================
 
-def _render_tank_row(tank: dict, fish_index: dict):
+def _render_tank_row(tank: dict, fish_index: dict,
+                     batch_index: Optional[dict] = None):
     tank_id = tank["id"]
     loc = tank.get("location_code") or "?"
     ttype = _tank_type_label(tank.get("tank_type") or "")
@@ -699,7 +717,7 @@ def _render_tank_row(tank: dict, fish_index: dict):
 
     if occupants:
         if len(occupants) == 1:
-            occ_short = _occupant_short(occupants[0], fish_index)
+            occ_short = _occupant_short(occupants[0], fish_index, batch_index=batch_index)
         else:
             occ_short = f"{len(occupants)} occupants"
     elif status == "Reserved":
@@ -825,7 +843,7 @@ def _render_tank_row(tank: dict, fish_index: dict):
                 st.caption("_None_")
             else:
                 for occ in occupants:
-                    text = _occupant_chip_text(occ, fish_index)
+                    text = _occupant_chip_text(occ, fish_index, batch_index=batch_index)
                     row_c1, row_c2 = st.columns([6, 1])
                     with row_c1:
                         st.markdown(text)
@@ -900,7 +918,8 @@ def _render_tank_row(tank: dict, fish_index: dict):
                         st.caption("**Danger zone**")
                         if occupants:
                             if st.button("🗑️ Delete (transfer first)", key=f"more_del_{tank_id}", use_container_width=True):
-                                _modal_delete_with_transfer(tank, occupants, fish_index)
+                                _modal_delete_with_transfer(tank, occupants, fish_index,
+                                                            batch_index=batch_index)
                         else:
                             confirm_del = st.checkbox("Confirm delete", key=f"more_del_confirm_{tank_id}")
                             if st.button(
@@ -949,8 +968,17 @@ def _sort_key_factory(sort_mode: str):
 
 
 # ============================================================
-# INVENTORY
+# INVENTORY  (Session 28B — batched occupant fetch)
 # ============================================================
+
+def _build_batch_index() -> dict:
+    """Pre-build {batch_id: batch_row} for fry-batch chip rendering."""
+    try:
+        from database import get_all_fry_batches
+        return {b["id"]: b for b in get_all_fry_batches()}
+    except Exception:
+        return {}
+
 
 def _render_inventory():
     all_tanks = list_all_tanks()
@@ -965,17 +993,41 @@ def _render_inventory():
     except Exception:
         pass
 
-    from database import get_tank_occupants
-    for t in all_tanks:
+    # Session 28B — ONE batched occupant query instead of N per-tank.
+    occupants_by_tank: dict = {}
+    try:
+        from database import get_all_tank_occupants
+        occupants_by_tank = get_all_tank_occupants()
+    except Exception:
+        occupants_by_tank = {}
+
+    # Fallback: if batch map is empty but tanks exist, fall back to per-tank.
+    # (Covers the rare case where cache errored or DB call failed.)
+    use_fallback = not occupants_by_tank
+    fallback_fn = None
+    if use_fallback:
         try:
-            occupants = get_tank_occupants(t["id"])
+            from database import get_tank_occupants as _gto
+            fallback_fn = _gto
         except Exception:
-            occupants = []
+            fallback_fn = None
+
+    for t in all_tanks:
+        if use_fallback and fallback_fn is not None:
+            try:
+                occupants = fallback_fn(t["id"])
+            except Exception:
+                occupants = []
+        else:
+            occupants = occupants_by_tank.get(t["id"], [])
         t["_occupants"] = occupants
         t["_has_star"] = any(
             _is_starred_occupant(o["occupant_type"], o["occupant_id"], fish_index)
             for o in occupants
         )
+
+    # Session 28B — batch index for fry-batch chips (was N+1 inside cards).
+    batch_index = _build_batch_index()
 
     counts = {s: 0 for s in VALID_STATUSES}
     for t in all_tanks:
@@ -1103,7 +1155,7 @@ def _render_inventory():
         return
 
     for t in filtered:
-        _render_tank_row(t, fish_index)
+        _render_tank_row(t, fish_index, batch_index=batch_index)
 
 
 # ============================================================
