@@ -4,11 +4,16 @@
 #
 # Session 26H.7 — Step 6: KPI row, action-needed, starred panel, jars.
 #
-# Session 27B — Round 3A (this revision):
-#   • Breeders table uses variety_of() + computed stage
-#   • Starred panel uses variety_of()
-#   • Removed any reliance on the dropped 'stage' column
-#   • Layout unchanged; no destructive changes
+# Session 27B — Round 3A: Breeders table uses variety_of() + computed
+#   stage; starred panel uses variety_of(); removed reliance on the
+#   dropped 'stage' column.
+#
+# Session 28B — Round 4 (this revision): PERFORMANCE
+#   • _render_action_needed() filters the already-fetched tanks list
+#     locally instead of calling get_expiring_reservations() (one
+#     fewer DB round-trip per dashboard load).
+#   • Removed unused get_tank_occupants import.
+#   • No visible behavior change.
 
 import datetime as _dt
 
@@ -22,11 +27,9 @@ from database import (
     get_all_spawns,
     get_dashboard_counts,
     get_expiring_reservations,
-    get_tank_occupants,
 )
 from modules.fish_manager import variety_of, stage_of
 from modules.photo_service import photo_url
-
 
 # ============================================================
 # HELPERS
@@ -115,8 +118,40 @@ def _spawns_dataframe(spawns: list, tank_by_id: dict) -> pd.DataFrame:
 # SECTION: ACTION NEEDED (expiring reservations)
 # ============================================================
 
+def _filter_expiring_from_tanks(tanks: list, days_ahead: int = 3) -> list:
+    """
+    Session 28B — return reservations expiring within days_ahead,
+    computed locally from an already-fetched tanks list. Replaces
+    a separate get_expiring_reservations() DB round-trip.
+    """
+    today = _dt.date.today()
+    cutoff = today + _dt.timedelta(days=days_ahead)
+    out = []
+    for t in tanks:
+        if (t.get("status") or "").strip() != "Reserved":
+            continue
+        until_raw = t.get("reserved_until")
+        if not until_raw:
+            continue
+        try:
+            until = _dt.date.fromisoformat(str(until_raw))
+        except Exception:
+            continue
+        if until <= cutoff:
+            out.append(t)
+    return out
+
+
 def _render_action_needed(tanks: list):
-    expiring = get_expiring_reservations(days_ahead=3)
+    """
+    Session 28B — prefer the caller's already-fetched tanks list;
+    only fall back to the DB helper if tanks is empty.
+    """
+    if tanks:
+        expiring = _filter_expiring_from_tanks(tanks, days_ahead=3)
+    else:
+        expiring = get_expiring_reservations(days_ahead=3)
+
     if not expiring:
         return
 
@@ -154,7 +189,7 @@ def _render_action_needed(tanks: list):
         if len(expiring) > 10:
             st.caption(f"... and {len(expiring) - 10} more")
 
-        st.caption("→ Open **🪣 Tank & Container Registry** to review or cancel.")
+        st.caption("→ Open ** Tank & Container Registry** to review or cancel.")
 
 
 # ============================================================
@@ -209,7 +244,7 @@ def _render_jarring_capacity(tanks: list):
 
     with st.container(border=True):
         n = len(jarring_empty)
-        st.markdown(f"### 🫙 Jarring Capacity: **{n}** empty jar(s) ready")
+        st.markdown(f"###  Jarring Capacity: **{n}** empty jar(s) ready")
         st.caption(
             "Empty/Idle tanks with purpose = **Jarring**. "
             "These are ready for individual male/female jarring."
@@ -268,7 +303,7 @@ def render_dashboard():
     c2.metric("⚪ Available", available_tanks)
     c3.metric("🟡 Reserved", reserved_tanks)
     c4.metric("🟢 Occupied", occupied_tanks)
-    c5.metric("🫙 Empty Jars", available_jars)
+    c5.metric(" Empty Jars", available_jars)
     c6.metric("Total Breeders", total_breeders)
     c7.metric("M / F", f"{male_breeders} / {female_breeders}")
     c8.metric("Active Spawns", active_spawns)
@@ -296,7 +331,7 @@ def render_dashboard():
 
     # Tank statuses
     with chart_col1:
-        st.markdown("**🪣 Tank Statuses**")
+        st.markdown("** Tank Statuses**")
         if tanks:
             df_t = pd.DataFrame([{"Status": t.get("status") or "Empty / Idle"} for t in tanks])
             tank_counts = df_t["Status"].value_counts().reset_index()
@@ -353,7 +388,7 @@ def render_dashboard():
     # --------------------------------------------------------------------------
     st.subheader("📋 Studio Inventory Quick Inspection")
     tab_tanks, tab_breeders, tab_spawns = st.tabs([
-        "🪣 Tanks & Containers",
+        " Tanks & Containers",
         "🐟 Breeder Inventory",
         "❤️ Pairings & Spawns",
     ])
