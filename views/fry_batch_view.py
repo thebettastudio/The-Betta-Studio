@@ -7,21 +7,23 @@
 # Session 28A/B2 — Jar Fry popover: Jarring Date picker; batch's
 #   jarring_date updated; passed to jar_fry_bulk for birth_date.
 #
-# Session 29 (this revision) — Fry batch fixes + M/F layout:
+# Session 29 — Fry batch fixes + M/F layout:
 #   • Parent thumbnails removed from card header.
 #   • New M/F showcase panel (right column, 65% width) with
-#     wide 4:3 rounded-square parent photos, details below, and
-#     "View fish →" link.
+#     wide 4:3 rounded-square parent photos.
 #   • Batch Outcome panel moved to left column (35% width).
-#   • Fixed StreamlitDuplicateElementKey: button keys now include
-#     batch_uuid so multiple cards sharing the same parent fish
-#     don't collide.
-#   • Jarring failures surfaced — messages now survive st.rerun()
-#     via session_state so the user actually sees them.
-#   • _stage_due_hint() now measures from free_swimming_date
-#     (via spawn), not hatch_date, so the hint fires at the right
-#     stage.
-#   • _render_list_section() fetches list_all_batches() once.
+#   • StreamlitDuplicateElementKey fixed via batch_uuid in keys.
+#   • Jarring messages survive st.rerun().
+#   • Stage-due hint anchored to free_swimming_date.
+#
+# Session 29/D (this revision) — Undo Jar + Delete Batch & Fish:
+#   • ⚙️ Edit / Delete popover now contains:
+#       ↩️ Undo Jar — reverses a jarring (deletes jarred fish,
+#          restores current_count, clears jarring_date, stage back
+#          to free_swimming). Preview shows fish count + new count.
+#       🔥 Delete Batch & Jarred Fish — requires typing the batch
+#          tag to confirm. Nukes fish AND batch.
+#       🗑️ Delete Batch Only — existing behavior (checkbox confirm).
 
 import datetime
 from typing import Optional
@@ -35,12 +37,16 @@ from modules.fry_batch_manager import (
     suggest_batch_tag,
     create_batch_from_spawn,
     get_batch_parents,
+    get_batch_jarred_fish,
+    count_batch_jarred_fish,
     edit_batch,
     advance_stage,
     set_current_count,
     assign_batch_tank,
     jar_fry_bulk,
+    undo_batch_jar,
     delete_batch,
+    delete_batch_and_fish,
     VALID_STAGES,
     ACTIVE_STAGES,
 )
@@ -74,24 +80,19 @@ STAGE_ICONS = {
     "adult":         "🌳",
 }
 
-# Stage-due hint: how long a batch may sit in fry/free_swimming
-# before we nudge the user. Measured from FREE_SWIMMING_DATE when
-# available (fallback: hatch_date).
 STAGE_DUE_DAYS = 14
 STAGE_DUE_HINT_STAGES = ("fry", "free_swimming")
 
-# M/F showcase styling
-PARENT_PHOTO_RADIUS = 24         # px, rounded-square
+PARENT_PHOTO_RADIUS = 24
 PARENT_PHOTO_BORDER = "#E5E7EB"
 PARENT_PHOTO_BG = "#F3F4F6"
-PARENT_PHOTO_ASPECT = "4/3"      # wide, matches betta side shots
+PARENT_PHOTO_ASPECT = "4/3"
 
-# Column split between outcome panel and M/F showcase.
 OUTCOME_COL_WEIGHT = 35
 MF_COL_WEIGHT = 65
 
-# Session_state key for post-rerun jarring messages.
 _JAR_MESSAGE_KEY = "_fry_jar_pending_message"
+_DANGER_MESSAGE_KEY = "_fry_danger_pending_message"
 
 
 # ============================================================
@@ -128,18 +129,10 @@ def _days_since(date_iso) -> Optional[int]:
 
 
 def _stage_due_hint(batch: dict, spawn: Optional[dict]) -> Optional[str]:
-    """
-    Nudge if a batch has been in fry/free_swimming too long.
-
-    Session 29 fix — measures from the spawn's free_swimming_date
-    (falls back to hatch_date). Previously used hatch_date only,
-    which fired ~45 days late.
-    """
     stage = (batch.get("stage") or "").lower()
     if stage not in STAGE_DUE_HINT_STAGES:
         return None
 
-    # Prefer free_swimming_date from the linked spawn; fall back to hatch_date.
     anchor_iso = None
     anchor_label = ""
     if spawn and spawn.get("free_swimming_date"):
@@ -159,14 +152,12 @@ def _stage_due_hint(batch: dict, spawn: Optional[dict]) -> Optional[str]:
     )
 
 
-def _queue_jar_message(kind: str, text: str) -> None:
-    """Store a post-rerun message in session_state."""
-    st.session_state[_JAR_MESSAGE_KEY] = {"kind": kind, "text": text}
+def _queue_message(key: str, kind: str, text: str) -> None:
+    st.session_state[key] = {"kind": kind, "text": text}
 
 
-def _drain_jar_message() -> None:
-    """Render and clear any pending jar message. Call at top of page."""
-    msg = st.session_state.pop(_JAR_MESSAGE_KEY, None)
+def _drain_message(key: str) -> None:
+    msg = st.session_state.pop(key, None)
     if not msg:
         return
     kind = msg.get("kind")
@@ -186,10 +177,6 @@ def _drain_jar_message() -> None:
 # ============================================================
 
 def _parent_photo_html(fish: Optional[dict], gender_sym: str) -> str:
-    """
-    Wide rounded-square photo that fills its container width.
-    Aspect ratio is 4:3 so betta side shots don't crop fins.
-    """
     wrapper_style = (
         f"width:100%;aspect-ratio:{PARENT_PHOTO_ASPECT};"
         f"border-radius:{PARENT_PHOTO_RADIUS}px;"
@@ -205,7 +192,6 @@ def _parent_photo_html(fish: Optional[dict], gender_sym: str) -> str:
             f'style="width:100%;height:100%;object-fit:cover;display:block;" />'
         )
     else:
-        # Responsive glyph size so it looks right at any column width.
         inner = (
             f'<div style="color:#9CA3AF;font-size:clamp(48px,8vw,96px);'
             f'line-height:1;">{gender_sym}</div>'
@@ -214,7 +200,6 @@ def _parent_photo_html(fish: Optional[dict], gender_sym: str) -> str:
 
 
 def _parent_details_html(fish: Optional[dict], gender_sym: str, label: str) -> str:
-    """Details block beneath the photo."""
     if not fish:
         return (
             f'<div style="text-align:center;margin-top:10px;">'
@@ -244,12 +229,6 @@ def _parent_details_html(fish: Optional[dict], gender_sym: str, label: str) -> s
 
 
 def _render_mf_showcase(parents: dict, batch_uuid: str):
-    """
-    Right-column panel: two side-by-side M & F wide photos.
-
-    batch_uuid namespaces button keys so multiple batch cards
-    sharing the same parent fish don't collide in Streamlit.
-    """
     st.markdown("##### 🧬 Parents")
 
     male = parents.get("male")
@@ -259,10 +238,7 @@ def _render_mf_showcase(parents: dict, batch_uuid: str):
 
     with col_m:
         st.markdown(_parent_photo_html(male, "♂"), unsafe_allow_html=True)
-        st.markdown(
-            _parent_details_html(male, "♂", "Male"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(_parent_details_html(male, "♂", "Male"), unsafe_allow_html=True)
         if male and male.get("id"):
             if st.button(
                 "View fish →",
@@ -278,10 +254,7 @@ def _render_mf_showcase(parents: dict, batch_uuid: str):
 
     with col_f:
         st.markdown(_parent_photo_html(female, "♀"), unsafe_allow_html=True)
-        st.markdown(
-            _parent_details_html(female, "♀", "Female"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(_parent_details_html(female, "♀", "Female"), unsafe_allow_html=True)
         if female and female.get("id"):
             if st.button(
                 "View fish →",
@@ -388,7 +361,7 @@ def _render_create_section():
 
 
 # ============================================================
-# OUTCOME PANEL (left column, unchanged content)
+# OUTCOME PANEL
 # ============================================================
 
 def _render_outcome_panel(outcome: dict):
@@ -518,31 +491,28 @@ def _render_jar_popover(batch: dict):
                 set_current_count(batch_uuid, new_count)
 
                 if failed:
-                    _queue_jar_message(
-                        "warning",
+                    _queue_message(
+                        _JAR_MESSAGE_KEY, "warning",
                         f"Jarred {len(created)} fry — **{failed} failed** to create. "
                         f"Remaining in batch: {new_count}. Check logs.",
                     )
                 else:
-                    _queue_jar_message(
-                        "success",
+                    _queue_message(
+                        _JAR_MESSAGE_KEY, "success",
                         f"Jarred {len(created)} fry. Remaining in batch: {new_count}.",
                     )
                 st.rerun()
 
             elif failed:
-                _queue_jar_message(
-                    "error",
+                _queue_message(
+                    _JAR_MESSAGE_KEY, "error",
                     f"Jarring failed — {failed} fry could not be created. Check logs.",
                 )
                 st.rerun()
 
             else:
-                # Both empty — nothing happened. Likely missing spawn link
-                # or a transient failure inside the manager (which shows
-                # its own error there). Surface a soft message anyway.
-                _queue_jar_message(
-                    "info",
+                _queue_message(
+                    _JAR_MESSAGE_KEY, "info",
                     "No fry were created. Check that the batch is linked to a spawn.",
                 )
                 st.rerun()
@@ -611,6 +581,139 @@ def _render_counts_popover(batch: dict):
 
 
 # ============================================================
+# EDIT / DELETE POPOVER  (Session 29/D: Undo Jar + Delete & Fish)
+# ============================================================
+
+def _render_edit_delete_popover(batch: dict):
+    batch_uuid = batch["id"]
+    batch_tag = batch.get("batch_tag") or "?"
+    stage = (batch.get("stage") or "").lower()
+    jarring_date = batch.get("jarring_date")
+
+    with st.popover("⚙️ Edit / Delete", use_container_width=True):
+        # ---- Edit fields ----
+        edit_tag = st.text_input(
+            "Batch Tag",
+            value=batch.get("batch_tag") or "",
+            key=f"edit_tag_{batch_uuid}",
+        )
+        edit_notes = st.text_area(
+            "Notes",
+            value=batch.get("notes") or "",
+            key=f"edit_notes_{batch_uuid}",
+        )
+        if st.button("Save Edits", key=f"save_edit_{batch_uuid}", use_container_width=True):
+            if edit_batch(batch_uuid, {"batch_tag": edit_tag, "notes": edit_notes}):
+                st.success("Saved.")
+                st.rerun()
+
+        st.divider()
+
+        # ---- Undo Jar ----
+        # Only show if the batch actually has a jarring_date — otherwise
+        # there's nothing to reverse.
+        if jarring_date:
+            jarred_count = count_batch_jarred_fish(batch)
+            restored_count = (batch.get("current_count") or 0) + jarred_count
+
+            st.markdown("**↩️ Undo Jar**")
+            st.caption(
+                f"Deletes all **{jarred_count}** fish jarred by this batch "
+                f"and restores current_count to **{restored_count}**. "
+                f"Clears jarring_date. Reversible — you can re-jar any time."
+            )
+            if jarred_count == 0:
+                st.info(
+                    "No matching jarred fish found. (Requires fish with "
+                    "birth_date matching this batch's jarring_date.)",
+                    icon="ℹ️",
+                )
+            if st.button(
+                "↩️ Undo Jar",
+                key=f"undo_jar_{batch_uuid}",
+                use_container_width=True,
+                disabled=(jarred_count == 0),
+            ):
+                deleted, failed, err = undo_batch_jar(batch, delete_photos=True)
+                if err:
+                    _queue_message(_DANGER_MESSAGE_KEY, "error", f"Undo Jar failed: {err}")
+                elif failed:
+                    _queue_message(
+                        _DANGER_MESSAGE_KEY, "warning",
+                        f"Undo Jar: deleted {deleted}, {failed} failed. Check logs.",
+                    )
+                else:
+                    _queue_message(
+                        _DANGER_MESSAGE_KEY, "success",
+                        f"Undo Jar complete — deleted {deleted} fish, "
+                        f"restored current_count to {restored_count}.",
+                    )
+                st.rerun()
+
+            st.divider()
+
+        # ---- Delete Batch & Jarred Fish ----
+        st.markdown("**🔥 Delete Batch & Jarred Fish**")
+        jarred_count = count_batch_jarred_fish(batch)
+        st.caption(
+            f"Deletes the batch **AND** all **{jarred_count}** fish jarred "
+            f"by it. This is **permanent**. Type the batch tag "
+            f"`{batch_tag}` to confirm."
+        )
+        confirm_tag = st.text_input(
+            "Type batch tag to confirm",
+            value="",
+            key=f"confirm_tag_full_{batch_uuid}",
+            placeholder=batch_tag,
+        )
+        tag_matches = (confirm_tag or "").strip() == batch_tag
+
+        if st.button(
+            "🔥 Delete Batch & Jarred Fish",
+            key=f"del_full_{batch_uuid}",
+            disabled=not tag_matches,
+            use_container_width=True,
+        ):
+            d_fish, f_fish, b_ok, err = delete_batch_and_fish(batch, delete_photos=True)
+            if err:
+                _queue_message(_DANGER_MESSAGE_KEY, "error", f"Delete failed: {err}")
+            elif not b_ok:
+                _queue_message(
+                    _DANGER_MESSAGE_KEY, "warning",
+                    f"Deleted {d_fish} fish, but batch delete failed. Check logs.",
+                )
+            else:
+                _queue_message(
+                    _DANGER_MESSAGE_KEY, "success",
+                    f"Deleted batch '{batch_tag}' and {d_fish} jarred fish."
+                    + (f" ({f_fish} failed)" if f_fish else ""),
+                )
+            st.rerun()
+
+        st.divider()
+
+        # ---- Delete Batch Only (existing behavior) ----
+        st.markdown("**🗑️ Delete Batch Only**")
+        st.caption("Deletes the batch record. Jarred fish are kept in Fish Registry.")
+        confirm_del = st.checkbox(
+            "Confirm delete batch (fish kept)",
+            key=f"confirm_del_{batch_uuid}",
+        )
+        if st.button(
+            "🗑️ Delete Batch Only",
+            key=f"del_{batch_uuid}",
+            disabled=not confirm_del,
+            use_container_width=True,
+        ):
+            if delete_batch(batch_uuid):
+                _queue_message(
+                    _DANGER_MESSAGE_KEY, "success",
+                    f"Batch '{batch_tag}' deleted. Jarred fish kept.",
+                )
+                st.rerun()
+
+
+# ============================================================
 # BATCH CARD
 # ============================================================
 
@@ -628,7 +731,7 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
     parents = get_batch_parents(batch)
 
     with st.container(border=True):
-        # ---- Header: title + spawn caption (no thumbs) ----
+        # ---- Header ----
         st.markdown(f"### {icon} `{batch_tag}`")
         if spawn:
             st.caption(
@@ -638,7 +741,7 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         else:
             st.caption("_No linked spawn._")
 
-        # ---- Stage selector row ----
+        # ---- Stage selector ----
         new_stage = st.selectbox(
             "Stage",
             options=VALID_STAGES,
@@ -652,19 +755,19 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
                     st.success(f"Stage → {new_stage}")
                     st.rerun()
 
-        # ---- Stage-due hint (anchored to free_swimming_date) ----
+        # ---- Stage-due hint ----
         hint = _stage_due_hint(batch, spawn)
         if hint:
             st.info(hint, icon="⏰")
 
-        # ---- Metric row ----
+        # ---- Metrics ----
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Initial", batch.get("initial_count") or 0)
         col2.metric("Current", batch.get("current_count") or 0)
         col3.metric("Survival", _survival_label(survival))
         col4.metric("Stage", f"{icon} {stage}")
 
-        # ---- Metadata caption ----
+        # ---- Metadata ----
         culled_pre_n = batch.get("culled_count") or 0
         died_n = batch.get("died_count") or 0
         female_n = batch.get("female_count") or 0
@@ -678,7 +781,7 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         if batch.get("notes"):
             st.info(batch["notes"])
 
-        # ---- Two-column: Outcome (35%) | M/F Parents (65%) ----
+        # ---- Outcome | Parents ----
         if outcome and outcome.get("verdict_key") not in ("unknown",):
             st.divider()
             col_outcome, col_mf = st.columns([OUTCOME_COL_WEIGHT, MF_COL_WEIGHT])
@@ -724,36 +827,7 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
                         st.rerun()
 
         with col_d:
-            with st.popover("⚙️ Edit / Delete", use_container_width=True):
-                edit_tag = st.text_input(
-                    "Batch Tag",
-                    value=batch.get("batch_tag") or "",
-                    key=f"edit_tag_{batch_uuid}",
-                )
-                edit_notes = st.text_area(
-                    "Notes",
-                    value=batch.get("notes") or "",
-                    key=f"edit_notes_{batch_uuid}",
-                )
-                if st.button("Save Edits", key=f"save_edit_{batch_uuid}", use_container_width=True):
-                    if edit_batch(batch_uuid, {"batch_tag": edit_tag, "notes": edit_notes}):
-                        st.success("Saved.")
-                        st.rerun()
-
-                st.divider()
-                confirm_del = st.checkbox(
-                    "Confirm delete batch",
-                    key=f"confirm_del_{batch_uuid}",
-                )
-                if st.button(
-                    "🗑️ Delete Batch",
-                    key=f"del_{batch_uuid}",
-                    disabled=not confirm_del,
-                    use_container_width=True,
-                ):
-                    if delete_batch(batch_uuid):
-                        st.success("Batch deleted.")
-                        st.rerun()
+            _render_edit_delete_popover(batch)
 
 
 # ============================================================
@@ -831,8 +905,8 @@ def render_fry_batch_page():
     st.title("🐣 Fry Batch Tracking")
     st.caption("Track fry from hatch to jarring. One batch per spawn.")
 
-    # Session 29 — replay any pending jar message from a prior run.
-    _drain_jar_message()
+    _drain_message(_JAR_MESSAGE_KEY)
+    _drain_message(_DANGER_MESSAGE_KEY)
 
     stats = get_batch_stats()
     c1, c2, c3, c4 = st.columns(4)
