@@ -3,8 +3,15 @@
 # Session 17 — Navigation cleanup, Supabase diagnostic, new pages added.
 # Session 21 — Added Lines & Varieties page.
 # Session 25 — Added Inheritance Analysis page.
-# Session 26B — WebRTC test page removed from production (kept local for dev).
+# Session 26B — WebRTC test page removed from production.
 # Session 26E — Temp Video Debug page added to sidebar nav.
+#
+# Session 27B — Round 3A (this revision):
+#   • Removed the Video Debug nav entry + import (file deleted)
+#   • Auto-run process_breeder_transitions() on app load — flips
+#     Recovering → Conditioning → Available based on elapsed time
+#     (Session 27A Q2)
+#   • Removed the temp Video Debug nav item
 
 import datetime
 
@@ -22,9 +29,6 @@ from views.lineage_view         import render_lineage_page
 from views.lines_view           import render_lines_page
 from views.inheritance_view     import render_inheritance_page
 from modules.dashboard          import render_dashboard
-
-# TEMP — remove this import + nav entry + routing when done tuning
-from views.video_debug_view     import render_video_debug_page
 
 
 # ============================================================
@@ -112,6 +116,29 @@ st.markdown("""
 
 
 # ============================================================
+# SESSION-LOAD SIDE EFFECTS
+# ============================================================
+
+def _run_load_time_transitions():
+    """
+    Run once per session: advance any breeder_status that has
+    exceeded its duration (Session 27A Q2).
+    Idempotent — safe to run on every load.
+    """
+    if st.session_state.get("_breeder_transitions_ran"):
+        return
+    try:
+        from modules.fish_manager import process_breeder_transitions
+        flipped = process_breeder_transitions()
+        if flipped:
+            st.toast(f"⚙️ Auto-flipped {flipped} breeder status(es).", icon="🔁")
+    except Exception as e:
+        # Non-fatal: log and continue
+        print(f"process_breeder_transitions issue: {e}")
+    st.session_state["_breeder_transitions_ran"] = True
+
+
+# ============================================================
 # SUPABASE DIAGNOSTIC (sidebar)
 # ============================================================
 
@@ -146,7 +173,7 @@ def run_supabase_diagnostic():
 
         st.divider()
         st.caption(
-            f"Session: 26E · Build: {datetime.date.today().isoformat()}"
+            f"Session: 27B · Build: {datetime.date.today().isoformat()}"
         )
 
 
@@ -168,11 +195,17 @@ page = st.sidebar.radio("Navigation", [
     "🧬 Lines & Varieties",
     "🧬 Inheritance",
     "📝 Activity Log",
-    "🐛 Video Debug (temp)",     # ← TEMP — remove when done
 ])
 
 st.sidebar.markdown("---")
 run_supabase_diagnostic()
+
+
+# ============================================================
+# LOAD-TIME TRANSITIONS
+# ============================================================
+
+_run_load_time_transitions()
 
 
 # ============================================================
@@ -201,5 +234,3 @@ elif page == "🧬 Inheritance":
     render_inheritance_page()
 elif page == "📝 Activity Log":
     render_activity_log_page()
-elif page == "🐛 Video Debug (temp)":     # ← TEMP
-    render_video_debug_page()
