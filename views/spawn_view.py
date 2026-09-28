@@ -4,6 +4,12 @@
 # tank_registry, database, photo_service.
 # Session 19 — Added inbreeding/lineage check to the pairing screen.
 # Session 24B — Show computed batch outcome in History + Active cards.
+#
+# Session 28A/B1 (this revision):
+#   • Start New Pairing: Pairing Date picker (defaults today)
+#   • Mark Free Swimming: Free Swim Date picker (defaults today)
+#   • Passes to spawn_manager.create_new_spawn(pairing_date=...)
+#     and mark_free_swimming(free_swim_date=...)
 
 import datetime
 from typing import Optional
@@ -102,10 +108,6 @@ def _default_batch_name(spawn: dict) -> str:
 # ============================================================
 
 def _render_outcome_panel(outcome: dict):
-    """
-    Renders the computed batch outcome as a compact panel.
-    Used in Active Pairing cards and expandable in History.
-    """
     verdict_key = outcome.get("verdict_key", "unknown")
     verdict_icon = outcome.get("verdict_icon", "—")
     verdict_reason = outcome.get("verdict_reason", "")
@@ -183,10 +185,25 @@ def _render_lifecycle_buttons(item: dict):
                 "Estimated Fry",
                 min_value=1, value=50, key=f"cnt_{spawn_uuid}",
             )
+            free_swim_date = st.date_input(
+                "Free Swim Date",
+                value=datetime.date.today(),
+                key=f"free_swim_date_{spawn_uuid}",
+                help="Backdate if the fry started free-swimming earlier. "
+                     "The recovery countdown for both parents starts from this date.",
+            )
             if st.button("Confirm Free Swim", key=f"confirm_swim_{spawn_uuid}"):
                 if batch_name.strip():
-                    mark_free_swimming(spawn_uuid, batch_name.strip(), int(fry_cnt))
-                    st.success("Spawn marked Free Swimming. Tank released. Parents available.")
+                    mark_free_swimming(
+                        spawn_uuid,
+                        batch_name.strip(),
+                        int(fry_cnt),
+                        free_swim_date=str(free_swim_date),
+                    )
+                    st.success(
+                        f"Spawn marked Free Swimming ({free_swim_date}). "
+                        f"Tank released. Parents now Recovering."
+                    )
                     st.rerun()
                 else:
                     st.error("Please enter a batch name.")
@@ -266,7 +283,6 @@ def _render_active_pairing_card(item: dict, outcome: Optional[dict] = None):
         if spawn.get("notes"):
             st.info(f"**Notes:** {spawn['notes']}")
 
-        # Show outcome panel if there's anything to show
         if outcome and outcome.get("verdict_key") not in ("unknown",):
             st.divider()
             _render_outcome_panel(outcome)
@@ -298,7 +314,6 @@ def render_active_pairings_tab():
         st.info("No active pairings. Start one in the 'Start New Pairing' tab.")
         return
 
-    # Precompute outcomes for active spawns
     outcome_map = compute_all_spawn_outcomes()
 
     for item in active:
@@ -312,7 +327,6 @@ def render_active_pairings_tab():
 # ============================================================
 
 def _render_lineage_check(male_uuid: str, female_uuid: str) -> dict:
-    """Render the lineage check panel. Returns the check result dict."""
     result = check_inbreeding(male_uuid, female_uuid)
     level = result.get("level", "clear")
     icon = result.get("icon", "🟢")
@@ -397,6 +411,14 @@ def render_start_pairing_tab():
         )
         tank_uuid = tank_dd[tank_idx]["id"]
 
+        pairing_date = st.date_input(
+            "Pairing Date",
+            value=datetime.date.today(),
+            key="pairing_date_new",
+            help="Backdate if the pairing started earlier. Both parents' "
+                 "breeding countdowns start from this date.",
+        )
+
     with col2:
         female_idx = st.selectbox(
             "Select Female Breeder",
@@ -458,13 +480,15 @@ def render_start_pairing_tab():
                 tank_id=tank_uuid,
                 line_goal=line_goal,
                 notes=notes,
+                pairing_date=str(pairing_date),
             )
         if not saved:
             st.error("Failed to create spawn.")
             return
         st.success(
             f"Pairing initiated! **{saved.get('system_id')}** "
-            f"(code: {saved.get('spawn_code')}) assigned to tank."
+            f"(code: {saved.get('spawn_code')}) assigned to tank — "
+            f"pairing date {pairing_date}."
         )
         st.rerun()
 
@@ -481,7 +505,6 @@ def render_history_tab():
         st.info("No spawn history recorded yet.")
         return
 
-    # Precompute outcomes for all spawns in one pass
     outcome_map = compute_all_spawn_outcomes()
 
     rows = []
@@ -492,7 +515,6 @@ def render_history_tab():
         spawn_uuid = s["id"]
         outcome = outcome_map.get(spawn_uuid) or {}
 
-        # Verdict + jarred + culled + avg score from outcome
         v_key = outcome.get("verdict_key", "unknown")
         v_icon = outcome.get("verdict_icon", "—")
         v_label = {
@@ -533,7 +555,6 @@ def render_history_tab():
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Below the table: expandable full outcome per spawn
     st.markdown("---")
     st.markdown("##### 📊 Full Outcome Details")
     st.caption("Click any spawn to see grade breakdown, best fish, and verdict reasoning.")
@@ -544,7 +565,6 @@ def render_history_tab():
         outcome = outcome_map.get(spawn_uuid) or {}
         system_id = s.get("system_id") or "?"
 
-        # Skip spawns with nothing to show
         if outcome.get("verdict_key") in ("unknown",):
             continue
 
