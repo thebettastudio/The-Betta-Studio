@@ -4,6 +4,11 @@
 #
 # One batch per spawn (Q2=A1). Manual stage advancement (Q4=A1).
 # Hybrid jarring: bulk-create placeholder fish rows (Q3=A3).
+#
+# Session 28A/B2b (this revision):
+#   • jar_fry_bulk() accepts optional jarring_date
+#   • Each jarred fish inherits birth_date = jarring_date
+#   • Batch's own jarring_date set on first jarring if empty
 
 from __future__ import annotations
 
@@ -51,12 +56,7 @@ MATURE_STAGES = {"jarred", "juvenile", "sub_adult", "adult"}
 # ============================================================
 
 def list_all_batches() -> list[dict]:
-    """
-    All fry batches, each enriched with:
-      spawn      : spawn row (or None)
-      tank       : tank row (or None)
-      survival   : current_count / initial_count (float 0..1) or None
-    """
+    """All fry batches enriched with spawn, tank, survival."""
     spawn_by_id = {s["id"]: s for s in get_all_spawns()}
     tank_by_id = {t["id"]: t for t in get_all_tanks()}
 
@@ -104,11 +104,7 @@ def get_batch_stats() -> dict:
 
 
 def suggest_batch_tag(spawn: dict) -> str:
-    """
-    Suggest a batch tag based on the spawn.
-    Format: {line_code}-{generation} e.g. AVT-F1
-    Fallback: {spawn.system_id} if line/gen are unknown.
-    """
+    """Suggest a batch tag: {line_code}-{generation} or fallback."""
     line = (spawn.get("line_code") or "").strip()
     gen = (spawn.get("generation") or "").strip()
     if line and line != "UNK" and len(line) <= 12:
@@ -117,10 +113,7 @@ def suggest_batch_tag(spawn: dict) -> str:
 
 
 def get_spawns_available_for_batch() -> list[dict]:
-    """
-    Spawns in 'Free Swimming' status WITHOUT an existing batch.
-    These are the ones a user can create a new batch from.
-    """
+    """Spawns in 'Free Swimming' status WITHOUT an existing batch."""
     existing_spawn_ids = {b.get("spawn_id") for b in get_all_fry_batches()}
     out = []
     for s in get_all_spawns():
@@ -143,16 +136,12 @@ def create_batch_from_spawn(
     initial_count: int,
     notes: str = "",
 ) -> Optional[dict]:
-    """
-    Create a fry batch linked to a spawn.
-    Enforces: one batch per spawn.
-    """
+    """Create a fry batch linked to a spawn. Enforces one-per-spawn."""
     spawn = get_spawn_by_id(spawn_id)
     if not spawn:
         st.error(f"Spawn {spawn_id} not found.")
         return None
 
-    # Enforce one-batch-per-spawn (Q2 = A1)
     existing = get_fry_batches_for_spawn(spawn_id)
     if existing:
         st.error(f"Spawn {spawn.get('system_id')} already has a batch.")
@@ -200,10 +189,7 @@ def edit_batch(batch_id: str, updates: dict) -> bool:
 
 
 def advance_stage(batch_id: str, new_stage: str) -> bool:
-    """
-    Manually advance a batch's stage (Q4 = A1).
-    Setting stage='jarred' also sets jarring_date=today if not set.
-    """
+    """Manually advance a batch's stage."""
     if new_stage not in VALID_STAGES:
         st.error(f"Invalid stage: {new_stage}")
         return False
@@ -256,7 +242,7 @@ def assign_batch_tank(batch_id: str, tank_id: Optional[str]) -> bool:
 
 
 # ============================================================
-# JARRING FLOW (Q3 = A3, hybrid)
+# JARRING FLOW
 # ============================================================
 
 def jar_fry_bulk(
@@ -266,14 +252,16 @@ def jar_fry_bulk(
     gender: str = "Unsexed",
     grade: str = "Pet Grade",
     location: str = "",
+    jarring_date: Optional[str] = None,
 ) -> list[dict]:
     """
     Bulk-create `count` placeholder fish rows linked to the batch's spawn.
-    Each call to register_fish_from_spawn() generates the next sequential
-    system_id for that spawn (SPN-XXX-NN).
 
-    Does NOT decrement current_count automatically — the caller should
-    call set_current_count() with the remaining fry count.
+    Session 28A/B2b — accepts an optional jarring_date (ISO 'YYYY-MM-DD').
+    When passed, each jarred fish's birth_date is set to that date, and
+    the batch's own jarring_date is updated if not already set.
+
+    Does NOT decrement current_count — caller does that via set_current_count().
 
     Returns: list of created fish rows.
     """
@@ -291,6 +279,13 @@ def jar_fry_bulk(
     if count == 0:
         return []
 
+    # Resolve the effective jarring date
+    resolved_date = jarring_date or _dt.date.today().isoformat()
+
+    # Update batch's jarring_date if empty
+    if not batch.get("jarring_date"):
+        update_fry_batch(batch_id, {"jarring_date": resolved_date})
+
     created = []
     for _ in range(count):
         fish = register_fish_from_spawn(
@@ -299,6 +294,7 @@ def jar_fry_bulk(
             grade=grade,
             location=location,
             notes=f"Jarred from batch '{batch.get('batch_tag')}'",
+            birth_date=resolved_date,
         )
         if fish:
             created.append(fish)
@@ -306,7 +302,10 @@ def jar_fry_bulk(
     if created:
         log_activity(
             action_type="fry_batch_jarred",
-            description=f"Jarred {len(created)} fry from batch '{batch.get('batch_tag')}'",
+            description=(
+                f"Jarred {len(created)} fry from batch '{batch.get('batch_tag')}' "
+                f"(jarring date {resolved_date})"
+            ),
             entity_type="fry_batch",
             entity_id=batch_id,
         )
@@ -318,10 +317,7 @@ def jar_fry_bulk(
 # ============================================================
 
 def delete_batch(batch_id: str) -> bool:
-    """
-    Delete a batch. Does NOT delete fish rows that were jarred from it
-    (their batch_id FK will be nulled by the DB).
-    """
+    """Delete a batch. Fish rows that were jarred from it keep their FK (nulled by DB)."""
     batch = get_fry_batch_by_id(batch_id)
     if not batch:
         return False
