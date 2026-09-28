@@ -16,10 +16,12 @@
 #   • Fixed StreamlitDuplicateElementKey: button keys now include
 #     batch_uuid so multiple cards sharing the same parent fish
 #     don't collide.
-#   • Jarring failures surfaced (jar_fry_bulk returns (created, failed)).
+#   • Jarring failures surfaced — messages now survive st.rerun()
+#     via session_state so the user actually sees them.
+#   • _stage_due_hint() now measures from free_swimming_date
+#     (via spawn), not hatch_date, so the hint fires at the right
+#     stage.
 #   • _render_list_section() fetches list_all_batches() once.
-#   • "Stage due?" hint when fry/free_swimming batch is older
-#     than STAGE_DUE_DAYS.
 
 import datetime
 from typing import Optional
@@ -72,7 +74,11 @@ STAGE_ICONS = {
     "adult":         "🌳",
 }
 
-STAGE_DUE_DAYS = 60
+# Stage-due hint: how long a batch may sit in fry/free_swimming
+# before we nudge the user. Measured from FREE_SWIMMING_DATE when
+# available (fallback: hatch_date).
+STAGE_DUE_DAYS = 14
+STAGE_DUE_HINT_STAGES = ("fry", "free_swimming")
 
 # M/F showcase styling
 PARENT_PHOTO_RADIUS = 24         # px, rounded-square
@@ -81,9 +87,11 @@ PARENT_PHOTO_BG = "#F3F4F6"
 PARENT_PHOTO_ASPECT = "4/3"      # wide, matches betta side shots
 
 # Column split between outcome panel and M/F showcase.
-# [35, 65] → outcome gets 35%, parents get 65%.
 OUTCOME_COL_WEIGHT = 35
 MF_COL_WEIGHT = 65
+
+# Session_state key for post-rerun jarring messages.
+_JAR_MESSAGE_KEY = "_fry_jar_pending_message"
 
 
 # ============================================================
@@ -119,18 +127,58 @@ def _days_since(date_iso) -> Optional[int]:
         return None
 
 
-def _stage_due_hint(batch: dict) -> Optional[str]:
-    """Return a soft warning if this batch may be ready to advance."""
+def _stage_due_hint(batch: dict, spawn: Optional[dict]) -> Optional[str]:
+    """
+    Nudge if a batch has been in fry/free_swimming too long.
+
+    Session 29 fix — measures from the spawn's free_swimming_date
+    (falls back to hatch_date). Previously used hatch_date only,
+    which fired ~45 days late.
+    """
     stage = (batch.get("stage") or "").lower()
-    if stage not in ("fry", "free_swimming"):
+    if stage not in STAGE_DUE_HINT_STAGES:
         return None
-    days = _days_since(batch.get("hatch_date"))
+
+    # Prefer free_swimming_date from the linked spawn; fall back to hatch_date.
+    anchor_iso = None
+    anchor_label = ""
+    if spawn and spawn.get("free_swimming_date"):
+        anchor_iso = spawn.get("free_swimming_date")
+        anchor_label = "started free-swimming"
+    elif batch.get("hatch_date"):
+        anchor_iso = batch.get("hatch_date")
+        anchor_label = "hatched"
+
+    days = _days_since(anchor_iso)
     if days is None or days < STAGE_DUE_DAYS:
         return None
+
     return (
-        f"⏰ This batch hatched **{days}d** ago and is still marked "
-        f"`{stage}` — may be ready to advance or jar."
+        f"⏰ This batch {anchor_label} **{days}d** ago and is still "
+        f"marked `{stage}` — may be ready to advance or jar."
     )
+
+
+def _queue_jar_message(kind: str, text: str) -> None:
+    """Store a post-rerun message in session_state."""
+    st.session_state[_JAR_MESSAGE_KEY] = {"kind": kind, "text": text}
+
+
+def _drain_jar_message() -> None:
+    """Render and clear any pending jar message. Call at top of page."""
+    msg = st.session_state.pop(_JAR_MESSAGE_KEY, None)
+    if not msg:
+        return
+    kind = msg.get("kind")
+    text = msg.get("text") or ""
+    if kind == "success":
+        st.success(text)
+    elif kind == "warning":
+        st.warning(text)
+    elif kind == "error":
+        st.error(text)
+    else:
+        st.info(text)
 
 
 # ============================================================
@@ -157,9 +205,10 @@ def _parent_photo_html(fish: Optional[dict], gender_sym: str) -> str:
             f'style="width:100%;height:100%;object-fit:cover;display:block;" />'
         )
     else:
+        # Responsive glyph size so it looks right at any column width.
         inner = (
-            f'<div style="color:#9CA3AF;font-size:64px;line-height:1;">'
-            f'{gender_sym}</div>'
+            f'<div style="color:#9CA3AF;font-size:clamp(48px,8vw,96px);'
+            f'line-height:1;">{gender_sym}</div>'
         )
     return f'<div style="{wrapper_style}">{inner}</div>'
 
@@ -198,8 +247,8 @@ def _render_mf_showcase(parents: dict, batch_uuid: str):
     """
     Right-column panel: two side-by-side M & F wide photos.
 
-    batch_uuid is used to namespace button keys so multiple batch
-    cards sharing the same parent fish don't collide in Streamlit.
+    batch_uuid namespaces button keys so multiple batch cards
+    sharing the same parent fish don't collide in Streamlit.
     """
     st.markdown("##### 🧬 Parents")
 
@@ -463,21 +512,40 @@ def _render_jar_popover(batch: dict):
                 location=location.strip(),
                 jarring_date=str(jarring_date),
             )
+
             if created:
                 new_count = max(0, (batch.get("current_count") or 0) - len(created))
                 set_current_count(batch_uuid, new_count)
+
                 if failed:
-                    st.warning(
+                    _queue_jar_message(
+                        "warning",
                         f"Jarred {len(created)} fry — **{failed} failed** to create. "
-                        f"Remaining in batch: {new_count}. Check logs."
+                        f"Remaining in batch: {new_count}. Check logs.",
                     )
                 else:
-                    st.success(
-                        f"Jarred {len(created)} fry. Remaining in batch: {new_count}."
+                    _queue_jar_message(
+                        "success",
+                        f"Jarred {len(created)} fry. Remaining in batch: {new_count}.",
                     )
                 st.rerun()
+
             elif failed:
-                st.error(f"Jarring failed — {failed} fry could not be created. Check logs.")
+                _queue_jar_message(
+                    "error",
+                    f"Jarring failed — {failed} fry could not be created. Check logs.",
+                )
+                st.rerun()
+
+            else:
+                # Both empty — nothing happened. Likely missing spawn link
+                # or a transient failure inside the manager (which shows
+                # its own error there). Surface a soft message anyway.
+                _queue_jar_message(
+                    "info",
+                    "No fry were created. Check that the batch is linked to a spawn.",
+                )
+                st.rerun()
 
 
 # ============================================================
@@ -584,8 +652,8 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
                     st.success(f"Stage → {new_stage}")
                     st.rerun()
 
-        # ---- Stage-due hint ----
-        hint = _stage_due_hint(batch)
+        # ---- Stage-due hint (anchored to free_swimming_date) ----
+        hint = _stage_due_hint(batch, spawn)
         if hint:
             st.info(hint, icon="⏰")
 
@@ -762,6 +830,9 @@ def _render_list_section():
 def render_fry_batch_page():
     st.title("🐣 Fry Batch Tracking")
     st.caption("Track fry from hatch to jarring. One batch per spawn.")
+
+    # Session 29 — replay any pending jar message from a prior run.
+    _drain_jar_message()
 
     stats = get_batch_stats()
     c1, c2, c3, c4 = st.columns(4)
