@@ -1,471 +1,600 @@
-# modules/spawn_outcome.py
+# views/spawn_view.py
 # Betta Farm Management System
-# Session 24B — Computed batch outcome per spawn.
-# Session 24C — Split culls (pre-jar / jarred), add died, reconciliation check.
+# Session 12 — Ported to Supabase via spawn_manager, fish_manager,
+# tank_registry, database, photo_service.
+# Session 19 — Added inbreeding/lineage check to the pairing screen.
+# Session 24B — Show computed batch outcome in History + Active cards.
 #
-# Count model (all numbers must reconcile):
-#   Initial = Current + Jarred_alive + Culled_pre + Culled_jarred + Died
-#
-# Where:
-#   Current       = unjarred fry still alive in the batch
-#   Jarred_alive  = individually tracked fish jarred from THIS batch,
-#                   status not culled/deceased
-#   Culled_pre    = fry culled BEFORE jarring (batch.culled_count)
-#   Culled_jarred = fish jarred from THIS batch then later culled
-#   Died          = natural deaths (batch.died_count)
-#
-# Survival % = (Current + Jarred_alive) ÷ Initial
-#   Represents "of everything we started with, how many are still alive with us"
-#
-# Verdict uses:
-#   high_pct  = (High+ grade jarred alive) ÷ jarred_alive
-#   cull_rate = (Culled_pre + Culled_jarred) ÷ Initial
-#
-# Session 29 — Batch-scoping fix:
-#   Previously, _compute_from_data(spawn_id) counted ALL fish whose
-#   fish.batch_id == spawn_id (which is really a spawn id, not a
-#   fry_batch id — see fish_manager.register_fish_from_spawn()).
-#   For a spawn that has produced multiple fry batches over time,
-#   every batch card showed the spawn-wide totals — e.g. a 69-fry
-#   batch displayed 159 jarred fish and 230% survival.
-#
-#   Now _compute_from_data() accepts an optional batch_id. When
-#   given, jarred-fish counts are scoped to only the fish jarred
-#   from THAT batch, discriminated by:
-#     fish.batch_id == spawn_id   (existing link)
-#     AND
-#     fish.birth_date == batch.jarring_date  (set by jar_fry_bulk)
-#
-#   When batch_id is None, behavior falls back to the old
-#   spawn-wide computation (backward-compatible).
+# Session 28A/B1 (this revision):
+#   • Start New Pairing: Pairing Date picker (defaults today)
+#   • Mark Free Swimming: Free Swim Date picker (defaults today)
+#   • Passes to spawn_manager.create_new_spawn(pairing_date=...)
+#     and mark_free_swimming(free_swim_date=...)
 
-from __future__ import annotations
-
+import datetime
 from typing import Optional
 
-from database import (
-    get_all_fish,
-    get_all_spawns,
-    get_all_fry_batches,
+import pandas as pd
+import streamlit as st
+
+from modules.spawn_manager import (
+    list_all_spawns,
+    list_active_pairings_with_details,
+    list_spawns_with_details,
+    create_new_spawn,
+    mark_pairing_success_pending,
+    mark_free_swimming,
+    mark_pairing_failed,
+    mark_completed,
+    update_spawn_details,
 )
-
-
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-HIGH_GRADES = {"Show Grade", "High Grade"}
-
-_GRADE_RANK = {
-    "Show Grade": 5,
-    "High Grade": 4,
-    "Breeder Grade": 3,
-    "Material Grade": 2,
-    "Pet Grade": 1,
-}
-
-VERDICT_ICONS = {
-    "excellent": "🌟",
-    "solid": "✅",
-    "mixed": "⚠️",
-    "weak": "❌",
-    "failed": "🚫",
-    "pending": "⏳",
-    "unknown": "—",
-}
+from modules.fish_manager import (
+    get_fish_dropdown_items,
+    register_fish_from_spawn,
+    VALID_GENDERS,
+)
+from modules.tank_registry import (
+    get_tank_dropdown_items,
+    list_available_tanks,
+)
+from modules.id_generator import calculate_child_lineage, generate_spawn_code
+from modules.lineage import check_inbreeding
+from modules.photo_service import photo_url
+from modules.spawn_outcome import (
+    compute_spawn_outcome,
+    compute_all_spawn_outcomes,
+    verdict_badge_html,
+    grade_breakdown_short,
+)
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def _safe_int(val, default: int = 0) -> int:
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return default
-
-
-def _avg(values: list) -> Optional[float]:
-    clean = [v for v in values if v is not None]
-    if not clean:
-        return None
-    return sum(clean) / len(clean)
-
-
-def _grade_breakdown(jarred: list[dict]) -> dict:
-    out: dict = {}
-    for f in jarred:
-        g = f.get("grade") or "Unspecified"
-        out[g] = out.get(g, 0) + 1
-    return out
-
-
-def _high_plus_count(jarred: list[dict]) -> int:
-    return sum(1 for f in jarred if (f.get("grade") or "") in HIGH_GRADES)
-
-
-def _best_fish(jarred: list[dict]) -> Optional[dict]:
-    if not jarred:
-        return None
-    def _key(f):
-        rank = _GRADE_RANK.get(f.get("grade") or "", 0)
-        score = _safe_int(f.get("form_score"))
-        return (rank, score)
-    return max(jarred, key=_key)
-
-
-def _compute_verdict(
-    jarred_alive: int,
-    high_plus_count: int,
-    total_culled: int,
-    initial: int,
-) -> tuple[str, str]:
-    """
-    Returns (verdict_key, reason_short).
-    cull_rate = total_culled ÷ initial (of all fry started, how many culled).
-    """
-    if jarred_alive == 0 and total_culled > 0:
-        return ("failed", f"All {total_culled} culled, none jarred")
-
-    if jarred_alive == 0 and total_culled == 0:
-        return ("pending", "No jarring or culling recorded yet")
-
-    if jarred_alive == 0:
-        return ("unknown", "No jarred fish to grade")
-
-    high_pct = high_plus_count / jarred_alive
-    cull_rate = (total_culled / initial) if initial > 0 else 0.0
-
-    summary = f"{high_pct*100:.0f}% High+ · {cull_rate*100:.0f}% culled"
-
-    if high_pct >= 0.50 and cull_rate < 0.20:
-        return ("excellent", summary)
-
-    if high_pct < 0.10 or cull_rate > 0.60:
-        return ("weak", summary)
-
-    if high_pct >= 0.25 and cull_rate <= 0.40:
-        return ("solid", summary)
-
-    return ("mixed", summary)
-
-
-def _iso_date_prefix(val) -> Optional[str]:
-    """Return YYYY-MM-DD from a value, or None if it can't be parsed."""
-    if not val:
-        return None
-    s = str(val)[:10]
-    # Basic sanity check: YYYY-MM-DD
-    if len(s) == 10 and s[4] == "-" and s[7] == "-":
-        return s
-    return None
-
-
-def _resolve_batch(
-    spawn_id: str,
-    all_batches: list[dict],
-    batch_id: Optional[str] = None,
-) -> Optional[dict]:
-    """
-    Find the batch row for this spawn. If batch_id is given, match
-    exactly that row. Otherwise, fall back to the first batch for
-    the spawn (old behavior for backward compatibility).
-    """
-    if batch_id:
-        return next(
-            (b for b in all_batches
-             if b.get("id") == batch_id and b.get("spawn_id") == spawn_id),
-            None,
-        )
-    return next((b for b in all_batches if b.get("spawn_id") == spawn_id), None)
-
-
-def _fish_belongs_to_batch(
-    fish: dict,
-    spawn_id: str,
-    batch: Optional[dict],
-    *,
-    scope_to_batch: bool,
-) -> bool:
-    """
-    Decide whether a fish counts as jarred from this batch.
-
-    When scope_to_batch is False (legacy spawn-wide mode):
-      Just check fish.batch_id == spawn_id.
-
-    When scope_to_batch is True (new batch-scoped mode):
-      fish.batch_id == spawn_id  AND
-      fish.birth_date matches the batch's jarring_date (if set).
-    """
-    if fish.get("batch_id") != spawn_id:
-        return False
-
-    if not scope_to_batch or not batch:
-        return True
-
-    jarring_date = _iso_date_prefix(batch.get("jarring_date"))
-    if not jarring_date:
-        # Batch has no jarring_date recorded — can't discriminate.
-        # Fall back to accepting the fish, but this will over-count
-        # if the spawn had multiple batches. User should set jarring_date.
-        return True
-
-    fish_date = _iso_date_prefix(fish.get("birth_date"))
-    return fish_date == jarring_date
-
-
-# ============================================================
-# MAIN API
-# ============================================================
-
-def compute_spawn_outcome(
-    spawn_id: str,
-    *,
-    batch_id: Optional[str] = None,
-) -> dict:
-    """
-    Compute the outcome for one spawn.
-
-    Session 29 — accepts optional batch_id to scope jarred-fish
-    counts to a single fry batch. Without batch_id, falls back to
-    the old spawn-wide behavior.
-    """
-    all_fish = get_all_fish()
-    all_batches = get_all_fry_batches()
-    return _compute_from_data(spawn_id, all_fish, all_batches, batch_id=batch_id)
-
-
-def _compute_from_data(
-    spawn_id: str,
-    all_fish: list[dict],
-    all_batches: list[dict],
-    *,
-    batch_id: Optional[str] = None,
-) -> dict:
-    """
-    Internal: compute using pre-fetched data.
-
-    Session 29 — batch_id is optional. When provided, jarred-fish
-    counts are scoped to only the fish belonging to that specific
-    batch (matched by jarring_date in addition to spawn_id).
-    """
-    # --- Resolve the batch row ---
-    batch = _resolve_batch(spawn_id, all_batches, batch_id=batch_id)
-    scope_to_batch = batch_id is not None
-
-    # --- Jarred fish (any status) that came from this batch ---
-    all_from_spawn = [
-        f for f in all_fish
-        if _fish_belongs_to_batch(
-            f, spawn_id, batch, scope_to_batch=scope_to_batch,
-        )
-    ]
-
-    culled_jarred_fish = [
-        f for f in all_from_spawn
-        if (f.get("status") or "").lower() in ("culled", "deceased")
-    ]
-    alive_jarred = [
-        f for f in all_from_spawn
-        if (f.get("status") or "").lower() not in ("culled", "deceased")
-    ]
-
-    # --- Batch counts ---
-    current_count     = _safe_int(batch.get("current_count")) if batch else 0
-    culled_pre        = _safe_int(batch.get("culled_count"))  if batch else 0
-    female_count      = _safe_int(batch.get("female_count"))  if batch else 0
-    died_count        = _safe_int(batch.get("died_count"))    if batch else 0
-    initial_count     = _safe_int(batch.get("initial_count")) if batch else 0
-
-    # --- Counts for the count model ---
-    jarred_alive   = len(alive_jarred)
-    culled_jarred  = len(culled_jarred_fish)
-    total_culled   = culled_pre + culled_jarred
-
-    # --- Grade breakdown (over alive jarred only) ---
-    breakdown  = _grade_breakdown(alive_jarred)
-    high_plus  = _high_plus_count(alive_jarred)
-
-    scores = [_safe_int(f.get("form_score")) for f in alive_jarred if f.get("form_score") is not None]
-    avg_score = _avg(scores)
-
-    # --- Survival % = (Current + Jarred_alive) ÷ Initial ---
-    survival = None
-    if initial_count > 0:
-        survival = (current_count + jarred_alive) / initial_count
-
-    # --- Reconciliation ---
-    expected_sum = current_count + jarred_alive + culled_pre + culled_jarred + died_count
-    reconciliation_delta = initial_count - expected_sum
-    reconciles = abs(reconciliation_delta) <= 1  # allow ±1 for rounding noise
-
-    # --- Verdict ---
-    verdict_key, verdict_reason = _compute_verdict(
-        jarred_alive=jarred_alive,
-        high_plus_count=high_plus,
-        total_culled=total_culled,
-        initial=initial_count,
-    )
-
-    best = _best_fish(alive_jarred)
-
+def _fish_display(fish: Optional[dict], fallback_id: str = "?") -> dict:
+    """Return a display-friendly dict from a fish row, with safe fallbacks."""
+    if not fish:
+        return {
+            "system_id": fallback_id,
+            "variety": "N/A",
+            "grade": "N/A",
+            "line_code": "UNK",
+            "generation": "P1",
+            "photo_id": None,
+        }
     return {
-        "spawn_id": spawn_id,
-        "batch_id": batch_id,
-
-        # Core counts
-        "initial_count":   initial_count,
-        "current_count":   current_count,
-        "jarred_alive":    jarred_alive,
-        "jarred_total":    len(all_from_spawn),
-        "culled_pre":      culled_pre,
-        "culled_jarred":   culled_jarred,
-        "culled_total":    total_culled,
-        "died":            died_count,
-        "female_count":    female_count,
-
-        # Quality
-        "survival":        survival,
-        "grade_breakdown": breakdown,
-        "high_plus_count": high_plus,
-        "avg_form_score":  avg_score,
-        "best_fish":       best,
-
-        # Verdict
-        "verdict_key":     verdict_key,
-        "verdict_icon":    VERDICT_ICONS.get(verdict_key, "—"),
-        "verdict_reason":  verdict_reason,
-
-        # Reconciliation
-        "expected_sum":    expected_sum,
-        "reconciliation_delta": reconciliation_delta,
-        "reconciles":      reconciles,
-
-        # Meta
-        "has_batch":       batch is not None,
-        "scope_to_batch":  scope_to_batch,
-
-        # Aliases for backward-compat
-        "jarred_count":    jarred_alive,
-        "culled_count":    total_culled,
+        "system_id": fish.get("system_id") or fallback_id,
+        "variety": fish.get("variety") or "N/A",
+        "grade": fish.get("grade") or "N/A",
+        "line_code": fish.get("line_code") or "UNK",
+        "generation": fish.get("generation") or "P1",
+        "photo_id": fish.get("photo_id"),
     }
 
 
-def compute_all_spawn_outcomes() -> dict[str, dict]:
-    """
-    Compute outcomes for all spawns in one pass.
+def _render_breeder_block(fish: dict, fallback_id: str, gender_label: str):
+    """Render one breeder's info + image. Compact 2-column inner layout."""
+    info = _fish_display(fish, fallback_id)
+    col_info, col_img = st.columns([2, 1.5])
 
-    NOTE: this returns spawn-wide results keyed by spawn_id, matching
-    the old behavior. To get batch-scoped results, call
-    compute_spawn_outcome(spawn_id, batch_id=...) per batch.
-    """
-    all_spawns  = get_all_spawns()
-    all_fish    = get_all_fish()
-    all_batches = get_all_fry_batches()
+    with col_info:
+        st.markdown(f"#### {gender_label}")
+        st.markdown(f"**ID:** `{info['system_id']}`")
+        st.markdown(f"**Variety:** {info['variety']}")
+        st.markdown(f"**Grade:** `{info['grade']}`")
+        st.markdown(f"**Line:** `{info['line_code']}` (`{info['generation']}`)")
 
-    out = {}
-    for s in all_spawns:
-        out[s["id"]] = _compute_from_data(s["id"], all_fish, all_batches)
-    return out
+    with col_img:
+        if info["photo_id"]:
+            st.image(photo_url(info["photo_id"]), use_container_width=True)
+        else:
+            st.caption(f"📷 *No {gender_label.split()[0]} image*")
 
 
-def compute_all_batch_outcomes() -> dict[str, dict]:
-    """
-    Session 29 — compute outcomes keyed by BATCH id, scoped to each
-    batch. Use this in views that iterate batches (e.g. fry_batch_view)
-    so multi-batch spawns show per-batch numbers instead of spawn-wide
-    totals.
-
-    Returns: { batch_id: outcome_dict }
-    """
-    all_fish    = get_all_fish()
-    all_batches = get_all_fry_batches()
-
-    out = {}
-    for b in all_batches:
-        bid = b.get("id")
-        sid = b.get("spawn_id")
-        if not bid or not sid:
-            continue
-        out[bid] = _compute_from_data(sid, all_fish, all_batches, batch_id=bid)
-    return out
+def _default_batch_name(spawn: dict) -> str:
+    """Generate a default batch name from line_code + generation."""
+    line = (spawn.get("line_code") or "").strip()
+    gen = (spawn.get("generation") or "").strip()
+    if not line or line == "UNK" or len(line) > 12:
+        base = spawn.get("system_id") or "BATCH"
+    else:
+        base = line
+    return f"{base}-{gen}" if gen else base
 
 
 # ============================================================
-# DISPLAY HELPERS
+# OUTCOME PANEL (Session 24B)
 # ============================================================
 
-def verdict_badge_html(outcome: dict) -> str:
-    """Return an inline HTML badge for the verdict."""
-    key = outcome.get("verdict_key", "unknown")
-    icon = outcome.get("verdict_icon", "—")
-    label_map = {
-        "excellent": "Excellent",
-        "solid": "Solid",
-        "mixed": "Mixed",
-        "weak": "Weak",
-        "failed": "Failed",
-        "pending": "Pending",
-        "unknown": "Unknown",
-    }
-    label = label_map.get(key, "—")
+def _render_outcome_panel(outcome: dict):
+    verdict_key = outcome.get("verdict_key", "unknown")
+    verdict_icon = outcome.get("verdict_icon", "—")
+    verdict_reason = outcome.get("verdict_reason", "")
+    jarred = outcome.get("jarred_count", 0)
+    culled = outcome.get("culled_count", 0)
+    females = outcome.get("female_count", 0)
+    avg_score = outcome.get("avg_form_score")
+    breakdown = grade_breakdown_short(outcome)
+    best = outcome.get("best_fish")
 
-    color_map = {
-        "excellent": ("#D1FAE5", "#065F46"),
-        "solid":     ("#DBEAFE", "#1E40AF"),
-        "mixed":     ("#FEF3C7", "#92400E"),
-        "weak":      ("#FEE2E2", "#991B1B"),
-        "failed":    ("#F3F4F6", "#6B7280"),
-        "pending":   ("#F3F4F6", "#374151"),
-        "unknown":   ("#F3F4F6", "#6B7280"),
-    }
-    bg, fg = color_map.get(key, ("#F3F4F6", "#374151"))
-
-    return (
-        f'<span style="display:inline-block;background:{bg};color:{fg};'
-        f'font-size:12px;font-weight:600;padding:3px 10px;border-radius:10px;">'
-        f'{icon} {label}</span>'
+    st.markdown("**📊 Batch Outcome**")
+    st.markdown(
+        f'{verdict_badge_html(outcome)} &nbsp; <span style="color:#6B7280;'
+        f'font-size:13px;">{verdict_reason}</span>',
+        unsafe_allow_html=True,
     )
 
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Jarred", jarred)
+    col2.metric("Culled", culled)
+    col3.metric("Females", females)
+    col4.metric("Avg Form", f"{avg_score:.0f}" if avg_score is not None else "—")
 
-def grade_breakdown_short(outcome: dict) -> str:
-    """Return '5 Show · 2 High · 3 Pet' style summary."""
-    breakdown = outcome.get("grade_breakdown") or {}
-    if not breakdown:
-        return "—"
-    order = ["Show Grade", "High Grade", "Breeder Grade", "Material Grade", "Pet Grade"]
-    parts = []
-    for g in order:
-        if g in breakdown:
-            short = g.replace(" Grade", "")
-            parts.append(f"{breakdown[g]} {short}")
-    for g, count in breakdown.items():
-        if g not in order:
-            parts.append(f"{count} {g}")
-    return " · ".join(parts) if parts else "—"
+    if breakdown and breakdown != "—":
+        st.caption(f"**Grades:** {breakdown}")
 
-
-def reconciliation_html(outcome: dict) -> str:
-    """
-    Return an HTML badge showing whether the counts reconcile.
-    """
-    if not outcome.get("has_batch"):
-        return ""
-
-    delta = outcome.get("reconciliation_delta", 0)
-    initial = outcome.get("initial_count", 0)
-
-    if abs(delta) <= 1:
-        return (
-            '<span style="display:inline-block;background:#D1FAE5;color:#065F46;'
-            'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;">'
-            '✓ Counts reconcile</span>'
+    if best:
+        st.caption(
+            f"🏆 Best: `{best.get('system_id') or '?'}` "
+            f"({best.get('grade') or '—'})"
         )
 
-    sign = "+" if delta > 0 else ""
-    return (
-        f'<span style="display:inline-block;background:#FEF3C7;color:#92400E;'
-        f'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;">'
-        f'⚠️ Off by {sign}{delta}</span>'
+    if verdict_key in ("pending", "unknown"):
+        st.caption(
+            "💡 Jar fry and cull fish to populate this outcome — it's "
+            "computed from your existing data."
+        )
+
+
+# ============================================================
+# TAB 1: ACTIVE PAIRINGS
+# ============================================================
+
+def _render_lifecycle_buttons(item: dict):
+    spawn = item["spawn"]
+    spawn_uuid = spawn["id"]
+    system_id = spawn.get("system_id") or "?"
+    status = spawn.get("status") or "In Pairing"
+    line_code = spawn.get("line_code") or "N/A"
+    generation = spawn.get("generation") or "N/A"
+
+    col_a, col_b, col_c = st.columns(3)
+
+    # --- Eggs Dropped ---
+    with col_a:
+        if status == "In Pairing":
+            if st.button("🥚 Eggs Dropped", key=f"egg_{spawn_uuid}", use_container_width=True):
+                mark_pairing_success_pending(spawn_uuid)
+                st.success("Status → Pending (Success)")
+                st.rerun()
+        elif status == "Pending (Success)":
+            st.caption("✅ Eggs pending")
+
+    # --- Mark Free Swimming ---
+    with col_b:
+        with st.popover("🏊 Mark Free Swimming", use_container_width=True):
+            default_batch = _default_batch_name(spawn)
+            batch_name = st.text_input(
+                "Batch Name / Code",
+                value=default_batch,
+                key=f"batch_{spawn_uuid}",
+                help="Short prefix used when jarring individual fish (e.g. SP01-F1-01)",
+            )
+            fry_cnt = st.number_input(
+                "Estimated Fry",
+                min_value=1, value=50, key=f"cnt_{spawn_uuid}",
+            )
+            free_swim_date = st.date_input(
+                "Free Swim Date",
+                value=datetime.date.today(),
+                key=f"free_swim_date_{spawn_uuid}",
+                help="Backdate if the fry started free-swimming earlier. "
+                     "The recovery countdown for both parents starts from this date.",
+            )
+            if st.button("Confirm Free Swim", key=f"confirm_swim_{spawn_uuid}"):
+                if batch_name.strip():
+                    mark_free_swimming(
+                        spawn_uuid,
+                        batch_name.strip(),
+                        int(fry_cnt),
+                        free_swim_date=str(free_swim_date),
+                    )
+                    st.success(
+                        f"Spawn marked Free Swimming ({free_swim_date}). "
+                        f"Tank released. Parents now Recovering."
+                    )
+                    st.rerun()
+                else:
+                    st.error("Please enter a batch name.")
+
+    # --- Mark Failed ---
+    with col_c:
+        with st.popover("❌ Mark Failed", use_container_width=True):
+            reason = st.selectbox(
+                "Reason",
+                [
+                    "Aggression / Fighting",
+                    "Eaten Eggs",
+                    "Infertility / Unhatched Eggs",
+                    "Fungal / Mold Infection",
+                    "Other",
+                ],
+                key=f"fail_reason_{spawn_uuid}",
+            )
+            if st.button("Confirm Failure", key=f"confirm_fail_{spawn_uuid}", type="primary"):
+                mark_pairing_failed(spawn_uuid, reason)
+                st.success("Spawn marked Failed. Tank released. Parents available.")
+                st.rerun()
+
+
+def _render_edit_popover(spawn: dict):
+    spawn_uuid = spawn["id"]
+    system_id = spawn.get("system_id") or "?"
+
+    with st.popover("✏️ Edit Spawn", use_container_width=True):
+        st.write(f"**Edit Spawn {system_id}**")
+        edit_goal = st.text_input(
+            "Line Goal",
+            value=spawn.get("line_goal") or "",
+            key=f"edit_goal_{spawn_uuid}",
+        )
+        edit_notes = st.text_area(
+            "Notes",
+            value=spawn.get("notes") or "",
+            key=f"edit_notes_{spawn_uuid}",
+        )
+        if st.button("Save Changes", key=f"save_edit_{spawn_uuid}"):
+            if update_spawn_details(spawn_uuid, line_goal=edit_goal, notes=edit_notes):
+                st.success("Updated.")
+                st.rerun()
+            else:
+                st.error("Failed to update spawn.")
+
+
+def _render_active_pairing_card(item: dict, outcome: Optional[dict] = None):
+    spawn = item["spawn"]
+    male = item["male"]
+    female = item["female"]
+    tank_loc = item.get("tank_location") or "Unassigned"
+    days_paired = item.get("days_paired") or 0
+
+    system_id = spawn.get("system_id") or "?"
+    status = spawn.get("status") or "In Pairing"
+    pairing_date = spawn.get("pairing_date") or "—"
+    line_code = spawn.get("line_code") or "N/A"
+    generation = spawn.get("generation") or "N/A"
+
+    with st.container(border=True):
+        col_title, col_edit = st.columns([4, 1])
+        with col_title:
+            st.markdown(f"### 🧪 Spawn: `{system_id}` | Line: `{line_code}` (`{generation}`)")
+        with col_edit:
+            _render_edit_popover(spawn)
+
+        st.caption(
+            f"📍 **Tank:** {tank_loc} | "
+            f"📅 **Paired:** {pairing_date} ({days_paired} days ago) | "
+            f"🏷️ **Status:** `{status}`"
+        )
+
+        if spawn.get("line_goal"):
+            st.write(f"🎯 **Goal:** {spawn['line_goal']}")
+        if spawn.get("notes"):
+            st.info(f"**Notes:** {spawn['notes']}")
+
+        if outcome and outcome.get("verdict_key") not in ("unknown",):
+            st.divider()
+            _render_outcome_panel(outcome)
+
+        st.divider()
+
+        col_male, col_female = st.columns(2)
+        with col_male:
+            _render_breeder_block(male, spawn.get("male_id") or "?", "♂️ Male Breeder")
+        with col_female:
+            _render_breeder_block(female, spawn.get("female_id") or "?", "♀️ Female Breeder")
+
+        st.divider()
+
+        _render_lifecycle_buttons(item)
+
+
+def render_active_pairings_tab():
+    st.subheader("Currently Active Pairings")
+
+    col_ref, _ = st.columns([1, 3])
+    with col_ref:
+        if st.button("🔄 Refresh", key="btn_refresh_spawns", use_container_width=True):
+            st.rerun()
+
+    active = list_active_pairings_with_details()
+
+    if not active:
+        st.info("No active pairings. Start one in the 'Start New Pairing' tab.")
+        return
+
+    outcome_map = compute_all_spawn_outcomes()
+
+    for item in active:
+        spawn_uuid = item["spawn"]["id"]
+        outcome = outcome_map.get(spawn_uuid)
+        _render_active_pairing_card(item, outcome=outcome)
+
+
+# ============================================================
+# TAB 2: START NEW PAIRING
+# ============================================================
+
+def _render_lineage_check(male_uuid: str, female_uuid: str) -> dict:
+    result = check_inbreeding(male_uuid, female_uuid)
+    level = result.get("level", "clear")
+    icon = result.get("icon", "🟢")
+    label = result.get("label", "Clear")
+    summary = result.get("summary", "")
+
+    body = f"**{icon} Lineage check: {label}**  \n{summary}"
+
+    if level == "clear":
+        st.success(body)
+    elif level == "distant":
+        st.info(body)
+    elif level == "caution":
+        st.warning(body)
+    else:
+        st.error(body)
+
+    shared = result.get("shared") or []
+    if shared:
+        with st.expander(f"🔍 Shared ancestors ({len(shared)})"):
+            for anc in shared:
+                sid = anc.get("system_id") or "?"
+                mg = anc.get("male_gen")
+                fg = anc.get("female_gen")
+                st.markdown(
+                    f"- `{sid}` — male side: {mg} gen"
+                    f"{'s' if mg != 1 else ''}, "
+                    f"female side: {fg} gen"
+                    f"{'s' if fg != 1 else ''}"
+                )
+
+    return result
+
+
+def render_start_pairing_tab():
+    st.subheader("Pair Male & Female Breeder")
+
+    from database import get_all_fish
+    all_fish = get_all_fish()
+
+    males_dd, females_dd = [], []
+    for f in all_fish:
+        if not f.get("system_id"):
+            continue
+        status = (f.get("status") or "").lower()
+        if status in ("deceased", "sold", "retired", "culled"):
+            continue
+        gender = (f.get("gender") or "").lower()
+        item = {
+            "id": f["id"],
+            "label": f"{f['system_id']} | {f.get('variety') or 'no variety'}",
+        }
+        if gender == "male":
+            males_dd.append(item)
+        elif gender == "female":
+            females_dd.append(item)
+
+    tank_dd = get_tank_dropdown_items(purpose="Spawning")
+
+    if not males_dd or not females_dd:
+        st.warning("⚠️ You need at least one Male and one Female fish to create a pair.")
+        return
+
+    if not tank_dd:
+        st.error("⚠️ No available Spawning-purpose tanks. Create or free up a tank first.")
+        return
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        male_idx = st.selectbox(
+            "Select Male Breeder",
+            options=range(len(males_dd)),
+            format_func=lambda i: males_dd[i]["label"],
+        )
+        male_uuid = males_dd[male_idx]["id"]
+
+        tank_idx = st.selectbox(
+            "Select Spawning Tank",
+            options=range(len(tank_dd)),
+            format_func=lambda i: tank_dd[i]["label"],
+        )
+        tank_uuid = tank_dd[tank_idx]["id"]
+
+        pairing_date = st.date_input(
+            "Pairing Date",
+            value=datetime.date.today(),
+            key="pairing_date_new",
+            help="Backdate if the pairing started earlier. Both parents' "
+                 "breeding countdowns start from this date.",
+        )
+
+    with col2:
+        female_idx = st.selectbox(
+            "Select Female Breeder",
+            options=range(len(females_dd)),
+            format_func=lambda i: females_dd[i]["label"],
+        )
+        female_uuid = females_dd[female_idx]["id"]
+
+        line_goal = st.text_input(
+            "Line / Breeding Goal",
+            placeholder="e.g. Improve caudal spread & clean dorsal",
+        )
+
+    lineage_result = _render_lineage_check(male_uuid, female_uuid)
+
+    male_fish = next((f for f in all_fish if f["id"] == male_uuid), None)
+    female_fish = next((f for f in all_fish if f["id"] == female_uuid), None)
+
+    if male_fish and female_fish:
+        preview_line, preview_gen = calculate_child_lineage(
+            male_line=male_fish.get("line_code") or "UNK",
+            male_gen=male_fish.get("generation") or "P1",
+            female_line=female_fish.get("line_code") or "UNK",
+            female_gen=female_fish.get("generation") or "P1",
+        )
+        preview_code = generate_spawn_code()
+
+        st.info(
+            f"📋 **Compact Code:** `{preview_code}` | "
+            f"🧬 **Target Line:** `{preview_line}` | "
+            f"🏷️ **Resulting Gen:** `{preview_gen}`"
+        )
+
+    notes = st.text_area(
+        "Pairing Notes",
+        placeholder="e.g. Both pre-conditioned for 7 days on bloodworms",
     )
+
+    dangerous = lineage_result.get("level") == "dangerous"
+    confirm_dangerous = True
+    if dangerous:
+        confirm_dangerous = st.checkbox(
+            "⚠️ I understand this pairing is a dangerous inbreeding. Proceed anyway.",
+            key="confirm_dangerous_pairing",
+        )
+
+    submit_disabled = dangerous and not confirm_dangerous
+
+    if st.button(
+        "💞 Initiate Pairing",
+        type="primary",
+        use_container_width=True,
+        disabled=submit_disabled,
+    ):
+        with st.spinner("Setting up pairing..."):
+            saved = create_new_spawn(
+                male_id=male_uuid,
+                female_id=female_uuid,
+                tank_id=tank_uuid,
+                line_goal=line_goal,
+                notes=notes,
+                pairing_date=str(pairing_date),
+            )
+        if not saved:
+            st.error("Failed to create spawn.")
+            return
+        st.success(
+            f"Pairing initiated! **{saved.get('system_id')}** "
+            f"(code: {saved.get('spawn_code')}) assigned to tank — "
+            f"pairing date {pairing_date}."
+        )
+        st.rerun()
+
+
+# ============================================================
+# TAB 3: ALL SPAWN HISTORY
+# ============================================================
+
+def render_history_tab():
+    st.subheader("All Spawn Records")
+
+    items = list_spawns_with_details()
+    if not items:
+        st.info("No spawn history recorded yet.")
+        return
+
+    outcome_map = compute_all_spawn_outcomes()
+
+    rows = []
+    for it in items:
+        s = it["spawn"]
+        male = it.get("male")
+        female = it.get("female")
+        spawn_uuid = s["id"]
+        outcome = outcome_map.get(spawn_uuid) or {}
+
+        v_key = outcome.get("verdict_key", "unknown")
+        v_icon = outcome.get("verdict_icon", "—")
+        v_label = {
+            "excellent": "Excellent",
+            "solid": "Solid",
+            "mixed": "Mixed",
+            "weak": "Weak",
+            "failed": "Failed",
+            "pending": "Pending",
+            "unknown": "—",
+        }.get(v_key, "—")
+
+        rows.append({
+            "Spawn ID": s.get("system_id") or "?",
+            "Code": s.get("spawn_code") or "",
+            "Line": s.get("line_code") or "",
+            "Gen": s.get("generation") or "",
+            "Male": (male or {}).get("system_id") or s.get("male_id") or "—",
+            "Female": (female or {}).get("system_id") or s.get("female_id") or "—",
+            "Pairing Date": s.get("pairing_date") or "",
+            "Status": s.get("status") or "",
+            "Batch": s.get("batch_name") or "",
+            "Free Swim": s.get("free_swimming_date") or "",
+            "Fry (est)": s.get("estimated_fry_count") or 0,
+            "Jarred": outcome.get("jarred_count", 0),
+            "Culled": outcome.get("culled_count", 0),
+            "Females": outcome.get("female_count", 0),
+            "Avg Score": (
+                round(outcome.get("avg_form_score") or 0)
+                if outcome.get("avg_form_score") is not None else "—"
+            ),
+            "Grades": grade_breakdown_short(outcome),
+            "Verdict": f"{v_icon} {v_label}",
+            "Tank": it.get("tank_location") or "Unassigned",
+            "Notes": s.get("notes") or "",
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("##### 📊 Full Outcome Details")
+    st.caption("Click any spawn to see grade breakdown, best fish, and verdict reasoning.")
+
+    for it in items:
+        s = it["spawn"]
+        spawn_uuid = s["id"]
+        outcome = outcome_map.get(spawn_uuid) or {}
+        system_id = s.get("system_id") or "?"
+
+        if outcome.get("verdict_key") in ("unknown",):
+            continue
+
+        with st.expander(f"🧪 {system_id} — {outcome.get('verdict_icon', '')} {outcome.get('verdict_reason', '')}"):
+            _render_outcome_panel(outcome)
+
+
+# ============================================================
+# PAGE
+# ============================================================
+
+def render_spawn_page():
+    st.title("🧬 Pair & Spawn Tracker")
+
+    tab1, tab2, tab3 = st.tabs([
+        "💞 Active Pairings",
+        "➕ Start New Pairing",
+        "📜 All Spawn History",
+    ])
+
+    with tab1:
+        render_active_pairings_tab()
+
+    with tab2:
+        render_start_pairing_tab()
+
+    with tab3:
+        render_history_tab()
+
+
+def render_spawn_tracker():
+    """Alias entrypoint."""
+    render_spawn_page()
