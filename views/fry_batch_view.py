@@ -13,6 +13,9 @@
 #     wide 4:3 rounded-square parent photos, details below, and
 #     "View fish →" link.
 #   • Batch Outcome panel moved to left column (35% width).
+#   • Fixed StreamlitDuplicateElementKey: button keys now include
+#     batch_uuid so multiple cards sharing the same parent fish
+#     don't collide.
 #   • Jarring failures surfaced (jar_fry_bulk returns (created, failed)).
 #   • _render_list_section() fetches list_all_batches() once.
 #   • "Stage due?" hint when fry/free_swimming batch is older
@@ -76,6 +79,11 @@ PARENT_PHOTO_RADIUS = 24         # px, rounded-square
 PARENT_PHOTO_BORDER = "#E5E7EB"
 PARENT_PHOTO_BG = "#F3F4F6"
 PARENT_PHOTO_ASPECT = "4/3"      # wide, matches betta side shots
+
+# Column split between outcome panel and M/F showcase.
+# [35, 65] → outcome gets 35%, parents get 65%.
+OUTCOME_COL_WEIGHT = 35
+MF_COL_WEIGHT = 65
 
 
 # ============================================================
@@ -186,11 +194,12 @@ def _parent_details_html(fish: Optional[dict], gender_sym: str, label: str) -> s
     )
 
 
-def _render_mf_showcase(parents: dict):
+def _render_mf_showcase(parents: dict, batch_uuid: str):
     """
-    Right-column panel: two side-by-side M & F wide photos that
-    each fill half the available width. 4:3 aspect ratio keeps
-    betta side shots from cropping.
+    Right-column panel: two side-by-side M & F wide photos.
+
+    batch_uuid is used to namespace button keys so multiple batch
+    cards sharing the same parent fish don't collide in Streamlit.
     """
     st.markdown("##### 🧬 Parents")
 
@@ -208,7 +217,7 @@ def _render_mf_showcase(parents: dict):
         if male and male.get("id"):
             if st.button(
                 "View fish →",
-                key=f"view_male_{male['id']}",
+                key=f"view_male_{batch_uuid}_{male['id']}",
                 use_container_width=True,
             ):
                 st.session_state["fish_registry_focus_id"] = male["id"]
@@ -227,7 +236,7 @@ def _render_mf_showcase(parents: dict):
         if female and female.get("id"):
             if st.button(
                 "View fish →",
-                key=f"view_female_{female['id']}",
+                key=f"view_female_{batch_uuid}_{female['id']}",
                 use_container_width=True,
             ):
                 st.session_state["fish_registry_focus_id"] = female["id"]
@@ -330,7 +339,7 @@ def _render_create_section():
 
 
 # ============================================================
-# OUTCOME PANEL (left column, unchanged)
+# OUTCOME PANEL (left column, unchanged content)
 # ============================================================
 
 def _render_outcome_panel(outcome: dict):
@@ -604,14 +613,14 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         # ---- Two-column: Outcome (35%) | M/F Parents (65%) ----
         if outcome and outcome.get("verdict_key") not in ("unknown",):
             st.divider()
-            col_outcome, col_mf = st.columns([35, 65])
+            col_outcome, col_mf = st.columns([OUTCOME_COL_WEIGHT, MF_COL_WEIGHT])
 
             with col_outcome:
                 _render_outcome_panel(outcome)
 
             with col_mf:
                 with st.container(border=True):
-                    _render_mf_showcase(parents)
+                    _render_mf_showcase(parents, batch_uuid=batch_uuid)
 
         st.divider()
 
