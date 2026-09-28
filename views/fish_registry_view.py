@@ -14,16 +14,15 @@
 # Session 26D fix — Better video UX + best frame handling.
 # Session 26D round 2 — Stronger framing warning banner.
 #
-# Session 26H.7 — Step 5 (this revision):
-#   • ⭐ Star toggle in Manage popover (writes is_starred + starred_reason)
-#   • ⭐ badge on grid tiles + ⭐ column in table view
-#   • "⭐ Show starred only" filter checkbox
-#   • Tank assignment via new API:
-#       - register form uses get_tank_dropdown_items()
-#       - register submit uses add_occupant_to_tank()
-#       - manage popover uses remove_occupant() + add_occupant_to_tank()
-#       - delete fish uses remove_occupant() for each occupant
-#   • Tank badge on tile sourced from tank_occupants (not fish.location)
+# Session 26H.7 — Step 5: ⭐ star toggle + new tank API.
+#
+# Session 27B — Round 2A (this revision):
+#   • Import stage_of, variety_of from fish_manager
+#   • Grid tile: show computed stage + breeder_status badges
+#   • Grid tile + table + highlight strip: variety display
+#     uses variety_of() (variety_4mo > variety_3mo > variety)
+#   • Table view: new "Stage" and "Breeder Status" columns
+#   • Side photos + molt checkpoints come in Round 2B
 
 import io
 import datetime
@@ -71,6 +70,8 @@ from modules.fish_manager import (
     grade_badge_text_color,
     get_fish_age_days,
     format_fish_age,
+    stage_of,
+    variety_of,
     VALID_GRADES,
     VALID_GENDERS,
     CULL_REASONS,
@@ -117,6 +118,14 @@ DISPLAY_WIDTH = 480
 VIDEO_SAMPLE_EVERY = 5
 VIDEO_MAX_FRAMES = 30
 VIDEO_MAX_MB = 150
+
+# Breeder statuses that are worth showing on a tile badge
+BREEDER_STATUS_BADGES = {
+    "Recovering":   ("🟡", "#FEF3C7", "#92400E"),
+    "Conditioning": ("🟠", "#FED7AA", "#9A3412"),
+    "In Pairing":   ("🔵", "#DBEAFE", "#1E40AF"),
+    "Ready":        ("🟢", "#D1FAE5", "#065F46"),
+}
 
 
 # ============================================================
@@ -1156,14 +1165,12 @@ def _render_card_actions(fish: dict):
 
         if st.button("📦 Apply Move", key=f"apply_move_{fish_uuid}", use_container_width=True):
             moved = False
-            # Remove from current tank(s)
             try:
                 for occ in get_occupants_for_fish(fish_uuid):
                     remove_occupant(occ["tank_id"], "fish", fish_uuid)
                     moved = True
             except Exception:
                 pass
-            # Add to new (if any)
             if new_tank_id:
                 if add_occupant_to_tank(new_tank_id, "fish", fish_uuid, role="primary"):
                     moved = True
@@ -1176,7 +1183,6 @@ def _render_card_actions(fish: dict):
     st.divider()
     confirm = st.checkbox("Confirm delete (removes fish + Drive photo)", key=f"del_confirm_{fish_uuid}")
     if st.button("🔥 Delete Fish", key=f"del_btn_{fish_uuid}", disabled=not confirm, use_container_width=True):
-        # Clear tank occupants first
         try:
             for occ in get_occupants_for_fish(fish_uuid):
                 remove_occupant(occ["tank_id"], "fish", fish_uuid)
@@ -1214,6 +1220,21 @@ def _color_swatch_row(fish: dict) -> str:
     for color, pct in sorted(palette.items(), key=lambda x: -x[1])[:4]:
         parts.append(color_swatch_html(color, size=14))
     return "".join(parts)
+
+
+def _breeder_status_badge_html(breeder_status: Optional[str]) -> str:
+    """Return an HTML badge for a breeder_status, or empty string if not badge-worthy."""
+    if not breeder_status:
+        return ""
+    style = BREEDER_STATUS_BADGES.get(breeder_status)
+    if not style:
+        return ""
+    icon, bg, fg = style
+    return (
+        f'<span style="display:inline-block;background:{bg};color:{fg};'
+        f'font-size:10px;font-weight:600;padding:2px 8px;border-radius:10px;'
+        f'margin-left:4px;">{icon} {breeder_status}</span>'
+    )
 
 
 def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
@@ -1258,7 +1279,7 @@ def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
                 st.markdown(_uniform_photo_html(f.get("photo_id"), aspect="4 / 3"), unsafe_allow_html=True)
                 st.caption(f"*{label}*")
                 st.markdown(f"**{f.get('system_id')}**")
-                st.caption(f"{f.get('gender') or '?'} · {f.get('variety') or '—'} · {f.get('grade') or '—'}")
+                st.caption(f"{f.get('gender') or '?'} · {variety_of(f)} · {f.get('grade') or '—'}")
 
     st.markdown("---")
 
@@ -1281,6 +1302,12 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
     age_days = get_fish_age_days(fish)
     age_text = format_fish_age(age_days)
 
+    stage = stage_of(fish)
+    stage_txt = stage.replace("_", "-") if stage else ""
+
+    breeder_status = fish.get("breeder_status")
+    breeder_badge = _breeder_status_badge_html(breeder_status)
+
     gender = (fish.get("gender") or "?").lower()
     gender_sym = "♂" if gender == "male" else ("♀" if gender == "female" else "•")
 
@@ -1294,7 +1321,7 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
             unsafe_allow_html=True,
         )
 
-        st.markdown(f"**{star_marker}{system_id}** · {gender_sym} {fish.get('variety') or '—'}")
+        st.markdown(f"**{star_marker}{system_id}** · {gender_sym} {variety_of(fish)}")
 
         if is_starred and fish.get("starred_reason"):
             st.caption(f"⭐ *{fish['starred_reason']}*")
@@ -1308,6 +1335,8 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
             badges.append(f"📸 {milestone_count}")
         if age_text and age_text != "—":
             badges.append(f"🗓 {age_text}")
+        if stage_txt:
+            badges.append(f"🌱 {stage_txt}")
         if is_culled:
             badges.append("⛔ Culled")
         if fish.get("iridescence_level") and fish["iridescence_level"] != "none":
@@ -1320,6 +1349,13 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0):
 
         if badges:
             st.caption(" · ".join(badges))
+
+        # Breeder status badge (below, more prominent)
+        if breeder_badge:
+            st.markdown(
+                f'<div style="margin-top:4px;">{breeder_badge}</div>',
+                unsafe_allow_html=True,
+            )
 
         with st.popover("⚙️ Manage", use_container_width=True):
             _render_card_actions(fish)
@@ -1343,11 +1379,15 @@ def _render_table_view(filtered: list[dict], milestone_counts: dict):
         current_tank = _get_current_tank_for_fish(f["id"])
         tank_loc = current_tank.get("location_code") if current_tank else "—"
 
+        stage = stage_of(f) or "—"
+
         rows.append({
             "⭐": "⭐" if f.get("is_starred") else "",
             "ID": f.get("system_id") or "?",
             "Gender": f.get("gender") or "—",
-            "Variety": f.get("variety") or "—",
+            "Variety": variety_of(f),
+            "Stage": stage.replace("_", "-"),
+            "Breeder": f.get("breeder_status") or "—",
             "Grade": f.get("grade") or "—",
             "Line": f.get("line_code") or "—",
             "Gen": f.get("generation") or "—",
@@ -1364,6 +1404,8 @@ def _render_table_view(filtered: list[dict], milestone_counts: dict):
         hide_index=True,
         column_config={
             "⭐": st.column_config.TextColumn("⭐", width="small"),
+            "Stage": st.column_config.TextColumn("Stage", width="small"),
+            "Breeder": st.column_config.TextColumn("Breeder", width="small"),
             "Milestones": st.column_config.NumberColumn("📸", width="small"),
             "Age": st.column_config.TextColumn("Age", width="small"),
         },
@@ -1420,7 +1462,7 @@ def render_list_tab():
     with f_col3:
         variety_filter = st.multiselect(
             "Variety",
-            options=sorted({f.get("variety") for f in all_fish if f.get("variety")}),
+            options=sorted({variety_of(f) for f in all_fish if variety_of(f) and variety_of(f) != "—"}),
         )
     with f_col4:
         iri_filter = st.multiselect(
@@ -1447,7 +1489,7 @@ def render_list_tab():
     if grade_filter:
         filtered = [f for f in filtered if f.get("grade") in grade_filter]
     if variety_filter:
-        filtered = [f for f in filtered if f.get("variety") in variety_filter]
+        filtered = [f for f in filtered if variety_of(f) in variety_filter]
     if iri_filter:
         filtered = [f for f in filtered if f.get("iridescence_level") in iri_filter]
     if hide_culled:
