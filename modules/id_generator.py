@@ -2,16 +2,21 @@
 # Betta Farm Management System
 # Session 5 — centralized ID generation. Single source of truth.
 #
-# ID schemes:
-#   Fish (manual)      : FISH-NNNN              e.g. FISH-0042
-#   Fish (batch-born)  : {SPAWN_SYS_ID}-NN      e.g. SPN-AVT-F1-01-03
-#   Tank system_id     : TNNNNN                 e.g. T00042
-#   Tank tape code     : {PREFIX}-NNNN          e.g. JAR-0007, SPN-0012
-#   Spawn system_id    : SPN-{LINE}-{GEN}-NN    e.g. SPN-AVT-F1-01
-#   Spawn spawn_code   : SPN-YY-NN              e.g. SPN-26-01
+# Session 27B — Round 1 (this revision):
+#   • generate_batch_fish_id() DELETED.
+#     All fish now use FISH-NNNN, regardless of origin.
+#     Lineage is tracked via DB relationships
+#     (fish.sire_id, fish.dam_id, fish.batch_id), not IDs.
 #
-# Lineage is NEVER reconstructed from IDs. It comes from DB relationships
-# (fish.sire_id, fish.dam_id, fish.batch_id). IDs are human labels only.
+# ID schemes:
+#   Fish                : FISH-NNNN              e.g. FISH-0042
+#   Tank system_id      : TNNNNN                 e.g. T00042
+#   Tank tape code      : {PREFIX}-NNNN          e.g. JAR-0007, SPN-0012
+#   Spawn system_id     : SPN-{LINE}-{GEN}-NN    e.g. SPN-AVT-F1-01
+#   Spawn spawn_code    : SPN-YY-NN              e.g. SPN-26-01
+#
+# Lineage is NEVER reconstructed from IDs. It comes from DB relationships.
+# IDs are human labels only.
 
 from __future__ import annotations
 
@@ -88,28 +93,16 @@ def _next_sequence(existing: Iterable[str], prefix: str, width: int) -> int:
 
 def generate_fish_id() -> str:
     """
-    Manual / purchased fish. Format: FISH-NNNN
-    Sequential across all manual fish.
+    Universal fish ID. Format: FISH-NNNN
+    Sequential across all fish — bought or bred, no exception.
+
+    Origin, spawn, generation, and parents are tracked
+    separately in the DB (batch_id, sire_id, dam_id, generation).
+    The ID itself carries no meaning beyond "which fish".
     """
     existing = [f.get("system_id") or "" for f in get_all_fish()]
     nxt = _next_sequence(existing, FISH_PREFIX, width=4)
     return f"{FISH_PREFIX}{nxt:04d}"
-
-
-def generate_batch_fish_id(spawn_system_id: str, batch_size_hint: Optional[int] = None) -> str:
-    """
-    Batch-born fish. Format: {SPAWN_SYS_ID}-NN
-    e.g. SPN-AVT-F1-01-03  (3rd fish from that spawn)
-
-    `batch_size_hint` is ignored — kept for API compatibility.
-    """
-    if not spawn_system_id:
-        spawn_system_id = "SPN-UNK-P1-01"
-
-    prefix = f"{spawn_system_id}-"
-    existing = [f.get("system_id") or "" for f in get_all_fish()]
-    nxt = _next_sequence(existing, prefix, width=2)
-    return f"{prefix}{nxt:02d}"
 
 
 # ============================================================
