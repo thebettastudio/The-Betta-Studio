@@ -6,11 +6,17 @@
 # Session 23 — Added get_fish_age_days() and grade color helper.
 # breeder_registry.py is retired; all breeder logic lives here.
 #
-# Session 26H.7 — Step 7 (this revision):
-#   • change_location() rewritten to use the new tank_occupants API
-#     (remove_occupant + add_occupant_to_tank + find_tank) instead of
-#     the old assign_occupant/clear_occupant wrappers, and to match
-#     tanks by uuid lookup rather than scanning location_code strings.
+# Session 26H.7 — Step 7: change_location uses new tank API.
+#
+# Session 27B — Round 1 (this revision):
+#   • VALID_STATUSES narrowed to 6 values (Jarred + Conditioning removed)
+#   • VALID_BREEDER_STATUSES gains "Recovering"
+#   • VALID_STAGES deleted (stage is now computed from age)
+#   • register_fish_from_spawn uses generate_fish_id() (single format)
+#   • register_breeder sets status="Active", breeder_status="Conditioning"
+#   • strain parameter removed from register_new_fish
+#   • New: stage_of(fish), variety_of(fish)
+#   • New: process_breeder_transitions() — auto-flip pass
 
 from __future__ import annotations
 
@@ -32,8 +38,13 @@ from database import (
     get_all_tanks,
     get_all_spawns,
     log_activity,
+    # Session 27B helpers
+    compute_stage,
+    stage_label,
+    display_variety,
+    advance_breeder_status,
 )
-from modules.id_generator import generate_fish_id, generate_batch_fish_id
+from modules.id_generator import generate_fish_id
 from modules.photo_service import upload_photo, delete_drive_file, photo_url
 
 
@@ -51,20 +62,31 @@ VALID_GRADES = [
     "Pet Grade",
 ]
 
-VALID_STAGES = [
-    "egg", "fry", "free_swimming", "jarred",
-    "juvenile", "sub_adult", "adult", "breeder", "retired",
-]
-
+# Session 27B — narrowed from 8 values to 6.
+#   - "Jarred"       removed (a location fact, not a life status)
+#   - "Conditioning" removed (moved entirely to breeder_status)
 VALID_STATUSES = [
-    "Active", "Jarred", "For Sale", "Sold",
-    "Deceased", "Retired", "Conditioning", "Culled",
+    "Active",
+    "For Sale",
+    "Sold",
+    "Deceased",
+    "Culled",
+    "Retired",
 ]
 
+# Session 27B — added "Recovering" for post-spawn male + female.
 VALID_BREEDER_STATUSES = [
-    "Available", "Conditioning", "Ready",
-    "In Pairing", "Retired", "Inactive",
+    "Available",
+    "Conditioning",
+    "Recovering",
+    "Ready",
+    "In Pairing",
+    "Retired",
+    "Inactive",
 ]
+
+# Session 27B — VALID_STAGES deleted. Stage is now computed
+# from age via database.compute_stage().
 
 VALID_ORIGINS = ["Purchased", "Batch Spawn"]
 
@@ -81,7 +103,7 @@ CULL_REASONS = [
 
 
 # ============================================================
-# DISPLAY HELPERS (Session 23)
+# DISPLAY HELPERS
 # ============================================================
 
 def grade_badge_color(grade: Optional[str]) -> str:
@@ -135,6 +157,63 @@ def format_fish_age(days: Optional[int]) -> str:
     return f"{days // 365}y"
 
 
+def stage_of(fish: dict) -> Optional[str]:
+    """
+    Return the computed growth stage for a fish.
+    Session 27B — wrapper around database.compute_stage().
+    Values: fry | juvenile | sub_adult | adult | senior
+    """
+    return compute_stage(fish)
+
+
+def variety_of(fish: dict) -> str:
+    """
+    Return the variety to display.
+    Session 27B — prefers variety_4mo > variety_3mo > variety.
+    """
+    return display_variety(fish)
+
+
+# ============================================================
+# BREEDER STATUS AUTO-FLIP
+# ============================================================
+
+def process_breeder_transitions() -> int:
+    """
+    Walk every fish with a breeder_status and auto-flip any that
+    have exceeded their duration.
+
+    Call this once per app load (or on demand) to keep breeder
+    statuses in sync with time.
+
+    Returns: number of fish whose status was flipped.
+    """
+    flipped = 0
+    try:
+        for fish in get_all_fish():
+            if not fish.get("breeder_status"):
+                continue
+            new_status = advance_breeder_status(fish)
+            if new_status and new_status != fish.get("breeder_status"):
+                update_fish(fish["id"], {
+                    "breeder_status": new_status,
+                    "breeder_status_started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+                })
+                log_activity(
+                    action_type="breeder_status_auto_flip",
+                    description=(
+                        f"{fish.get('system_id')} auto-flipped "
+                        f"{fish.get('breeder_status')} → {new_status}"
+                    ),
+                    entity_type="fish",
+                    entity_id=fish["id"],
+                )
+                flipped += 1
+    except Exception as e:
+        st.warning(f"process_breeder_transitions issue: {e}")
+    return flipped
+
+
 # ============================================================
 # READ
 # ============================================================
@@ -181,7 +260,9 @@ def _fish_label(f: dict) -> str:
     """Format: 'FISH-0042 | Male | Avatar | High Grade'"""
     parts = [f.get("system_id") or "?"]
     if f.get("gender"):    parts.append(f["gender"])
-    if f.get("variety"):   parts.append(f["variety"])
+    variety = display_variety(f)
+    if variety and variety != "—":
+        parts.append(variety)
     if f.get("grade"):     parts.append(f["grade"])
     return " | ".join(str(p) for p in parts)
 
@@ -195,7 +276,6 @@ def register_new_fish(
     origin: str = "Purchased",
     gender: str = "Unsexed",
     variety: str = "",
-    strain: str = "",
     form_type: str = "",
     grade: str = "Pet Grade",
     body_shape: str = "",
@@ -226,7 +306,6 @@ def register_new_fish(
         "origin": origin,
         "gender": gender,
         "variety": variety,
-        "strain": strain,
         "form_type": form_type,
         "grade": grade,
         "body_shape": body_shape,
@@ -268,14 +347,18 @@ def register_fish_from_spawn(
     notes: str = "",
     photo_file=None,
 ) -> Optional[dict]:
-    """Register a jarred fry from a spawn. Inherits lineage."""
+    """
+    Register a jarred fry from a spawn. Inherits lineage.
+    Session 27B — uses generate_fish_id() (single FISH-NNNN format).
+    Session 27B — status defaults to "Active" (Jarred removed from statuses).
+    """
     spawn = next((s for s in get_all_spawns() if s["id"] == spawn_id), None)
     if not spawn:
         st.error(f"Spawn {spawn_id} not found.")
         return None
 
     spawn_sys = spawn.get("system_id") or "SPN-UNK-P1-01"
-    system_id = generate_batch_fish_id(spawn_sys)
+    system_id = generate_fish_id()
 
     photo_id = None
     if photo_file is not None:
@@ -284,7 +367,7 @@ def register_fish_from_spawn(
     variety = ""
     sire = get_fish_by_id(spawn.get("male_id"))
     if sire:
-        variety = sire.get("variety") or ""
+        variety = display_variety(sire) or ""
 
     record = {
         "system_id": system_id,
@@ -300,7 +383,7 @@ def register_fish_from_spawn(
         "batch_id": spawn["id"],
         "line_code": spawn.get("line_code") or "UNK",
         "generation": spawn.get("generation") or "F1",
-        "status": "Jarred",
+        "status": "Active",
         "is_breeder": False,
         "breeder_status": None,
     }
@@ -347,15 +430,7 @@ def edit_fish(fish_id: str, updates: dict) -> bool:
 
 
 def change_location(fish_id: str, new_location: str) -> bool:
-    """
-    Move a fish to a new tank (by tape code).
-    Session 26H.7 Step 7: rewritten to use the tank_occupants join
-    table as source of truth.
-       1. Remove the fish from all current tanks (join rows).
-       2. Look up the destination tank by tape code.
-       3. Add the fish as primary occupant.
-       4. Mirror the new tape code onto fish.location.
-    """
+    """Move a fish to a new tank (by tape code). Uses tank_occupants."""
     fish = get_fish_by_id(fish_id)
     if not fish:
         return False
@@ -367,14 +442,12 @@ def change_location(fish_id: str, new_location: str) -> bool:
         find_tank,
     )
 
-    # 1. Clear from all current tanks via join table
     try:
         for occ in get_occupants_for_fish(fish_id):
             remove_occupant(occ["tank_id"], "fish", fish_id)
     except Exception as e:
         st.warning(f"Could not clear previous tank occupants: {e}")
 
-    # 2-3. Assign to new tank if a matching tape code exists
     if new_location:
         tank = find_tank(new_location)
         if tank:
@@ -382,7 +455,6 @@ def change_location(fish_id: str, new_location: str) -> bool:
         else:
             st.warning(f"No tank found with tape code '{new_location}'. Fish location field updated anyway.")
 
-    # 4. Mirror tape code onto fish row
     return update_fish(fish_id, {"location": new_location})
 
 
@@ -412,7 +484,7 @@ def delete_fish_and_photos(fish_id: str) -> bool:
 
 
 # ============================================================
-# CULLING (Session 22)
+# CULLING
 # ============================================================
 
 def cull_fish(fish_id: str, reason: str = "", notes: str = "") -> bool:
@@ -484,10 +556,7 @@ def restore_fish_from_culled(fish_id: str, new_status: str = "Active") -> bool:
 # ============================================================
 
 def list_breeders(include_retired: bool = False) -> list[dict]:
-    """
-    Return all fish marked as breeders.
-    By default excludes Retired / Inactive breeder_status.
-    """
+    """Return all fish marked as breeders."""
     out = []
     for f in get_all_fish():
         if not f.get("is_breeder"):
@@ -511,7 +580,12 @@ def register_breeder(
     body_shape: str = "",
     fin_checks: Optional[dict] = None,
 ) -> Optional[dict]:
-    """Convenience wrapper: register a new fish AND immediately promote to breeder."""
+    """
+    Convenience wrapper: register a new fish AND immediately promote
+    to breeder.
+    Session 27B — status is now "Active" (not "Conditioning");
+    breeder_status carries the Conditioning signal.
+    """
     from modules.id_generator import _sanitize
 
     line_code = _sanitize(lineage, max_len=16) if lineage else "UNK"
@@ -529,12 +603,12 @@ def register_breeder(
         photo_file=photo_file,
         line_code=line_code,
         generation="P1",
-        status="Conditioning",
+        status="Active",
     )
     if not fish:
         return None
 
-    promote_to_breeder(fish["id"], breeder_status="Available")
+    promote_to_breeder(fish["id"], breeder_status="Conditioning")
     return get_fish_by_id(fish["id"])
 
 
@@ -569,7 +643,7 @@ def retire_breeder(fish_id: str, reason: str = "", notes: str = "") -> bool:
 
 
 def list_available_breeders(gender: Optional[str] = None) -> list[dict]:
-    """Available breeders, optionally filtered by gender. Returns fish rows."""
+    """Available breeders, optionally filtered by gender."""
     breeders = get_available_breeders()
     if gender:
         g = gender.strip().lower()
@@ -606,12 +680,19 @@ def get_breeder_stats() -> dict:
         "available": sum(1 for b in breeders if b.get("breeder_status") == "Available"),
         "in_pairing": sum(1 for b in breeders if b.get("breeder_status") == "In Pairing"),
         "conditioning": sum(1 for b in breeders if b.get("breeder_status") == "Conditioning"),
+        "recovering": sum(1 for b in breeders if b.get("breeder_status") == "Recovering"),
     }
 
 
 def sync_breeder_status(fish_id: str, new_status: str) -> bool:
-    """Called by spawn_manager when a pairing starts/ends."""
-    return update_fish(fish_id, {"breeder_status": new_status})
+    """
+    Called by spawn_manager when a pairing starts/ends.
+    Session 27B — also stamps breeder_status_started_at.
+    """
+    return update_fish(fish_id, {
+        "breeder_status": new_status,
+        "breeder_status_started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+    })
 
 
 # ============================================================
