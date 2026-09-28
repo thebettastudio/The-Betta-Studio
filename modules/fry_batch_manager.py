@@ -15,6 +15,9 @@
 #   • jar_fry_bulk() auto-advances batch stage → jarred after bulk
 #     create; returns (created, failed_count).
 #   • New get_batch_parents(batch) → {male, female} for thumbnails.
+#   • get_batch_parents() now surfaces exceptions via st.warning
+#     instead of silently swallowing them (an unreachable parent
+#     no longer shows as "Unknown").
 #   • Removed unused get_all_fish import.
 
 from __future__ import annotations
@@ -143,7 +146,10 @@ def get_batch_parents(batch: dict) -> dict:
     """
     Session 29 — return the sire and dam fish rows for a batch's spawn.
     Returns {"male": fish_row | None, "female": fish_row | None}.
-    Used by the view to render parent thumbnails inline.
+
+    Session 29 fix — surfaces exceptions via st.warning instead of
+    silently swallowing them. An unreachable parent now tells you
+    something went wrong, rather than masquerading as "Unknown".
     """
     out = {"male": None, "female": None}
     try:
@@ -157,8 +163,8 @@ def get_batch_parents(batch: dict) -> dict:
             out["male"] = get_fish_by_id(spawn["male_id"])
         if spawn.get("female_id"):
             out["female"] = get_fish_by_id(spawn["female_id"])
-    except Exception:
-        pass
+    except Exception as e:
+        st.warning(f"get_batch_parents failed: {e}")
     return out
 
 
