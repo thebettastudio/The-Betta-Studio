@@ -9,28 +9,17 @@
 # Session 26A — added color_primary, color_secondary, color_palette,
 #               pattern_hint, iridescence_level to FISH_FIELDS.
 # Session 26H.7 — Tank model redesign:
-#   • tank_occupants join table (multi-occupant support)
-#   • reservation fields (reserved_for/reason/until/ref_id)
-#   • "Active" status removed → "Occupied"
-#   • transfer_occupant(), reserve_tank(), cancel_reservation()
+#   • tank_occupants join table, reservation fields, etc.
 #
-# Session 26H.7 — Step 2 (this revision):
-#   • VALID_STATUSES constant added (5 values, source of truth)
-#   • assign_occupant() + clear_occupant() restored as backward-compat
-#     wrappers over the join table.
-#   • _refresh_tank_cache() fixed: primary role via two-pass scan,
-#     preserves 'Cleaning / Quarantine', clears reservation fields on
-#     occupant arrival.
-#   • transfer_occupant() parameterized by occupant_type.
-#   • get_tank_stats() added (includes 'reserved').
-#   • delete_tank_safely_impl() added — blocks occupied deletes unless
-#     transfers are supplied (Q3 Option D). Named "_impl" so the
-#     higher-level wrapper in tank_registry.py can present the public
-#     delete_tank_safely() with activity logging.
-#   • regenerate_tape_code() added — delegates to
-#     modules.id_generator.generate_tape_code() for the new purpose
-#     (Q4 Option C). The import is INSIDE the function body to avoid a
-#     circular import (id_generator imports database at module top).
+# Session 27B — Round 1 (this revision):
+#   • FISH_FIELDS: added molt checkpoint fields + breeder_status_started_at
+#   • FISH_FIELDS: removed 'strain' and 'stage' (columns being dropped)
+#   • STAGE_THRESHOLDS + compute_stage() + stage_label()
+#   • display_variety() helper — variety_4mo > variety_3mo > variety
+#   • fish_photos CRUD: get_fish_photos, add_fish_photo,
+#     set_profile_photo, delete_fish_photo
+#   • advance_breeder_status() — auto-flip logic for Recovering
+#     and Conditioning states
 
 from __future__ import annotations
 
@@ -66,16 +55,163 @@ def _now_iso() -> str:
 
 FISH_FIELDS = [
     "system_id", "origin", "batch_id", "line_code", "generation",
-    "sire_id", "dam_id", "gender", "variety", "strain", "form_type",
+    "sire_id", "dam_id", "gender", "variety", "form_type",
     "grade", "body_shape", "form_score", "fin_checks",
     "seller", "purchase_date", "purchase_cost",
     "photo_id", "qr_id", "location", "tank_id",
     "status", "is_breeder", "breeder_status",
-    "notes", "stage",
+    "breeder_status_started_at",
+    "notes",
+    # molt checkpoints (Session 27A Q1)
+    "variety_3mo", "variety_3mo_date",
+    "variety_4mo", "variety_4mo_date",
+    # color analysis (Session 26A)
     "color_primary", "color_secondary", "color_palette",
     "pattern_hint", "iridescence_level",
+    # starring (Session 26H.7 Step 5)
+    "is_starred", "starred_reason",
 ]
 
+# NOTE: 'strain' and 'stage' deliberately removed from the accepted
+# fields — the columns are being dropped and the concepts are gone:
+#   - 'strain'  → merged into 'variety' + 'line_code'
+#   - 'stage'   → now COMPUTED from age (see compute_stage below)
+
+
+# ------------------------------------------------------------
+# Computed stage (Session 27A Q2)
+# ------------------------------------------------------------
+
+# Age thresholds in days
+STAGE_THRESHOLDS = {
+    "fry":       (1, 45),
+    "juvenile":  (45, 60),
+    "sub_adult": (60, 120),    # 4 months
+    "adult":     (120, 365),   # up to 1 year
+    "senior":    (365, None),  # 1 year+
+}
+
+STAGE_LABELS = {
+    "fry":       "🥚 Fry",
+    "juvenile":  "🐟 Juvenile",
+    "sub_adult": "🐠 Sub-adult",
+    "adult":     "🐡 Adult",
+    "senior":    "🌿 Senior",
+}
+
+
+def compute_stage(fish: dict) -> Optional[str]:
+    """
+    Return the fish's current growth stage, computed from age.
+
+    Stage boundaries (Session 27A Q2):
+        fry        1–45 days
+        juvenile   45–60 days
+        sub_adult  60 days – 4 months (~120 days)
+        adult      4 months – 1 year
+        senior     1 year+
+
+    Returns None if created_at is missing or unparseable.
+    """
+    created = fish.get("created_at")
+    if not created:
+        return None
+    try:
+        d = _dt.date.fromisoformat(str(created)[:10])
+    except Exception:
+        return None
+    age_days = (_dt.date.today() - d).days
+
+    if age_days < 45:
+        return "fry"
+    if age_days < 60:
+        return "juvenile"
+    if age_days < 120:
+        return "sub_adult"
+    if age_days < 365:
+        return "adult"
+    return "senior"
+
+
+def stage_label(stage: Optional[str]) -> str:
+    """Display label with emoji for a stage string."""
+    if not stage:
+        return "—"
+    return STAGE_LABELS.get(stage, stage)
+
+
+# ------------------------------------------------------------
+# Display variety helper (Session 27A Q1)
+# ------------------------------------------------------------
+
+def display_variety(fish: dict) -> str:
+    """
+    Return the variety to show for this fish.
+    Priority: variety_4mo > variety_3mo > variety (placeholder).
+
+    The stored 'variety' field is the ORIGINAL placeholder set at
+    registration. It's never overwritten. Molt checkpoints refine it.
+    """
+    return (
+        fish.get("variety_4mo")
+        or fish.get("variety_3mo")
+        or fish.get("variety")
+        or "—"
+    )
+
+
+# ------------------------------------------------------------
+# Breeder status auto-flip (Session 27A Q2)
+# ------------------------------------------------------------
+
+MALE_RECOVERY_DAYS = 4
+MALE_CONDITIONING_DAYS = 10
+FEMALE_RECOVERY_DAYS = 14
+
+
+def advance_breeder_status(fish: dict) -> Optional[str]:
+    """
+    Auto-flip a fish's breeder_status if its current state has
+    exceeded its duration.
+
+    Rules (Session 27A Q2):
+      MALE:
+        Recovering   → after 4 days  → Conditioning
+        Conditioning → after 10 days → Available
+      FEMALE:
+        Recovering   → after 14 days → Available
+
+    Returns the new breeder_status if a flip happened, else None.
+    Caller is responsible for persisting the change via update_fish.
+    """
+    bs = (fish.get("breeder_status") or "").strip()
+    started = fish.get("breeder_status_started_at")
+    if not bs or not started:
+        return None
+
+    try:
+        started_dt = _dt.datetime.fromisoformat(str(started).replace("Z", ""))
+    except Exception:
+        return None
+
+    elapsed_days = (_dt.datetime.now() - started_dt).days
+    gender = (fish.get("gender") or "").lower()
+
+    if bs == "Recovering":
+        if gender == "male" and elapsed_days >= MALE_RECOVERY_DAYS:
+            return "Conditioning"
+        if gender == "female" and elapsed_days >= FEMALE_RECOVERY_DAYS:
+            return "Available"
+    elif bs == "Conditioning":
+        if gender == "male" and elapsed_days >= MALE_CONDITIONING_DAYS:
+            return "Available"
+
+    return None
+
+
+# ------------------------------------------------------------
+# Fish CRUD
+# ------------------------------------------------------------
 
 def get_all_fish() -> list[dict]:
     """Return every fish row, newest first."""
@@ -145,7 +281,8 @@ def promote_fish_to_breeder(fish_id: str, breeder_status: str = "Available") -> 
     return update_fish(fish_id, {
         "is_breeder": True,
         "breeder_status": breeder_status,
-        "status": "Conditioning",
+        "breeder_status_started_at": _now_iso(),
+        "status": "Active",
     })
 
 
@@ -201,6 +338,94 @@ def get_next_fish_sequence(prefix: str = "FISH-") -> str:
     except Exception as e:
         st.error(f"get_next_fish_sequence failed: {e}")
         return f"{prefix}0001"
+
+
+# ============================================================
+# FISH PHOTOS (Session 27A Q5)
+# ============================================================
+
+def get_fish_photos(fish_id: str) -> list[dict]:
+    """All side photos for a fish, newest first."""
+    try:
+        res = (_sb().table("fish_photos")
+               .select("*")
+               .eq("fish_id", fish_id)
+               .order("captured_at", desc=True)
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_fish_photos failed: {e}")
+        return []
+
+
+def add_fish_photo(
+    fish_id: str,
+    photo_id: str,
+    side: Optional[str] = None,
+    photo_type: str = "profile_side",
+    captured_at: Optional[str] = None,
+    analysis: Optional[dict] = None,
+    notes: str = "",
+) -> Optional[dict]:
+    """
+    Add a side photo for a fish.
+    side: 'left' | 'right' | 'other' | None
+    photo_type: 'profile_side' | 'profile_top' | 'other'
+    analysis: JSONB dict with palette/form score/etc.
+    """
+    try:
+        record = {
+            "fish_id": fish_id,
+            "photo_id": photo_id,
+            "side": side,
+            "photo_type": photo_type,
+            "captured_at": captured_at or _today_iso(),
+            "analysis": analysis or {},
+            "notes": notes,
+        }
+        res = _sb().table("fish_photos").insert(record).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"add_fish_photo failed: {e}")
+        return None
+
+
+def set_profile_photo(fish_id: str, photo_id: str) -> bool:
+    """
+    Mark a photo as the profile for a fish.
+    Clears is_profile on all other fish_photos rows for this fish,
+    and mirrors the choice onto fish.photo_id.
+    """
+    try:
+        # 1. Clear is_profile for all photos of this fish
+        (_sb().table("fish_photos")
+         .update({"is_profile": False})
+         .eq("fish_id", fish_id)
+         .execute())
+
+        # 2. Set is_profile on the chosen one (if it exists in fish_photos)
+        (_sb().table("fish_photos")
+         .update({"is_profile": True})
+         .eq("fish_id", fish_id)
+         .eq("photo_id", photo_id)
+         .execute())
+
+        # 3. Mirror onto fish.photo_id
+        update_fish(fish_id, {"photo_id": photo_id})
+        return True
+    except Exception as e:
+        st.error(f"set_profile_photo failed: {e}")
+        return False
+
+
+def delete_fish_photo(photo_row_id: str) -> bool:
+    """Delete a fish_photos row (does NOT delete the Drive file)."""
+    try:
+        _sb().table("fish_photos").delete().eq("id", photo_row_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_fish_photo failed: {e}")
+        return False
 
 
 # ============================================================
@@ -310,7 +535,7 @@ def get_tank_stats() -> dict:
 
 
 # ============================================================
-# TANK OCCUPANTS (Session 26H.7 — join table)
+# TANK OCCUPANTS
 # ============================================================
 
 def get_tank_occupants(tank_id: str) -> list[dict]:
@@ -421,15 +646,7 @@ def assign_occupant(
     fish_id: Optional[str],
     label: Optional[str] = None,
 ) -> bool:
-    """
-    Backward-compatible occupant assignment.
-
-    - fish_id is a real uuid → adds a join-table row (type='fish',
-      role='primary') and caches the label onto tanks.occupant_label.
-    - fish_id is None → "spawn-tank marker": writes the label directly
-      to tanks.occupant_label and sets status='Occupied'. No join row
-      (tank_occupants.occupant_id is NOT NULL).
-    """
+    """Backward-compatible occupant assignment."""
     try:
         if fish_id:
             if not label:
@@ -461,10 +678,7 @@ def assign_occupant(
 
 
 def clear_occupant(tank_id: str) -> bool:
-    """
-    Remove ALL occupants from a tank. Mirrors the old clear_occupant(tank_id).
-    Clears fish.location for any fish occupant.
-    """
+    """Remove ALL occupants from a tank."""
     try:
         occupants = get_tank_occupants(tank_id)
 
@@ -502,19 +716,7 @@ def _stash_reservation_warning(tank: dict) -> None:
 
 
 def _refresh_tank_cache(tank_id: str) -> None:
-    """
-    Recompute occupant_fish_id / occupant_label / status for a tank
-    based on current tank_occupants rows.
-
-    Rules:
-      - Occupants exist → status='Occupied' (unless current is
-        'Cleaning / Quarantine', which we don't silently override).
-      - No occupants AND current is 'Reserved' → keep 'Reserved'.
-      - No occupants AND current is 'Cleaning / Quarantine' → keep.
-      - Otherwise → 'Empty / Idle'.
-      - Primary occupant: prefer role='primary'; else first fish;
-        else fry-batch summary label.
-    """
+    """Recompute occupant_fish_id / occupant_label / status for a tank."""
     try:
         occupants = get_tank_occupants(tank_id)
         current = get_tank_by_id(tank_id)
@@ -578,10 +780,7 @@ def transfer_occupant(
     role: str = "primary",
     occupant_type: str = "fish",
 ) -> bool:
-    """
-    Move an occupant (fish OR fry batch) from one tank to another.
-    For fish, mirrors fish.location + tank_id.
-    """
+    """Move an occupant (fish OR fry batch) from one tank to another."""
     try:
         if from_tank_id:
             remove_tank_occupant(from_tank_id, occupant_type, fish_id)
@@ -598,27 +797,13 @@ def transfer_occupant(
         return False
 
 
-# ---------- Safe delete (Q3 Option D) ----------
+# ---------- Safe delete ----------
 
 def delete_tank_safely_impl(
     tank_id: str,
     transfers: Optional[dict] = None,
 ) -> tuple[bool, str]:
-    """
-    Delete a tank only if it has no occupants, OR if `transfers` maps
-    each occupant to a destination tank.
-
-    transfers format:
-        {
-          ("fish",       fish_uuid):  destination_tank_uuid,
-          ("fry_batch",  batch_uuid): destination_tank_uuid,
-        }
-
-    Returns (success, message).
-    NOTE: this is the raw implementation. UI calls the wrapper in
-    modules/tank_registry.py which also handles Drive media cleanup +
-    activity logging.
-    """
+    """Delete a tank only if it has no occupants, OR if transfers map is complete."""
     try:
         tank = get_tank_by_id(tank_id)
         if not tank:
@@ -658,7 +843,7 @@ def delete_tank_safely_impl(
 
 
 # ============================================================
-# TANK RESERVATIONS (Session 26H.7)
+# TANK RESERVATIONS
 # ============================================================
 
 def reserve_tank(
@@ -738,10 +923,7 @@ def move_reservation(from_tank_id: str, to_tank_id: str) -> bool:
 
 
 def get_expiring_reservations(days_ahead: int = 3) -> list[dict]:
-    """
-    Reservations whose reserved_until is within `days_ahead` days
-    or already past.
-    """
+    """Reservations whose reserved_until is within days_ahead days or already past."""
     try:
         today = _dt.date.today()
         cutoff = today + _dt.timedelta(days=days_ahead)
@@ -760,22 +942,14 @@ def get_expiring_reservations(days_ahead: int = 3) -> list[dict]:
 
 
 # ============================================================
-# TAPE-CODE REGENERATION (Session 26H.7 Q4, Option C)
+# TAPE-CODE REGENERATION
 # ============================================================
 
 def regenerate_tape_code(
     tank_id: str,
     new_purpose: str,
 ) -> Optional[tuple[str, str]]:
-    """
-    Regenerate a tank's tape code after a purpose change.
-
-    The import of generate_tape_code is INSIDE the function on purpose:
-    modules/id_generator.py imports from database.py at module top, so
-    a top-level import here would create a circular import.
-
-    Returns (old_code, new_code) or None on failure.
-    """
+    """Regenerate a tank's tape code after a purpose change."""
     try:
         from modules.id_generator import generate_tape_code
 
@@ -1038,7 +1212,7 @@ def delete_fry_batch(batch_id: str) -> bool:
 
 
 # ============================================================
-# FISH MILESTONES (Session 20)
+# FISH MILESTONES
 # ============================================================
 
 MILESTONE_FIELDS = [
