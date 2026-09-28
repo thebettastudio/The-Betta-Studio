@@ -9,8 +9,9 @@
 #
 # Session 29 (this revision) — Fry batch fixes + M/F layout:
 #   • Parent thumbnails removed from card header.
-#   • New M/F showcase panel (right column) with rounded-square
-#     parent photos, details below, and "View fish →" link.
+#   • New M/F showcase panel (right column) with responsive
+#     rounded-square parent photos (fill column width, 1:1 aspect),
+#     details below, and "View fish →" link.
 #   • Batch Outcome panel moved to left column, unchanged content.
 #   • Jarring failures surfaced (jar_fry_bulk returns (created, failed)).
 #   • _render_list_section() fetches list_all_batches() once.
@@ -70,10 +71,10 @@ STAGE_ICONS = {
 
 STAGE_DUE_DAYS = 60
 
-# M/F showcase
-PARENT_PHOTO_SIZE = 140          # px, square
+# M/F showcase styling
 PARENT_PHOTO_RADIUS = 24         # px, rounded-square
 PARENT_PHOTO_BORDER = "#E5E7EB"
+PARENT_PHOTO_BG = "#F3F4F6"
 
 
 # ============================================================
@@ -128,14 +129,17 @@ def _stage_due_hint(batch: dict) -> Optional[str]:
 # ============================================================
 
 def _parent_photo_html(fish: Optional[dict], gender_sym: str) -> str:
-    """Big rounded-square photo for a parent fish."""
-    common_style = (
-        f"width:{PARENT_PHOTO_SIZE}px;height:{PARENT_PHOTO_SIZE}px;"
+    """
+    Big rounded-square photo that fills its container width.
+    Aspect ratio is forced to 1:1 so M and F always match.
+    """
+    wrapper_style = (
+        f"width:100%;aspect-ratio:1/1;"
         f"border-radius:{PARENT_PHOTO_RADIUS}px;"
         f"border:1px solid {PARENT_PHOTO_BORDER};"
-        f"background:#F3F4F6;"
+        f"background:{PARENT_PHOTO_BG};"
         f"display:flex;align-items:center;justify-content:center;"
-        f"overflow:hidden;margin:0 auto;"
+        f"overflow:hidden;"
     )
     if fish and fish.get("photo_id"):
         url = photo_url(fish["photo_id"])
@@ -145,10 +149,10 @@ def _parent_photo_html(fish: Optional[dict], gender_sym: str) -> str:
         )
     else:
         inner = (
-            f'<div style="color:#9CA3AF;font-size:52px;line-height:1;">'
+            f'<div style="color:#9CA3AF;font-size:64px;line-height:1;">'
             f'{gender_sym}</div>'
         )
-    return f'<div style="{common_style}">{inner}</div>'
+    return f'<div style="{wrapper_style}">{inner}</div>'
 
 
 def _parent_details_html(fish: Optional[dict], gender_sym: str, label: str) -> str:
@@ -184,14 +188,15 @@ def _parent_details_html(fish: Optional[dict], gender_sym: str, label: str) -> s
 def _render_mf_showcase(parents: dict):
     """
     Right-column panel: two side-by-side M & F rounded-square photos
-    with details below each. Includes 'View fish' links.
+    that each fill half the available width. Photos keep a 1:1 aspect
+    ratio and scale up to fill their column.
     """
     st.markdown("##### 🧬 Parents")
 
     male = parents.get("male")
     female = parents.get("female")
 
-    col_m, col_f = st.columns(2)
+    col_m, col_f = st.columns(2, gap="small")
 
     with col_m:
         st.markdown(_parent_photo_html(male, "♂"), unsafe_allow_html=True)
@@ -545,7 +550,7 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
     parents = get_batch_parents(batch)
 
     with st.container(border=True):
-        # ---- Header: title + spawn caption (NO thumbs anymore) ----
+        # ---- Header: title + spawn caption (no thumbs) ----
         st.markdown(f"### {icon} `{batch_tag}`")
         if spawn:
             st.caption(
@@ -595,7 +600,7 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         if batch.get("notes"):
             st.info(batch["notes"])
 
-        # ---- Two-column: BLUE (outcome) | RED (M/F showcase) ----
+        # ---- Two-column: Outcome (left) | M/F Parents (right) ----
         if outcome and outcome.get("verdict_key") not in ("unknown",):
             st.divider()
             col_outcome, col_mf = st.columns([1, 1])
