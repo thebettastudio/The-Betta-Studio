@@ -2,16 +2,13 @@
 # Betta Farm Management System
 # Session 13 — Ported to Supabase via database + module helpers.
 #
-# Session 26H.7 — Step 6 (this revision):
-#   • KPI row updated for 5-status model:
-#       - Available = Empty / Idle only
-#       - Reserved count added
-#       - Occupied count added
-#       - "Available Jars" = Empty/Idle tanks with purpose=Jarring
-#   • ⚠️ Action Needed panel: expiring reservations
-#   • ⭐ Starred Fish panel: your high-expectation fish
-#   • 🫙 Jarring Capacity indicator
-#   • All counts computed from the same loaded lists (no drift)
+# Session 26H.7 — Step 6: KPI row, action-needed, starred panel, jars.
+#
+# Session 27B — Round 3A (this revision):
+#   • Breeders table uses variety_of() + computed stage
+#   • Starred panel uses variety_of()
+#   • Removed any reliance on the dropped 'stage' column
+#   • Layout unchanged; no destructive changes
 
 import datetime as _dt
 
@@ -27,6 +24,7 @@ from database import (
     get_expiring_reservations,
     get_tank_occupants,
 )
+from modules.fish_manager import variety_of, stage_of
 from modules.photo_service import photo_url
 
 
@@ -70,16 +68,18 @@ def _breeders_dataframe(fish: list) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for f in breeders:
+        stage = stage_of(f) or "—"
         rows.append({
+            "⭐": "⭐" if f.get("is_starred") else "",
             "System ID": f.get("system_id") or "",
             "Gender": f.get("gender") or "",
-            "Variety": f.get("variety") or "",
+            "Variety": variety_of(f),
+            "Stage": stage.replace("_", "-"),
             "Line": f.get("line_code") or "",
             "Gen": f.get("generation") or "",
             "Grade": f.get("grade") or "",
             "Breeder Status": f.get("breeder_status") or "",
             "Location": f.get("location") or "",
-            "⭐": "⭐" if f.get("is_starred") else "",
             "Notes": f.get("notes") or "",
         })
     return pd.DataFrame(rows)
@@ -185,7 +185,7 @@ def _render_starred_panel(fish: list):
                     )
                 st.markdown(f"**{f.get('system_id') or '?'}**")
                 st.caption(
-                    f"{f.get('gender') or '?'} · {f.get('variety') or '—'}"
+                    f"{f.get('gender') or '?'} · {variety_of(f)}"
                 )
                 if f.get("starred_reason"):
                     st.caption(f"⭐ *{f['starred_reason']}*")
@@ -215,7 +215,6 @@ def _render_jarring_capacity(tanks: list):
             "These are ready for individual male/female jarring."
         )
 
-        # Show first 20 tape codes as a compact list
         codes = [t.get("location_code") or "?" for t in jarring_empty]
         if codes:
             display = " · ".join(f"`{c}`" for c in codes[:20])
@@ -257,7 +256,6 @@ def render_dashboard():
     total_spawns = counts.get("total_spawns", len(spawns))
     active_spawns = counts.get("active_spawns", 0)
 
-    # Available jarring jars
     available_jars = sum(
         1 for t in tanks
         if (t.get("purpose") or "").strip() == "Jarring"
