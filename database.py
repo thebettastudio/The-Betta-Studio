@@ -11,11 +11,11 @@
 # Session 26H.7 — Tank model redesign.
 # Session 27B — Round 1: molt fields, fish_photos CRUD, compute_stage,
 #               display_variety, advance_breeder_status.
-#
 # Session 28A (this revision):
 #   • FISH_FIELDS: added birth_date
 #   • compute_stage() reads birth_date (fallback: created_at)
-#     so backdated fish compute the correct stage.
+#   • advance_breeder_status() normalizes timestamps to UTC-aware
+#     before subtracting (fixes naive-vs-aware error)
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ FISH_FIELDS = [
 
 
 # ------------------------------------------------------------
-# Computed stage (Session 27A Q2 / 28A backdating)
+# Computed stage
 # ------------------------------------------------------------
 
 STAGE_THRESHOLDS = {
@@ -94,8 +94,7 @@ STAGE_LABELS = {
 def _fish_age_date(fish: dict) -> Optional[_dt.date]:
     """
     Return the date to use for age/stage computation.
-    Prefers birth_date (may be backdated); falls back to created_at
-    for older records that predate the birth_date field.
+    Prefers birth_date (may be backdated); falls back to created_at.
     """
     birth = fish.get("birth_date")
     if birth:
@@ -113,17 +112,7 @@ def _fish_age_date(fish: dict) -> Optional[_dt.date]:
 
 
 def compute_stage(fish: dict) -> Optional[str]:
-    """
-    Return the fish's current growth stage, computed from age.
-
-    Uses birth_date when present, else created_at (Session 28A).
-    Stage boundaries (Session 27A Q2):
-        fry        1–45 days
-        juvenile   45–60 days
-        sub_adult  60 days – 4 months (~120 days)
-        adult      4 months – 1 year
-        senior     1 year+
-    """
+    """Return the fish's current growth stage, computed from age."""
     d = _fish_age_date(fish)
     if d is None:
         return None
@@ -148,14 +137,11 @@ def stage_label(stage: Optional[str]) -> str:
 
 
 # ------------------------------------------------------------
-# Display variety helper (Session 27A Q1)
+# Display variety helper
 # ------------------------------------------------------------
 
 def display_variety(fish: dict) -> str:
-    """
-    Return the variety to show for this fish.
-    Priority: variety_4mo > variety_3mo > variety (placeholder).
-    """
+    """Priority: variety_4mo > variety_3mo > variety."""
     return (
         fish.get("variety_4mo")
         or fish.get("variety_3mo")
@@ -165,7 +151,7 @@ def display_variety(fish: dict) -> str:
 
 
 # ------------------------------------------------------------
-# Breeder status auto-flip (Session 27A Q2)
+# Breeder status auto-flip
 # ------------------------------------------------------------
 
 MALE_RECOVERY_DAYS = 4
@@ -186,7 +172,10 @@ def advance_breeder_status(fish: dict) -> Optional[str]:
         Recovering   → after 14 days → Available
 
     Returns the new breeder_status if a flip happened, else None.
-    Caller persists the change via update_fish.
+
+    Session 28A fix — normalizes both timestamps to UTC-aware before
+    subtracting, so naive (from _dt.datetime.now()) and aware (from
+    backdated spawn timestamps) values can be compared safely.
     """
     bs = (fish.get("breeder_status") or "").strip()
     started = fish.get("breeder_status_started_at")
@@ -198,7 +187,12 @@ def advance_breeder_status(fish: dict) -> Optional[str]:
     except Exception:
         return None
 
-    elapsed_days = (_dt.datetime.now() - started_dt).days
+    # Normalize: if naive, treat as UTC. Compare against UTC-aware now.
+    if started_dt.tzinfo is None:
+        started_dt = started_dt.replace(tzinfo=_dt.timezone.utc)
+    now_dt = _dt.datetime.now(_dt.timezone.utc)
+
+    elapsed_days = (now_dt - started_dt).days
     gender = (fish.get("gender") or "").lower()
 
     if bs == "Recovering":
