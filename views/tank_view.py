@@ -2,18 +2,13 @@
 # Betta Farm Management System
 # Session 10 — Ported to Supabase via tank_registry + fish_manager.
 #
-# Session 26H.7 — Step 4 v2 (this revision): compact single-line rows.
-#   • Each tank = ONE horizontal line:  [stripe] CODE · Type · Purpose · Occupant  [STATUS] [▸]
-#   • Click anywhere on the row to expand (toggle via chevron on the right)
-#   • Expanded card: 2 columns (photo | details + occupants + actions stacked)
-#   • KPI row: native clickable buttons
-#   • Filter bar: search + sort inline; advanced filters in expander
-#   • ⭐ Starred indicator inherited from fish.is_starred
-#   • Modals: Assign (Fish/Fry Batch tabs), Reserve (quick-picks + big calendar),
-#     Change Purpose, Transfer-on-delete
-#   • Reservation warning toasts + expiring banner
-#   • Custom tank types remembered (merged from DB values)
-#   • All mutations go through modules/tank_registry.py
+# Session 26H.7 — Step 4 v2: compact single-line rows.
+#
+# Session 27B — Round 2C (this revision):
+#   • _occupant_short(): append breeder_status badge when
+#     Recovering / Conditioning / In Pairing / Ready
+#   • _occupant_chip_text(): same badge in the expanded card
+#   Nothing else changes.
 
 from __future__ import annotations
 
@@ -102,6 +97,21 @@ STATUS_STYLE = {
     "Retired":               ("#4B5563", "⚫", "#E5E7EB", "#6B7280", "RETIRED"),
 }
 
+# Breeder status badges (Session 27B Round 2C)
+BREEDER_STATUS_SHORT = {
+    "Recovering":   ("🟡", "Rec"),
+    "Conditioning": ("🟠", "Cond"),
+    "In Pairing":   ("🔵", "Pair"),
+    "Ready":        ("🟢", "Ready"),
+}
+
+BREEDER_STATUS_FULL = {
+    "Recovering":   ("🟡", "Recovering"),
+    "Conditioning": ("🟠", "Conditioning"),
+    "In Pairing":   ("🔵", "In Pairing"),
+    "Ready":        ("🟢", "Ready"),
+}
+
 
 def _purpose_label(p: str) -> str:
     return PURPOSE_LABELS.get(p, p)
@@ -146,6 +156,30 @@ def _is_starred_occupant(occupant_type: str, occupant_id: str, fish_index: dict)
         return False
     fish = fish_index.get(occupant_id)
     return bool(fish and fish.get("is_starred"))
+
+
+def _breeder_status_badge_short(fish: Optional[dict]) -> str:
+    """Return a short badge string like ' 🟡Rec' or empty string."""
+    if not fish:
+        return ""
+    bs = fish.get("breeder_status")
+    style = BREEDER_STATUS_SHORT.get(bs)
+    if not style:
+        return ""
+    icon, label = style
+    return f" {icon}{label}"
+
+
+def _breeder_status_badge_full(fish: Optional[dict]) -> str:
+    """Return a full badge string like ' · 🟡 Recovering' or empty."""
+    if not fish:
+        return ""
+    bs = fish.get("breeder_status")
+    style = BREEDER_STATUS_FULL.get(bs)
+    if not style:
+        return ""
+    icon, label = style
+    return f"  ·  {icon} **{label}**"
 
 
 # ============================================================
@@ -577,10 +611,11 @@ def _modal_delete_with_transfer(tank: dict, occupants: list[dict], fish_index: d
 
 
 # ============================================================
-# OCCUPANT CHIP TEXT
+# OCCUPANT CHIP TEXT (Session 27B Round 2C updated)
 # ============================================================
 
 def _occupant_chip_text(occ: dict, fish_index: dict) -> str:
+    """Full occupant label for the expanded card."""
     otype = occ.get("occupant_type")
     oid = occ.get("occupant_id")
 
@@ -592,7 +627,9 @@ def _occupant_chip_text(occ: dict, fish_index: dict) -> str:
         sid = fish.get("system_id") or "?"
         gender = fish.get("gender") or "?"
         variety = fish.get("variety") or "—"
-        return f"{star}🐟 {sid} · {gender} · {variety}"
+        base = f"{star}🐟 {sid} · {gender} · {variety}"
+        # Session 27B Round 2C — append breeder_status badge
+        return base + _breeder_status_badge_full(fish)
     elif otype == "fry_batch":
         try:
             from database import get_fry_batch_by_id
@@ -600,7 +637,7 @@ def _occupant_chip_text(occ: dict, fish_index: dict) -> str:
             tag = batch.get("batch_tag") if batch else str(oid)[:8]
         except Exception:
             tag = str(oid)[:8]
-        return f"🐣 {tag}"
+        return f"🐣 Fry batch: {tag}"
     return f"{otype} {str(oid)[:8]}"
 
 
@@ -614,7 +651,9 @@ def _occupant_short(occ: dict, fish_index: dict) -> str:
         if not fish:
             return f"🐟 {str(oid)[:8]}"
         star = "⭐" if fish.get("is_starred") else ""
-        return f"{star}🐟 {fish.get('system_id') or '?'}"
+        base = f"{star}🐟 {fish.get('system_id') or '?'}"
+        # Session 27B Round 2C — append short breeder_status badge
+        return base + _breeder_status_badge_short(fish)
     elif otype == "fry_batch":
         try:
             from database import get_fry_batch_by_id
@@ -642,7 +681,7 @@ def _is_expiring_soon(tank: dict, days: int = 3) -> bool:
 
 
 # ============================================================
-# COMPACT ROW (single-line) + EXPANDED CARD
+# COMPACT ROW + EXPANDED CARD
 # ============================================================
 
 def _render_tank_row(tank: dict, fish_index: dict):
@@ -658,7 +697,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
     starred = any(_is_starred_occupant(o["occupant_type"], o["occupant_id"], fish_index)
                   for o in occupants)
 
-    # Occupant short summary for collapsed row
     if occupants:
         if len(occupants) == 1:
             occ_short = _occupant_short(occupants[0], fish_index)
@@ -673,7 +711,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
     badge_html = _status_badge_html(status)
     purpose_str = _purpose_label(purpose)
 
-    # ---- Single-line collapsed header ----
     hc = st.columns([3, 5, 3, 2, 1])
 
     with hc[0]:
@@ -712,7 +749,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
             unsafe_allow_html=True,
         )
 
-    # ---- Toggle button (full-width, small) ----
     toggle_key = f"_expand_{tank_id}"
     is_open = st.session_state.get(toggle_key, False)
 
@@ -733,7 +769,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
         )
         return
 
-    # ---- Expanded card ----
     with st.container(border=True):
         col_photo, col_main = st.columns([2, 5])
 
@@ -753,7 +788,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
                     st.image(photo_url(tank["qr_id"]), use_container_width=True)
 
         with col_main:
-            # ---- Details ----
             st.markdown("##### 📋 Details")
             d1, d2 = st.columns(2)
             with d1:
@@ -785,7 +819,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
                 st.markdown("---")
                 st.markdown(f"**📝 Notes:** {tank['notes']}")
 
-            # ---- Occupants ----
             st.markdown("---")
             st.markdown(f"##### 🐟 Occupants ({len(occupants)})")
             if not occupants:
@@ -806,7 +839,6 @@ def _render_tank_row(tank: dict, fish_index: dict):
                                 st.success("Removed.")
                                 st.rerun()
 
-            # ---- Actions ----
             st.markdown("---")
             st.markdown("##### ⚡ Actions")
 
@@ -952,7 +984,6 @@ def _render_inventory():
             counts[s] += 1
     total = len(all_tanks)
 
-    # ---- KPI row: native clickable buttons ----
     selected_kpi = st.session_state.get("_inv_kpi", "All")
 
     kpi_cols = st.columns(6)
