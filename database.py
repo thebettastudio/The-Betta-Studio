@@ -997,4 +997,336 @@ def get_spawn_by_id(spawn_id: str) -> Optional[dict]:
 def create_spawn(data: dict) -> Optional[dict]:
     payload = {k: data.get(k) for k in SPAWN_FIELDS if k in data}
     try:
-        res = _sb
+        res = _sb().table("spawns").insert(payload).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_spawn failed: {e}")
+        return None
+
+
+def update_spawn(spawn_id: str, updates: dict) -> bool:
+    payload = {k: v for k, v in updates.items() if k in SPAWN_FIELDS}
+    if not payload:
+        return False
+    try:
+        _sb().table("spawns").update(payload).eq("id", spawn_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"update_spawn failed: {e}")
+        return False
+
+
+def delete_spawn(spawn_id: str) -> bool:
+    try:
+        _sb().table("spawns").delete().eq("id", spawn_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_spawn failed: {e}")
+        return False
+
+
+def get_next_spawn_code() -> str:
+    """SPN-YY-NN, resetting per year."""
+    yy = _dt.date.today().strftime("%y")
+    prefix = f"SPN-{yy}-"
+    try:
+        res = _sb().table("spawns").select("system_id").like("system_id", f"{prefix}%").execute()
+        nums = []
+        for r in (res.data or []):
+            tail = (r.get("system_id") or "").replace(prefix, "").strip()
+            if tail.isdigit():
+                nums.append(int(tail))
+        nxt = (max(nums) + 1) if nums else 1
+        return f"{prefix}{nxt:02d}"
+    except Exception as e:
+        st.error(f"get_next_spawn_code failed: {e}")
+        return f"{prefix}01"
+
+
+# ============================================================
+# STRAINS
+# ============================================================
+
+def get_all_strains() -> list[dict]:
+    try:
+        res = _sb().table("strains").select("*").order("name").execute()
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_all_strains failed: {e}")
+        return []
+
+
+def create_strain(name: str, line_code: str = "", description: str = "") -> Optional[dict]:
+    try:
+        res = _sb().table("strains").insert({
+            "name": name, "line_code": line_code, "description": description,
+        }).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_strain failed: {e}")
+        return None
+
+
+def delete_strain(strain_id: str) -> bool:
+    """Delete a strain by uuid."""
+    try:
+        _sb().table("strains").delete().eq("id", strain_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_strain failed: {e}")
+        return False
+
+
+# ============================================================
+# ACTIVITY LOG
+# ============================================================
+
+def log_activity(
+    action_type: str,
+    description: str,
+    entity_type: Optional[str] = None,
+    entity_id: Optional[str] = None,
+    photo_id: Optional[str] = None,
+    photo_url: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> bool:
+    try:
+        _sb().table("activity_log").insert({
+            "action_type": action_type,
+            "description": description,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "photo_id": photo_id,
+            "photo_url": photo_url,
+            "metadata": metadata or {},
+        }).execute()
+        return True
+    except Exception as e:
+        print(f"log_activity failed: {e}")
+        return False
+
+
+def get_activity_log(limit: int = 200) -> list[dict]:
+    try:
+        res = (_sb().table("activity_log")
+               .select("*")
+               .order("ts", desc=True)
+               .limit(limit)
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_activity_log failed: {e}")
+        return []
+
+
+# ============================================================
+# FRY BATCHES
+# ============================================================
+
+FRY_BATCH_FIELDS = [
+    "batch_tag", "batch_code", "spawn_id", "hatch_date", "jarring_date",
+    "initial_count", "current_count", "culled_count", "female_count",
+    "died_count",
+    "stage", "tank_id", "notes",
+]
+
+
+def get_all_fry_batches() -> list[dict]:
+    try:
+        res = _sb().table("fry_batches").select("*").order("created_at", desc=True).execute()
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_all_fry_batches failed: {e}")
+        return []
+
+
+def create_fry_batch(data: dict) -> Optional[dict]:
+    payload = {k: data.get(k) for k in FRY_BATCH_FIELDS if k in data}
+    try:
+        res = _sb().table("fry_batches").insert(payload).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_fry_batch failed: {e}")
+        return None
+
+
+def update_fry_batch(batch_id: str, updates: dict) -> bool:
+    payload = {k: v for k, v in updates.items() if k in FRY_BATCH_FIELDS}
+    if not payload:
+        return False
+    try:
+        _sb().table("fry_batches").update(payload).eq("id", batch_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"update_fry_batch failed: {e}")
+        return False
+
+
+def get_fry_batch_by_id(batch_id: str) -> Optional[dict]:
+    """Fetch one fry batch by uuid."""
+    try:
+        res = _sb().table("fry_batches").select("*").eq("id", batch_id).limit(1).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"get_fry_batch_by_id failed: {e}")
+        return None
+
+
+def get_fry_batches_for_spawn(spawn_id: str) -> list[dict]:
+    """All batches linked to a specific spawn."""
+    try:
+        res = (_sb().table("fry_batches")
+               .select("*")
+               .eq("spawn_id", spawn_id)
+               .order("created_at", desc=True)
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_fry_batches_for_spawn failed: {e}")
+        return []
+
+
+def delete_fry_batch(batch_id: str) -> bool:
+    """Delete a fry batch by uuid."""
+    try:
+        _sb().table("fry_batches").delete().eq("id", batch_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_fry_batch failed: {e}")
+        return False
+
+
+# ============================================================
+# FISH MILESTONES
+# ============================================================
+
+MILESTONE_FIELDS = [
+    "fish_id", "milestone_date", "photo_id",
+    "form_score", "body_shape", "fin_checks",
+    "notes",
+]
+
+
+def get_milestones_for_fish(fish_id: str) -> list[dict]:
+    """All milestones for a fish, newest first."""
+    try:
+        res = (_sb().table("fish_milestones")
+               .select("*")
+               .eq("fish_id", fish_id)
+               .order("milestone_date", desc=True)
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_milestones_for_fish failed: {e}")
+        return []
+
+
+def get_milestone_by_id(milestone_id: str) -> Optional[dict]:
+    """Fetch one milestone by uuid."""
+    try:
+        res = _sb().table("fish_milestones").select("*").eq("id", milestone_id).limit(1).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"get_milestone_by_id failed: {e}")
+        return None
+
+
+def create_milestone(data: dict) -> Optional[dict]:
+    """Insert a milestone. `data` keys must match MILESTONE_FIELDS."""
+    payload = {k: data.get(k) for k in MILESTONE_FIELDS if k in data}
+    try:
+        res = _sb().table("fish_milestones").insert(payload).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_milestone failed: {e}")
+        return None
+
+
+def update_milestone(milestone_id: str, updates: dict) -> bool:
+    """Update a milestone. Only MILESTONE_FIELDS keys are accepted."""
+    payload = {k: v for k, v in updates.items() if k in MILESTONE_FIELDS}
+    if not payload:
+        return False
+    try:
+        _sb().table("fish_milestones").update(payload).eq("id", milestone_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"update_milestone failed: {e}")
+        return False
+
+
+def delete_milestone(milestone_id: str) -> bool:
+    """Delete a milestone by uuid."""
+    try:
+        _sb().table("fish_milestones").delete().eq("id", milestone_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"delete_milestone failed: {e}")
+        return False
+
+
+def get_milestone_counts_by_fish() -> dict:
+    """Returns { fish_id: count } for all fish that have milestones."""
+    try:
+        res = _sb().table("fish_milestones").select("fish_id").execute()
+        counts: dict[str, int] = {}
+        for row in (res.data or []):
+            fid = row.get("fish_id")
+            if fid:
+                counts[fid] = counts.get(fid, 0) + 1
+        return counts
+    except Exception as e:
+        st.error(f"get_milestone_counts_by_fish failed: {e}")
+        return {}
+
+
+# ============================================================
+# DASHBOARD AGGREGATES
+# ============================================================
+
+def get_dashboard_counts() -> dict:
+    """Returns the KPI numbers the dashboard needs in one call."""
+    try:
+        fish = _sb().table("fish").select("id,is_breeder,breeder_status,status,gender").execute().data or []
+        tanks = _sb().table("tanks").select("id,status").execute().data or []
+        spawns = _sb().table("spawns").select("id,status").execute().data or []
+
+        total_tanks = len(tanks)
+
+        available_tanks = sum(
+            1 for t in tanks
+            if (t.get("status") or "").strip() == "Empty / Idle"
+        )
+        reserved_tanks = sum(
+            1 for t in tanks
+            if (t.get("status") or "").strip() == "Reserved"
+        )
+        occupied_tanks = sum(
+            1 for t in tanks
+            if (t.get("status") or "").strip() == "Occupied"
+        )
+
+        total_breeders = sum(1 for f in fish if f.get("is_breeder"))
+        males = sum(1 for f in fish if f.get("is_breeder") and (f.get("gender") or "").lower() == "male")
+        females = sum(1 for f in fish if f.get("is_breeder") and (f.get("gender") or "").lower() == "female")
+
+        active_spawn_states = {"in pairing", "pending (success)", "free swimming", "pairing", "eggs"}
+        active_spawns = sum(
+            1 for s in spawns
+            if (s.get("status") or "").lower() in active_spawn_states
+        )
+
+        return {
+            "total_tanks": total_tanks,
+            "available_tanks": available_tanks,
+            "reserved_tanks": reserved_tanks,
+            "occupied_tanks": occupied_tanks,
+            "total_breeders": total_breeders,
+            "male_breeders": males,
+            "female_breeders": females,
+            "total_spawns": len(spawns),
+            "active_spawns": active_spawns,
+        }
+    except Exception as e:
+        st.error(f"get_dashboard_counts failed: {e}")
+        return {}
