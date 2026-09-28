@@ -2,6 +2,15 @@
 # Betta Farm Management System
 # Session 8 — Spawn lifecycle ported to Supabase.
 # Session 12 — list_active_pairings_with_details() enriched with tank + days_paired.
+#
+# Session 27B — Round 1 (this revision):
+#   • mark_free_swimming() now triggers the parent transitions
+#     defined in Session 27A Q2:
+#       MALE   → breeder_status = "Recovering"  (4d → Conditioning → 10d → Available)
+#       FEMALE → breeder_status = "Recovering"  (14d → Available)
+#     Both transitions are auto-managed by process_breeder_transitions()
+#     in modules/fish_manager.py — this file just sets the initial state
+#     and stamps breeder_status_started_at.
 
 from __future__ import annotations
 
@@ -69,12 +78,12 @@ def list_active_spawns() -> list[dict]:
 def list_spawns_with_details() -> list[dict]:
     """
     Returns all spawns, each enriched with:
-      spawn       : raw spawn row
-      male        : fish row of sire (or None)
-      female      : fish row of dam (or None)
-      tank        : tank row (or None)
+      spawn         : raw spawn row
+      male          : fish row of sire (or None)
+      female        : fish row of dam (or None)
+      tank          : tank row (or None)
       tank_location : tape code (or 'Unassigned')
-      days_paired : int (days since pairing_date)
+      days_paired   : int (days since pairing_date)
     """
     fish_by_id = {f["id"]: f for f in get_all_fish()}
     tank_by_id = {t["id"]: t for t in get_all_tanks()}
@@ -136,7 +145,6 @@ def create_new_spawn(
     """
     Create a new spawn record.
     Returns the created spawn row (dict) or None on failure.
-    Caller can read saved["system_id"], saved["spawn_code"], etc.
     """
     sire = get_fish_by_id(male_id)
     dam  = get_fish_by_id(female_id)
@@ -220,8 +228,20 @@ def mark_free_swimming(
     est_fry_count: int = 0,
 ) -> bool:
     """
-    Transition to Free Swimming. Sets dates/counts, releases breeders,
-    and frees the tank.
+    Transition to Free Swimming.
+
+    Session 27B — triggers the parent breeder-status transitions
+    defined in Session 27A Q2:
+
+      MALE   → "Recovering"  (4d auto-flip → Conditioning → 10d → Available)
+      FEMALE → "Recovering"  (14d auto-flip → Available)
+
+    Both parents have breeder_status_started_at stamped by
+    sync_breeder_status(). The auto-flips happen later via
+    process_breeder_transitions() in fish_manager.py.
+
+    Also: sets free_swimming_date, releases tank, sets batch_name
+    and estimated_fry_count.
     """
     spawn = get_spawn_by_id(spawn_id)
     if not spawn:
@@ -238,15 +258,25 @@ def mark_free_swimming(
     if not ok:
         return False
 
-    sync_breeder_status(spawn.get("male_id"), "Available")
-    sync_breeder_status(spawn.get("female_id"), "Available")
+    # Parent transitions (Session 27A Q2)
+    male_id = spawn.get("male_id")
+    female_id = spawn.get("female_id")
 
+    if male_id:
+        sync_breeder_status(male_id, "Recovering")
+    if female_id:
+        sync_breeder_status(female_id, "Recovering")
+
+    # Free the spawn tank
     if spawn.get("tank_id"):
         unassign_tank(spawn["tank_id"])
 
     log_activity(
         action_type="spawn_free_swimming",
-        description=f"{spawn.get('system_id')} free swimming — batch '{batch_name}', ~{est_fry_count} fry",
+        description=(
+            f"{spawn.get('system_id')} free swimming — batch '{batch_name}', "
+            f"~{est_fry_count} fry. Male → Recovering (4d), Female → Recovering (14d)."
+        ),
         entity_type="spawn",
         entity_id=spawn_id,
     )
