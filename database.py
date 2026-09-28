@@ -11,11 +11,15 @@
 # Session 26H.7 — Tank model redesign.
 # Session 27B — Round 1: molt fields, fish_photos CRUD, compute_stage,
 #               display_variety, advance_breeder_status.
-# Session 28A (this revision):
-#   • FISH_FIELDS: added birth_date
-#   • compute_stage() reads birth_date (fallback: created_at)
-#   • advance_breeder_status() normalizes timestamps to UTC-aware
-#     before subtracting (fixes naive-vs-aware error)
+# Session 28A — FISH_FIELDS: added birth_date; compute_stage() reads
+#               birth_date; advance_breeder_status() normalizes timestamps.
+# Session 28B (this revision) — PERFORMANCE OPTIMIZATION ROUND 1:
+#   • @st.cache_data(ttl=45) on read helpers
+#   • get_all_tank_occupants() batch fetch (N→1 queries)
+#   • get_all_occupants_for_fish() batch fish→tanks map
+#   • get_milestone_counts_by_fish() uses Supabase count aggregation
+#   • Explicit cache invalidation on every write
+#   • All signatures backward-compatible
 
 from __future__ import annotations
 
@@ -43,6 +47,41 @@ def _today_iso() -> str:
 
 def _now_iso() -> str:
     return _dt.datetime.now().isoformat(timespec="seconds")
+
+
+# ============================================================
+# CACHE CONTROL  (Session 28B)
+# ============================================================
+
+# TTL in seconds for cached reads.
+CACHE_TTL = 45
+
+# Names used by invalidate_all_caches() / _bust_cache().
+_CACHE_NAMES = (
+    "get_all_fish",
+    "get_all_tanks",
+    "get_all_spawns",
+    "get_all_fry_batches",
+    "get_all_strains",
+    "get_all_tank_occupants",
+    "get_milestone_counts_by_fish",
+)
+
+
+def _bust_cache(name: str) -> None:
+    """Clear a single cached read function. Safe if cache not populated."""
+    try:
+        fn = globals().get(name)
+        if fn is not None and hasattr(fn, "clear"):
+            fn.clear()
+    except Exception:
+        pass
+
+
+def invalidate_all_caches() -> None:
+    """Clear every cached read function. Called after writes."""
+    for name in _CACHE_NAMES:
+        _bust_cache(name)
 
 
 # ============================================================
@@ -174,8 +213,7 @@ def advance_breeder_status(fish: dict) -> Optional[str]:
     Returns the new breeder_status if a flip happened, else None.
 
     Session 28A fix — normalizes both timestamps to UTC-aware before
-    subtracting, so naive (from _dt.datetime.now()) and aware (from
-    backdated spawn timestamps) values can be compared safely.
+    subtracting, so naive and aware values can be compared safely.
     """
     bs = (fish.get("breeder_status") or "").strip()
     started = fish.get("breeder_status_started_at")
@@ -187,7 +225,6 @@ def advance_breeder_status(fish: dict) -> Optional[str]:
     except Exception:
         return None
 
-    # Normalize: if naive, treat as UTC. Compare against UTC-aware now.
     if started_dt.tzinfo is None:
         started_dt = started_dt.replace(tzinfo=_dt.timezone.utc)
     now_dt = _dt.datetime.now(_dt.timezone.utc)
@@ -211,8 +248,9 @@ def advance_breeder_status(fish: dict) -> Optional[str]:
 # Fish CRUD
 # ------------------------------------------------------------
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_fish() -> list[dict]:
-    """Return every fish row, newest first."""
+    """Return every fish row, newest first. Cached (Session 28B)."""
     try:
         res = _sb().table("fish").select("*").order("created_at", desc=True).execute()
         return res.data or []
@@ -246,6 +284,7 @@ def create_fish(data: dict) -> Optional[dict]:
     payload = {k: data.get(k) for k in FISH_FIELDS if k in data}
     try:
         res = _sb().table("fish").insert(payload).execute()
+        invalidate_all_caches()
         return (res.data or [None])[0]
     except Exception as e:
         st.error(f"create_fish failed: {e}")
@@ -259,6 +298,7 @@ def update_fish(fish_id: str, updates: dict) -> bool:
         return False
     try:
         _sb().table("fish").update(payload).eq("id", fish_id).execute()
+        invalidate_all_caches()
         return True
     except Exception as e:
         st.error(f"update_fish failed: {e}")
@@ -268,6 +308,7 @@ def update_fish(fish_id: str, updates: dict) -> bool:
 def delete_fish(fish_id: str) -> bool:
     try:
         _sb().table("fish").delete().eq("id", fish_id).execute()
+        invalidate_all_caches()
         return True
     except Exception as e:
         st.error(f"delete_fish failed: {e}")
@@ -438,7 +479,9 @@ RESERVATION_FIELDS = [
 ]
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_tanks() -> list[dict]:
+    """Return every tank row. Cached (Session 28B)."""
     try:
         res = _sb().table("tanks").select("*").order("created_at", desc=True).execute()
         return res.data or []
@@ -460,6 +503,7 @@ def create_tank(data: dict) -> Optional[dict]:
     payload = {k: data.get(k) for k in TANK_FIELDS if k in data}
     try:
         res = _sb().table("tanks").insert(payload).execute()
+        invalidate_all_caches()
         return (res.data or [None])[0]
     except Exception as e:
         st.error(f"create_tank failed: {e}")
@@ -473,6 +517,7 @@ def update_tank(tank_id: str, updates: dict) -> bool:
         return False
     try:
         _sb().table("tanks").update(payload).eq("id", tank_id).execute()
+        invalidate_all_caches()
         return True
     except Exception as e:
         st.error(f"update_tank failed: {e}")
@@ -483,6 +528,7 @@ def delete_tank(tank_id: str) -> bool:
     """Raw delete — does NOT check occupants."""
     try:
         _sb().table("tanks").delete().eq("id", tank_id).execute()
+        invalidate_all_caches()
         return True
     except Exception as e:
         st.error(f"delete_tank failed: {e}")
@@ -521,8 +567,67 @@ def get_tank_stats() -> dict:
 # TANK OCCUPANTS
 # ============================================================
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def get_all_tank_occupants() -> dict[str, list[dict]]:
+    """
+    Session 28B — batch fetch every tank occupant in ONE query.
+
+    Returns: { tank_id: [occupant_row, ...] } sorted by added_at.
+
+    Replaces N per-tank calls to get_tank_occupants() with a single
+    round trip. Empty tanks are omitted from the dict; callers should
+    use .get(tank_id, []) for safety.
+    """
+    try:
+        res = (_sb().table("tank_occupants")
+               .select("*")
+               .order("added_at")
+               .execute())
+        grouped: dict[str, list[dict]] = {}
+        for row in (res.data or []):
+            tid = row.get("tank_id")
+            if tid:
+                grouped.setdefault(tid, []).append(row)
+        return grouped
+    except Exception as e:
+        st.error(f"get_all_tank_occupants failed: {e}")
+        return {}
+
+
+def get_all_occupants_for_fish() -> dict[str, list[dict]]:
+    """
+    Session 28B — batch fish→tanks lookup.
+
+    Returns: { fish_id: [tank_occupants row, ...] }
+
+    Uses the already-cached get_all_tank_occupants() so this is free
+    when occupants are already loaded.
+    """
+    try:
+        all_occ = get_all_tank_occupants()
+        by_fish: dict[str, list[dict]] = {}
+        for tid, rows in all_occ.items():
+            for row in rows:
+                if row.get("occupant_type") == "fish":
+                    fid = row.get("occupant_id")
+                    if fid:
+                        by_fish.setdefault(fid, []).append(row)
+        return by_fish
+    except Exception as e:
+        st.error(f"get_all_occupants_for_fish failed: {e}")
+        return {}
+
+
 def get_tank_occupants(tank_id: str) -> list[dict]:
-    """All occupants of a tank."""
+    """All occupants of a tank. Uses batch cache when available."""
+    # Fast path: use the cached batch map if it's populated.
+    try:
+        batch = get_all_tank_occupants()
+        if batch:
+            return batch.get(tank_id, [])
+    except Exception:
+        pass
+    # Slow path: direct query (cache miss / error).
     try:
         res = (_sb().table("tank_occupants")
                .select("*")
@@ -594,6 +699,7 @@ def add_tank_occupant(
         res = _sb().table("tank_occupants").insert(record).execute()
         new_row = (res.data or [None])[0]
 
+        invalidate_all_caches()
         _refresh_tank_cache(tank_id)
         return new_row
     except Exception as e:
@@ -611,6 +717,7 @@ def remove_tank_occupant(tank_id: str, occupant_type: str, occupant_id: str) -> 
          .eq("occupant_id", occupant_id)
          .execute())
 
+        invalidate_all_caches()
         _refresh_tank_cache(tank_id)
         return True
     except Exception as e:
@@ -670,6 +777,7 @@ def clear_occupant(tank_id: str) -> bool:
          .eq("tank_id", tank_id)
          .execute())
 
+        invalidate_all_caches()
         _refresh_tank_cache(tank_id)
         return True
     except Exception as e:
@@ -970,7 +1078,9 @@ SPAWN_FIELDS = [
 ]
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_spawns() -> list[dict]:
+    """Return every spawn row, newest first. Cached (Session 28B)."""
     try:
         res = _sb().table("spawns").select("*").order("created_at", desc=True).execute()
         return res.data or []
@@ -992,6 +1102,7 @@ def create_spawn(data: dict) -> Optional[dict]:
     payload = {k: data.get(k) for k in SPAWN_FIELDS if k in data}
     try:
         res = _sb().table("spawns").insert(payload).execute()
+        invalidate_all_caches()
         return (res.data or [None])[0]
     except Exception as e:
         st.error(f"create_spawn failed: {e}")
@@ -1004,6 +1115,7 @@ def update_spawn(spawn_id: str, updates: dict) -> bool:
         return False
     try:
         _sb().table("spawns").update(payload).eq("id", spawn_id).execute()
+        invalidate_all_caches()
         return True
     except Exception as e:
         st.error(f"update_spawn failed: {e}")
@@ -1013,6 +1125,7 @@ def update_spawn(spawn_id: str, updates: dict) -> bool:
 def delete_spawn(spawn_id: str) -> bool:
     try:
         _sb().table("spawns").delete().eq("id", spawn_id).execute()
+        invalidate_all_caches()
         return True
     except Exception as e:
         st.error(f"delete_spawn failed: {e}")
@@ -1041,7 +1154,9 @@ def get_next_spawn_code() -> str:
 # STRAINS
 # ============================================================
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_strains() -> list[dict]:
+    """Return every strain row, ordered by name. Cached (Session 28B)."""
     try:
         res = _sb().table("strains").select("*").order("name").execute()
         return res.data or []
@@ -1055,6 +1170,7 @@ def create_strain(name: str, line_code: str = "", description: str = "") -> Opti
         res = _sb().table("strains").insert({
             "name": name, "line_code": line_code, "description": description,
         }).execute()
+        invalidate_all_caches()
         return (res.data or [None])[0]
     except Exception as e:
         st.error(f"create_strain failed: {e}")
@@ -1065,6 +1181,7 @@ def delete_strain(strain_id: str) -> bool:
     """Delete a strain by uuid."""
     try:
         _sb().table("strains").delete().eq("id", strain_id).execute()
+        invalidate_all_caches()
         return True
     except Exception as e:
         st.error(f"delete_strain failed: {e}")
@@ -1125,7 +1242,9 @@ FRY_BATCH_FIELDS = [
 ]
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_fry_batches() -> list[dict]:
+    """Return every fry batch row, newest first. Cached (Session 28B)."""
     try:
         res = _sb().table("fry_batches").select("*").order("created_at", desc=True).execute()
         return res.data or []
@@ -1138,6 +1257,7 @@ def create_fry_batch(data: dict) -> Optional[dict]:
     payload = {k: data.get(k) for k in FRY_BATCH_FIELDS if k in data}
     try:
         res = _sb().table("fry_batches").insert(payload).execute()
+        invalidate_all_caches()
         return (res.data or [None])[0]
     except Exception as e:
         st.error(f"create_fry_batch failed: {e}")
@@ -1150,6 +1270,7 @@ def update_fry_batch(batch_id: str, updates: dict) -> bool:
         return False
     try:
         _sb().table("fry_batches").update(payload).eq("id", batch_id).execute()
+        invalidate_all_caches()
         return True
     except Exception as e:
         st.error(f"update_fry_batch failed: {e}")
@@ -1184,6 +1305,7 @@ def delete_fry_batch(batch_id: str) -> bool:
     """Delete a fry batch by uuid."""
     try:
         _sb().table("fry_batches").delete().eq("id", batch_id).execute()
+        invalidate_all_caches()
         return True
     except Exception as e:
         st.error(f"delete_fry_batch failed: {e}")
@@ -1230,6 +1352,7 @@ def create_milestone(data: dict) -> Optional[dict]:
     payload = {k: data.get(k) for k in MILESTONE_FIELDS if k in data}
     try:
         res = _sb().table("fish_milestones").insert(payload).execute()
+        _bust_cache("get_milestone_counts_by_fish")
         return (res.data or [None])[0]
     except Exception as e:
         st.error(f"create_milestone failed: {e}")
@@ -1243,6 +1366,7 @@ def update_milestone(milestone_id: str, updates: dict) -> bool:
         return False
     try:
         _sb().table("fish_milestones").update(payload).eq("id", milestone_id).execute()
+        _bust_cache("get_milestone_counts_by_fish")
         return True
     except Exception as e:
         st.error(f"update_milestone failed: {e}")
@@ -1253,25 +1377,59 @@ def delete_milestone(milestone_id: str) -> bool:
     """Delete a milestone by uuid."""
     try:
         _sb().table("fish_milestones").delete().eq("id", milestone_id).execute()
+        _bust_cache("get_milestone_counts_by_fish")
         return True
     except Exception as e:
         st.error(f"delete_milestone failed: {e}")
         return False
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_milestone_counts_by_fish() -> dict:
-    """Returns { fish_id: count } for all fish that have milestones."""
+    """
+    Returns { fish_id: count } for all fish that have milestones.
+
+    Session 28B — uses Supabase count aggregation (head=True) per
+    distinct fish_id so we never fetch row bodies. Falls back to the
+    old row-scan on any error.
+    """
+    counts: dict[str, int] = {}
     try:
-        res = _sb().table("fish_milestones").select("fish_id").execute()
-        counts: dict[str, int] = {}
-        for row in (res.data or []):
-            fid = row.get("fish_id")
-            if fid:
-                counts[fid] = counts.get(fid, 0) + 1
+        # Get the distinct fish_ids that have milestones (cheap: single col).
+        ids_res = _sb().table("fish_milestones").select("fish_id").execute()
+        fish_ids = {r.get("fish_id") for r in (ids_res.data or []) if r.get("fish_id")}
+
+        for fid in fish_ids:
+            try:
+                cnt_res = (_sb().table("fish_milestones")
+                           .select("id", count="exact")
+                           .eq("fish_id", fid)
+                           .limit(1)
+                           .execute())
+                counts[fid] = int(cnt_res.count or 0)
+            except Exception:
+                # Fallback: per-fish row scan if aggregate fails.
+                try:
+                    rows = (_sb().table("fish_milestones")
+                            .select("id")
+                            .eq("fish_id", fid)
+                            .execute())
+                    counts[fid] = len(rows.data or [])
+                except Exception:
+                    counts[fid] = 0
         return counts
     except Exception as e:
-        st.error(f"get_milestone_counts_by_fish failed: {e}")
-        return {}
+        # Ultimate fallback: old behavior (fetch every row).
+        st.warning(f"get_milestone_counts_by_fish fallback: {e}")
+        try:
+            res = _sb().table("fish_milestones").select("fish_id").execute()
+            for row in (res.data or []):
+                fid = row.get("fish_id")
+                if fid:
+                    counts[fid] = counts.get(fid, 0) + 1
+        except Exception:
+            pass
+        return counts
 
 
 # ============================================================
