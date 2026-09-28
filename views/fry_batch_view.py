@@ -9,10 +9,10 @@
 #
 # Session 29 (this revision) — Fry batch fixes + M/F layout:
 #   • Parent thumbnails removed from card header.
-#   • New M/F showcase panel (right column) with responsive
-#     rounded-square parent photos (fill column width, 1:1 aspect),
-#     details below, and "View fish →" link.
-#   • Batch Outcome panel moved to left column, unchanged content.
+#   • New M/F showcase panel (right column, 65% width) with
+#     wide 4:3 rounded-square parent photos, details below, and
+#     "View fish →" link.
+#   • Batch Outcome panel moved to left column (35% width).
 #   • Jarring failures surfaced (jar_fry_bulk returns (created, failed)).
 #   • _render_list_section() fetches list_all_batches() once.
 #   • "Stage due?" hint when fry/free_swimming batch is older
@@ -75,6 +75,7 @@ STAGE_DUE_DAYS = 60
 PARENT_PHOTO_RADIUS = 24         # px, rounded-square
 PARENT_PHOTO_BORDER = "#E5E7EB"
 PARENT_PHOTO_BG = "#F3F4F6"
+PARENT_PHOTO_ASPECT = "4/3"      # wide, matches betta side shots
 
 
 # ============================================================
@@ -130,11 +131,11 @@ def _stage_due_hint(batch: dict) -> Optional[str]:
 
 def _parent_photo_html(fish: Optional[dict], gender_sym: str) -> str:
     """
-    Big rounded-square photo that fills its container width.
-    Aspect ratio is forced to 1:1 so M and F always match.
+    Wide rounded-square photo that fills its container width.
+    Aspect ratio is 4:3 so betta side shots don't crop fins.
     """
     wrapper_style = (
-        f"width:100%;aspect-ratio:1/1;"
+        f"width:100%;aspect-ratio:{PARENT_PHOTO_ASPECT};"
         f"border-radius:{PARENT_PHOTO_RADIUS}px;"
         f"border:1px solid {PARENT_PHOTO_BORDER};"
         f"background:{PARENT_PHOTO_BG};"
@@ -187,9 +188,9 @@ def _parent_details_html(fish: Optional[dict], gender_sym: str, label: str) -> s
 
 def _render_mf_showcase(parents: dict):
     """
-    Right-column panel: two side-by-side M & F rounded-square photos
-    that each fill half the available width. Photos keep a 1:1 aspect
-    ratio and scale up to fill their column.
+    Right-column panel: two side-by-side M & F wide photos that
+    each fill half the available width. 4:3 aspect ratio keeps
+    betta side shots from cropping.
     """
     st.markdown("##### 🧬 Parents")
 
@@ -600,10 +601,10 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         if batch.get("notes"):
             st.info(batch["notes"])
 
-        # ---- Two-column: Outcome (left) | M/F Parents (right) ----
+        # ---- Two-column: Outcome (35%) | M/F Parents (65%) ----
         if outcome and outcome.get("verdict_key") not in ("unknown",):
             st.divider()
-            col_outcome, col_mf = st.columns([1, 1])
+            col_outcome, col_mf = st.columns([35, 65])
 
             with col_outcome:
                 _render_outcome_panel(outcome)
