@@ -9,16 +9,14 @@
 #   Mark Free Swimming: Free Swim Date picker.
 #
 # Session 29/E — Pairing duplicate guard:
-#   • Male / Female dropdowns exclude fish already In Pairing
-#     on another active spawn (via get_active_pairing_fish_ids).
+#   • Male / Female dropdowns exclude fish already In Pairing.
 #   • Success / error messages survive st.rerun() via session_state.
 #
-# Session 30 (this revision) — Breeder-only pairing dropdowns:
-#   • Dropdowns now show only PROMOTED breeders (is_breeder = True).
-#   • Non-breeders, retired/inactive breeders, and anything already
-#     In Pairing are excluded.
-#   • Each dropdown item shows breeder_status (Available/Ready/etc).
-#   • Clearer empty-state messages pointing to Fish Registry.
+# Session 30 — Round H Part 3 (this revision):
+#   • New "📊 Pairing Performance" tab: per parent-pair rollup of
+#     batches, fry, grade counts, and quality score.
+#   • Uses get_pairing_performance() from spawn_manager.
+#   • No changes to existing tabs.
 
 import datetime
 from typing import Optional
@@ -37,6 +35,7 @@ from modules.spawn_manager import (
     mark_completed,
     update_spawn_details,
     get_active_pairing_fish_ids,
+    get_pairing_performance,
 )
 from modules.fish_manager import (
     get_fish_dropdown_items,
@@ -67,9 +66,18 @@ _SPAWN_MESSAGE_KEY = "_spawn_pending_message"
 # Session 30 — breeder_status values that are eligible for pairing.
 PAIRABLE_BREEDER_STATUSES = {"Available", "Conditioning", "Ready", "Idle"}
 
+# Grade order for the pairing performance table.
+GRADE_COLUMNS = [
+    "Show Grade",
+    "High Grade",
+    "Breeder Grade",
+    "Material Grade",
+    "Pet Grade",
+]
+
 
 # ============================================================
-# MESSAGE QUEUE (Session 29/E)
+# MESSAGE QUEUE
 # ============================================================
 
 def _queue_spawn_message(kind: str, text: str) -> None:
@@ -148,7 +156,7 @@ def _default_batch_name(spawn: dict) -> str:
 
 
 # ============================================================
-# OUTCOME PANEL (Session 24B)
+# OUTCOME PANEL
 # ============================================================
 
 def _render_outcome_panel(outcome: dict):
@@ -205,7 +213,6 @@ def _render_lifecycle_buttons(item: dict):
 
     col_a, col_b, col_c = st.columns(3)
 
-    # --- Eggs Dropped ---
     with col_a:
         if status == "In Pairing":
             if st.button("🥚 Eggs Dropped", key=f"egg_{spawn_uuid}", use_container_width=True):
@@ -215,7 +222,6 @@ def _render_lifecycle_buttons(item: dict):
         elif status == "Pending (Success)":
             st.caption("✅ Eggs pending")
 
-    # --- Mark Free Swimming ---
     with col_b:
         with st.popover("🏊 Mark Free Swimming", use_container_width=True):
             default_batch = _default_batch_name(spawn)
@@ -252,7 +258,6 @@ def _render_lifecycle_buttons(item: dict):
                 else:
                     st.error("Please enter a batch name.")
 
-    # --- Mark Failed ---
     with col_c:
         with st.popover("❌ Mark Failed", use_container_width=True):
             reason = st.selectbox(
@@ -414,34 +419,26 @@ def render_start_pairing_tab():
     already_paired = get_active_pairing_fish_ids()
 
     # Session 30 — breeder-only filter.
-    # Only PROMOTED breeders with a pairable breeder_status appear.
-    # Non-breeders, retired/inactive breeders, fish already In Pairing,
-    # and fish with non-active statuses are all excluded.
     males_dd, females_dd = [], []
     for f in all_fish:
         if not f.get("system_id"):
             continue
 
-        # Must be a promoted breeder
         if not f.get("is_breeder"):
             continue
 
         bs = (f.get("breeder_status") or "").strip()
 
-        # Exclude "In Pairing" even without an active spawn (orphan state)
         if bs == "In Pairing":
             continue
 
-        # Must be in a pairable breeder status
         if bs not in PAIRABLE_BREEDER_STATUSES:
             continue
 
-        # Skip non-active fish statuses
         status = (f.get("status") or "").lower()
         if status in ("deceased", "sold", "retired", "culled"):
             continue
 
-        # Skip fish already on an active pairing
         if f["id"] in already_paired:
             continue
 
@@ -672,6 +669,100 @@ def render_history_tab():
 
 
 # ============================================================
+# TAB 4: PAIRING PERFORMANCE  (Session 30 — Round H Part 3)
+# ============================================================
+
+def render_pairing_performance_tab():
+    st.subheader("📊 Pairing Performance")
+    st.caption(
+        "One row per parent pair, aggregating all batches they've produced. "
+        "Sorted by quality score — the best pairs to repeat are at the top."
+    )
+
+    rows = get_pairing_performance()
+
+    if not rows:
+        st.info(
+            "No pairing performance data yet. Once you pair fish and jar fry, "
+            "their batch statistics will appear here."
+        )
+        return
+
+    # Build display DataFrame
+    df_rows = []
+    for r in rows:
+        counts = r.get("counts") or {}
+        df_rows.append({
+            "Pair":         r.get("pair_label") or "—",
+            "Batches":      r.get("batch_count", 0),
+            "Fry":          r.get("fry_count", 0),
+            "Show":         counts.get("Show Grade", 0),
+            "High":         counts.get("High Grade", 0),
+            "Breeder":      counts.get("Breeder Grade", 0),
+            "Material":     counts.get("Material Grade", 0),
+            "Pet":          counts.get("Pet Grade", 0),
+            "Quality %":    r.get("quality_score", 0),
+        })
+
+    df = pd.DataFrame(df_rows)
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Pair":      st.column_config.TextColumn("Pair", width="medium"),
+            "Batches":   st.column_config.NumberColumn("Batches", width="small"),
+            "Fry":       st.column_config.NumberColumn("Fry", width="small"),
+            "Show":      st.column_config.NumberColumn("🏆 Show", width="small"),
+            "High":      st.column_config.NumberColumn("🥇 High", width="small"),
+            "Breeder":   st.column_config.NumberColumn("🥈 Breeder", width="small"),
+            "Material":  st.column_config.NumberColumn("🥉 Material", width="small"),
+            "Pet":       st.column_config.NumberColumn("🐟 Pet", width="small"),
+            "Quality %": st.column_config.ProgressColumn(
+                "Quality %",
+                min_value=0,
+                max_value=100,
+                format="%d%%",
+                width="small",
+            ),
+        },
+    )
+
+    st.markdown("---")
+
+    # --- Top / bottom callouts ---
+    top = rows[0] if rows else None
+    bottom = rows[-1] if len(rows) > 1 else None
+
+    col_top, col_bottom = st.columns(2)
+
+    with col_top:
+        if top:
+            st.success(
+                f"🏆 **Top performer:** {top['pair_label']} — "
+                f"**{top['quality_score']}%** quality across "
+                f"{top['batch_count']} batch{'es' if top['batch_count'] != 1 else ''} "
+                f"({top['fry_count']} fry)."
+            )
+
+    with col_bottom:
+        if bottom and bottom is not top:
+            st.warning(
+                f"⚠️ **Weakest performer:** {bottom['pair_label']} — "
+                f"**{bottom['quality_score']}%** quality across "
+                f"{bottom['batch_count']} batch{'es' if bottom['batch_count'] != 1 else ''} "
+                f"({bottom['fry_count']} fry). Consider retiring one side, or "
+                f"reassess the pairing."
+            )
+
+    st.caption(
+        "**Quality %** = (Show + High + Breeder) ÷ total fish graded. "
+        "Grade fish via their Milestones or Molt Checks to populate this table."
+    )
+
+
+# ============================================================
 # PAGE
 # ============================================================
 
@@ -680,10 +771,11 @@ def render_spawn_page():
 
     _drain_spawn_message()
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "💞 Active Pairings",
         "➕ Start New Pairing",
         "📜 All Spawn History",
+        "📊 Pairing Performance",
     ])
 
     with tab1:
@@ -694,6 +786,9 @@ def render_spawn_page():
 
     with tab3:
         render_history_tab()
+
+    with tab4:
+        render_pairing_performance_tab()
 
 
 def render_spawn_tracker():
