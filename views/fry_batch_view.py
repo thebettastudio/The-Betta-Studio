@@ -4,30 +4,19 @@
 # Session 24B — Outcome panel + culled/female count editors.
 # Session 24C — 4-row outcome layout + reconciliation badge.
 #
-# Session 28A/B2 — Jar Fry popover: Jarring Date picker; batch's
-#   jarring_date updated; passed to jar_fry_bulk for birth_date.
+# Session 28A/B2 — Jar Fry popover: Jarring Date picker.
 #
-# Session 29 — Fry batch fixes + M/F layout:
-#   • Parent thumbnails removed from card header.
-#   • New M/F showcase panel (right column, 65% width) with wide
-#     4:3 rounded-square parent photos.
-#   • Batch Outcome panel moved to left column (35% width).
-#   • StreamlitDuplicateElementKey fixed via batch_uuid in keys.
-#   • Jarring messages survive st.rerun().
-#   • Stage-due hint anchored to free_swimming_date.
+# Session 29 — Fry batch fixes + M/F layout.
+# Session 29/C — Batch-scoped outcomes.
+# Session 29/D — Undo Jar + Delete Batch & Fish.
 #
-# Session 29/C — Batch-scoped outcomes:
-#   • Uses compute_all_batch_outcomes() so multi-batch spawns show
-#     per-batch numbers (fixes 159-vs-69 outcome bug).
-#
-# Session 29/D — Undo Jar + Delete Batch & Fish:
-#   • ⚙️ Edit / Delete popover now contains:
-#       ↩️ Undo Jar — reverses jarring; deletes jarred fish,
-#          restores current_count, clears jarring_date, stage back
-#          to free_swimming. Preview shows count + new value.
-#       🔥 Delete Batch & Jarred Fish — requires typing the batch
-#          tag to confirm. Nukes fish AND batch.
-#       🗑️ Delete Batch Only — existing behavior.
+# Session 29/F (this revision) — DERIVED current_count:
+#   • Update Counts popover no longer has a "Current" input.
+#     It now has "Initial fry count" (editable) + a read-only
+#     caption showing the derived Current.
+#   • Jar Fry handler no longer calls set_current_count().
+#   • Batch card shows a red warning when the derived Current
+#     would be negative (data inconsistency signal).
 
 import datetime
 from typing import Optional
@@ -44,7 +33,6 @@ from modules.fry_batch_manager import (
     count_batch_jarred_fish,
     edit_batch,
     advance_stage,
-    set_current_count,
     assign_batch_tank,
     jar_fry_bulk,
     undo_batch_jar,
@@ -428,6 +416,7 @@ def _render_outcome_panel(outcome: dict):
 def _render_jar_popover(batch: dict):
     batch_uuid = batch["id"]
     batch_tag = batch.get("batch_tag") or "?"
+    current_count = int(batch.get("current_count") or 0)
 
     with st.popover("🫙 Jar Fry", use_container_width=True):
         st.markdown(f"**Jar fry from batch '{batch_tag}'**")
@@ -436,11 +425,18 @@ def _render_jar_popover(batch: dict):
             "and details later in Fish Registry."
         )
 
+        if current_count == 0:
+            st.warning(
+                "⚠️ This batch has **0 unjarred fry** (derived). "
+                "Nothing to jar. Check Initial count if this is wrong.",
+                icon="⚠️",
+            )
+
         jar_count = st.number_input(
             "How many fry to jar?",
             min_value=1,
-            max_value=max(1, batch.get("current_count") or 1),
-            value=min(10, batch.get("current_count") or 1),
+            max_value=max(1, current_count or 1),
+            value=min(10, current_count or 1),
             key=f"jar_count_{batch_uuid}",
         )
 
@@ -490,19 +486,20 @@ def _render_jar_popover(batch: dict):
             )
 
             if created:
-                new_count = max(0, (batch.get("current_count") or 0) - len(created))
-                set_current_count(batch_uuid, new_count)
+                # Session 29/F — derived count updates automatically.
+                # No set_current_count() call.
+                new_derived = max(0, current_count - len(created))
 
                 if failed:
                     _queue_message(
                         _JAR_MESSAGE_KEY, "warning",
                         f"Jarred {len(created)} fry — **{failed} failed** to create. "
-                        f"Remaining in batch: {new_count}. Check logs.",
+                        f"Remaining in batch: {new_derived}. Check logs.",
                     )
                 else:
                     _queue_message(
                         _JAR_MESSAGE_KEY, "success",
-                        f"Jarred {len(created)} fry. Remaining in batch: {new_count}.",
+                        f"Jarred {len(created)} fry. Remaining in batch: {new_derived}.",
                     )
                 st.rerun()
 
@@ -522,28 +519,44 @@ def _render_jar_popover(batch: dict):
 
 
 # ============================================================
-# COUNTS POPOVER
+# COUNTS POPOVER  (Session 29/F — derived Current)
 # ============================================================
 
 def _render_counts_popover(batch: dict):
     batch_uuid = batch["id"]
+    current_count = int(batch.get("current_count") or 0)
 
     with st.popover("🔢 Update Counts", use_container_width=True):
         st.markdown("**Update batch counts**")
         st.caption(
-            "Current = unjarred fry alive. "
-            "Culled = fry culled before jarring. "
-            "Died = natural loss. "
-            "Females = fry kept in sorority (not individually tracked)."
+            "**Current** is now derived automatically: "
+            "`Initial − Jarred − Culled(pre) − Died`. "
+            "Edit Initial, Culled, Died, or Females below."
         )
 
-        new_current = st.number_input(
-            "Current fry count (unjarred, alive)",
-            min_value=0,
-            value=int(batch.get("current_count") or 0),
-            step=1,
-            key=f"count_cur_{batch_uuid}",
+        # --- Read-only derived Current ---
+        st.markdown(
+            f'<div style="background:#F3F4F6;border-radius:8px;padding:10px;'
+            f'margin-bottom:8px;">'
+            f'<div style="font-size:11px;color:#6B7280;font-weight:600;'
+            f'text-transform:uppercase;letter-spacing:0.5px;">Current (derived)</div>'
+            f'<div style="font-size:22px;color:#111827;font-weight:700;'
+            f'margin-top:2px;">{current_count}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
         )
+
+        # --- Editable Initial ---
+        new_initial = st.number_input(
+            "Initial fry count (total at hatch)",
+            min_value=0,
+            value=int(batch.get("initial_count") or 0),
+            step=1,
+            key=f"count_init_{batch_uuid}",
+            help="Total fry counted at hatch. If wrong, correct it here.",
+        )
+
+        # --- Editable Culled (pre-jar) ---
         new_culled_pre = st.number_input(
             "Culled (pre-jar)",
             min_value=0,
@@ -551,13 +564,17 @@ def _render_counts_popover(batch: dict):
             step=1,
             key=f"count_culled_{batch_uuid}",
         )
+
+        # --- Editable Died ---
         new_died = st.number_input(
-            "Died (natural loss)",
+            "Died (natural loss, pre-jar)",
             min_value=0,
             value=int(batch.get("died_count") or 0),
             step=1,
             key=f"count_died_{batch_uuid}",
         )
+
+        # --- Editable Female count ---
         new_female = st.number_input(
             "Female count (kept in sorority)",
             min_value=0,
@@ -573,7 +590,7 @@ def _render_counts_popover(batch: dict):
             key=f"save_counts_{batch_uuid}",
         ):
             ok = edit_batch(batch_uuid, {
-                "current_count": int(new_current),
+                "initial_count": int(new_initial),
                 "culled_count":  int(new_culled_pre),
                 "died_count":    int(new_died),
                 "female_count":  int(new_female),
@@ -584,7 +601,7 @@ def _render_counts_popover(batch: dict):
 
 
 # ============================================================
-# EDIT / DELETE POPOVER (Session 29/D)
+# EDIT / DELETE POPOVER
 # ============================================================
 
 def _render_edit_delete_popover(batch: dict):
@@ -593,7 +610,6 @@ def _render_edit_delete_popover(batch: dict):
     jarring_date = batch.get("jarring_date")
 
     with st.popover("⚙️ Edit / Delete", use_container_width=True):
-        # ---- Edit fields ----
         edit_tag = st.text_input(
             "Batch Tag",
             value=batch.get("batch_tag") or "",
@@ -611,15 +627,13 @@ def _render_edit_delete_popover(batch: dict):
 
         st.divider()
 
-        # ---- Undo Jar (only if there's something to undo) ----
         if jarring_date:
             jarred_count = count_batch_jarred_fish(batch)
-            restored_count = (batch.get("current_count") or 0) + jarred_count
 
             st.markdown("**↩️ Undo Jar**")
             st.caption(
-                f"Deletes all **{jarred_count}** fish jarred by this batch "
-                f"and restores current_count to **{restored_count}**. "
+                f"Deletes all **{jarred_count}** fish jarred by this batch. "
+                f"Current count will increase automatically (derived). "
                 f"Clears jarring_date."
             )
             if jarred_count == 0:
@@ -645,14 +659,12 @@ def _render_edit_delete_popover(batch: dict):
                 else:
                     _queue_message(
                         _DANGER_MESSAGE_KEY, "success",
-                        f"Undo Jar complete — deleted {deleted} fish, "
-                        f"restored current_count to {restored_count}.",
+                        f"Undo Jar complete — deleted {deleted} fish.",
                     )
                 st.rerun()
 
             st.divider()
 
-        # ---- Delete Batch & Jarred Fish ----
         jarred_count = count_batch_jarred_fish(batch)
         st.markdown("**🔥 Delete Batch & Jarred Fish**")
         st.caption(
@@ -692,7 +704,6 @@ def _render_edit_delete_popover(batch: dict):
 
         st.divider()
 
-        # ---- Delete Batch Only ----
         st.markdown("**🗑️ Delete Batch Only**")
         st.caption("Deletes the batch record. Jarred fish are kept in Fish Registry.")
         confirm_del = st.checkbox(
@@ -722,6 +733,7 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
     spawn = item.get("spawn")
     tank = item.get("tank")
     survival = item.get("survival")
+    derived = item.get("derived") or {}
 
     batch_uuid = batch["id"]
     batch_tag = batch.get("batch_tag") or "?"
@@ -731,7 +743,6 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
     parents = get_batch_parents(batch)
 
     with st.container(border=True):
-        # ---- Header ----
         st.markdown(f"### {icon} `{batch_tag}`")
         if spawn:
             st.caption(
@@ -741,7 +752,6 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         else:
             st.caption("_No linked spawn._")
 
-        # ---- Stage selector ----
         new_stage = st.selectbox(
             "Stage",
             options=VALID_STAGES,
@@ -755,19 +765,26 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
                     st.success(f"Stage → {new_stage}")
                     st.rerun()
 
-        # ---- Stage-due hint ----
         hint = _stage_due_hint(batch, spawn)
         if hint:
             st.info(hint, icon="⏰")
 
-        # ---- Metrics ----
+        # Session 29/F — negative-derived warning
+        if derived.get("negative_warning"):
+            st.error(
+                f"⚠️ **Data inconsistency.** Derived Current would be "
+                f"**{derived.get('raw_current')}** (negative). "
+                f"Initial is lower than Jarred + Culled + Died. "
+                f"Check Initial fry count and the jarred/culled/died numbers.",
+                icon="🚨",
+            )
+
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Initial", batch.get("initial_count") or 0)
         col2.metric("Current", batch.get("current_count") or 0)
         col3.metric("Survival", _survival_label(survival))
         col4.metric("Stage", f"{icon} {stage}")
 
-        # ---- Metadata ----
         culled_pre_n = batch.get("culled_count") or 0
         died_n = batch.get("died_count") or 0
         female_n = batch.get("female_count") or 0
@@ -781,7 +798,6 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         if batch.get("notes"):
             st.info(batch["notes"])
 
-        # ---- Outcome | Parents ----
         if outcome and outcome.get("verdict_key") not in ("unknown",):
             st.divider()
             col_outcome, col_mf = st.columns([OUTCOME_COL_WEIGHT, MF_COL_WEIGHT])
@@ -795,7 +811,6 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
 
         st.divider()
 
-        # ---- Action bar ----
         col_a, col_b, col_c, col_d = st.columns(4)
 
         with col_a:
@@ -888,7 +903,6 @@ def _render_list_section():
         st.info("No batches match the current filter.")
         return
 
-    # Session 29/C — batch-scoped outcomes (fixes 159-vs-69)
     outcome_map = compute_all_batch_outcomes()
 
     for it in items:
