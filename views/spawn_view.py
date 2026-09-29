@@ -13,11 +13,14 @@
 # Session 30 — Round H Part 3: Pairing Performance tab.
 #   Breeder-only pairing dropdowns.
 #
-# Session 32 (this revision) — PAIRING PLANS:
-#   • Start New Pairing tab now has a radio "Start now / Plan for later"
-#   • Planning mode: creates a pairing_plan instead of a spawn
-#   • Uses create_pairing_plan + is_fish_planned from spawn_manager
-#   • No changes to other tabs
+# Session 32 — PAIRING PLANS: Start New Pairing has radio
+#   "Start now / Plan for later".
+#
+# Session 35 (this revision) — CANCEL PAIRING soft exit:
+#   • Imported cancel_pairing.
+#   • New _render_cancel_popover(spawn).
+#   • Lifecycle buttons now show both "Cancel" (soft) and
+#     "Mark Failed" (biological) side by side.
 
 import datetime
 from typing import Optional
@@ -33,6 +36,7 @@ from modules.spawn_manager import (
     mark_pairing_success_pending,
     mark_free_swimming,
     mark_pairing_failed,
+    cancel_pairing,
     mark_completed,
     update_spawn_details,
     get_active_pairing_fish_ids,
@@ -74,6 +78,15 @@ GRADE_COLUMNS = [
     "Breeder Grade",
     "Material Grade",
     "Pet Grade",
+]
+
+CANCEL_REASONS = [
+    "Changed my mind",
+    "Wrong pairing",
+    "Fish not ready",
+    "Tank needed for something else",
+    "Line goal changed",
+    "Other",
 ]
 
 
@@ -201,6 +214,63 @@ def _render_outcome_panel(outcome: dict):
 # TAB 1: ACTIVE PAIRINGS
 # ============================================================
 
+def _render_cancel_popover(spawn: dict):
+    """Session 35 — soft-exit cancel popover."""
+    spawn_uuid = spawn["id"]
+    system_id = spawn.get("system_id") or "?"
+
+    with st.popover("🚫 Cancel Pairing", use_container_width=True):
+        st.markdown(f"**Cancel pairing `{system_id}`?**")
+        st.caption(
+            "This is a soft exit. Use it when you started a pairing by "
+            "mistake or want to back out before anything happened. "
+            "Use **Mark Failed** instead if the pairing actually failed "
+            "(aggression, eaten eggs, etc.)."
+        )
+
+        cancel_reason = st.selectbox(
+            "Reason",
+            options=CANCEL_REASONS,
+            key=f"cancel_reason_{spawn_uuid}",
+        )
+
+        extra_notes = st.text_area(
+            "Additional notes (optional)",
+            placeholder="e.g. Noticed the female was still recovering",
+            key=f"cancel_notes_{spawn_uuid}",
+        )
+
+        confirm = st.checkbox(
+            "I understand — cancel this pairing",
+            key=f"cancel_confirm_{spawn_uuid}",
+        )
+
+        final_reason = cancel_reason
+        if extra_notes.strip():
+            final_reason = f"{cancel_reason} — {extra_notes.strip()}"
+
+        if st.button(
+            "Confirm Cancel",
+            key=f"cancel_btn_{spawn_uuid}",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm,
+        ):
+            if cancel_pairing(spawn_uuid, final_reason):
+                _queue_spawn_message(
+                    "success",
+                    f"Pairing `{system_id}` cancelled. Both parents released "
+                    f"to Available, tank freed.",
+                )
+                st.rerun()
+            else:
+                _queue_spawn_message(
+                    "error",
+                    "Failed to cancel pairing — see message above.",
+                )
+                st.rerun()
+
+
 def _render_lifecycle_buttons(item: dict):
     spawn = item["spawn"]
     spawn_uuid = spawn["id"]
@@ -211,6 +281,7 @@ def _render_lifecycle_buttons(item: dict):
 
     col_a, col_b, col_c = st.columns(3)
 
+    # --- Eggs Dropped ---
     with col_a:
         if status == "In Pairing":
             if st.button("🥚 Eggs Dropped", key=f"egg_{spawn_uuid}", use_container_width=True):
@@ -220,6 +291,7 @@ def _render_lifecycle_buttons(item: dict):
         elif status == "Pending (Success)":
             st.caption("✅ Eggs pending")
 
+    # --- Mark Free Swimming ---
     with col_b:
         with st.popover("🏊 Mark Free Swimming", use_container_width=True):
             default_batch = _default_batch_name(spawn)
@@ -256,7 +328,13 @@ def _render_lifecycle_buttons(item: dict):
                 else:
                     st.error("Please enter a batch name.")
 
+    # --- Cancel + Mark Failed (Session 35) ---
     with col_c:
+        st.caption("**End this pairing**")
+        # Cancel — soft exit
+        _render_cancel_popover(spawn)
+
+        # Mark Failed — biological failure
         with st.popover("❌ Mark Failed", use_container_width=True):
             reason = st.selectbox(
                 "Reason",
@@ -370,7 +448,7 @@ def render_active_pairings_tab():
 
 
 # ============================================================
-# TAB 2: START NEW PAIRING  (Session 32 — with Plan mode)
+# TAB 2: START NEW PAIRING
 # ============================================================
 
 def _render_lineage_check(male_uuid: str, female_uuid: str) -> dict:
@@ -478,7 +556,6 @@ def render_start_pairing_tab():
         )
         return
 
-    # Session 32 — Start now vs Plan for later
     st.markdown("##### Mode")
     mode = st.radio(
         "Do you want to start this pairing now, or plan it for a future date?",
@@ -553,7 +630,6 @@ def render_start_pairing_tab():
             key="start_line_goal",
         )
 
-    # Session 32 — check for conflicting plans
     male_conflict = is_fish_planned(male_uuid)
     female_conflict = is_fish_planned(female_uuid)
     conflicts = []
