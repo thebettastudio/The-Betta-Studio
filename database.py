@@ -13,13 +13,11 @@
 #               display_variety, advance_breeder_status.
 # Session 28A — FISH_FIELDS: added birth_date; compute_stage() reads
 #               birth_date; advance_breeder_status() normalizes timestamps.
-# Session 28B (this revision) — PERFORMANCE OPTIMIZATION ROUND 1:
-#   • @st.cache_data(ttl=45) on read helpers
-#   • get_all_tank_occupants() batch fetch (N→1 queries)
-#   • get_all_occupants_for_fish() batch fish→tanks map
-#   • get_milestone_counts_by_fish() uses Supabase count aggregation
-#   • Explicit cache invalidation on every write
-#   • All signatures backward-compatible
+# Session 28B — PERFORMANCE OPTIMIZATION ROUND 1: caching, batch
+#               occupant fetch, cache invalidation.
+# Session 30 (this revision) — Round H Part 1:
+#   • MILESTONE_FIELDS: added "grade" so grades set at molt/milestone
+#     are persisted on the milestone row.
 
 from __future__ import annotations
 
@@ -571,12 +569,6 @@ def get_tank_stats() -> dict:
 def get_all_tank_occupants() -> dict[str, list[dict]]:
     """
     Session 28B — batch fetch every tank occupant in ONE query.
-
-    Returns: { tank_id: [occupant_row, ...] } sorted by added_at.
-
-    Replaces N per-tank calls to get_tank_occupants() with a single
-    round trip. Empty tanks are omitted from the dict; callers should
-    use .get(tank_id, []) for safety.
     """
     try:
         res = (_sb().table("tank_occupants")
@@ -597,11 +589,6 @@ def get_all_tank_occupants() -> dict[str, list[dict]]:
 def get_all_occupants_for_fish() -> dict[str, list[dict]]:
     """
     Session 28B — batch fish→tanks lookup.
-
-    Returns: { fish_id: [tank_occupants row, ...] }
-
-    Uses the already-cached get_all_tank_occupants() so this is free
-    when occupants are already loaded.
     """
     try:
         all_occ = get_all_tank_occupants()
@@ -620,14 +607,12 @@ def get_all_occupants_for_fish() -> dict[str, list[dict]]:
 
 def get_tank_occupants(tank_id: str) -> list[dict]:
     """All occupants of a tank. Uses batch cache when available."""
-    # Fast path: use the cached batch map if it's populated.
     try:
         batch = get_all_tank_occupants()
         if batch:
             return batch.get(tank_id, [])
     except Exception:
         pass
-    # Slow path: direct query (cache miss / error).
     try:
         res = (_sb().table("tank_occupants")
                .select("*")
@@ -1319,6 +1304,7 @@ def delete_fry_batch(batch_id: str) -> bool:
 MILESTONE_FIELDS = [
     "fish_id", "milestone_date", "photo_id",
     "form_score", "body_shape", "fin_checks",
+    "grade",
     "notes",
 ]
 
@@ -1390,12 +1376,10 @@ def get_milestone_counts_by_fish() -> dict:
     Returns { fish_id: count } for all fish that have milestones.
 
     Session 28B — uses Supabase count aggregation (head=True) per
-    distinct fish_id so we never fetch row bodies. Falls back to the
-    old row-scan on any error.
+    distinct fish_id so we never fetch row bodies.
     """
     counts: dict[str, int] = {}
     try:
-        # Get the distinct fish_ids that have milestones (cheap: single col).
         ids_res = _sb().table("fish_milestones").select("fish_id").execute()
         fish_ids = {r.get("fish_id") for r in (ids_res.data or []) if r.get("fish_id")}
 
@@ -1408,7 +1392,6 @@ def get_milestone_counts_by_fish() -> dict:
                            .execute())
                 counts[fid] = int(cnt_res.count or 0)
             except Exception:
-                # Fallback: per-fish row scan if aggregate fails.
                 try:
                     rows = (_sb().table("fish_milestones")
                             .select("id")
@@ -1419,7 +1402,6 @@ def get_milestone_counts_by_fish() -> dict:
                     counts[fid] = 0
         return counts
     except Exception as e:
-        # Ultimate fallback: old behavior (fetch every row).
         st.warning(f"get_milestone_counts_by_fish fallback: {e}")
         try:
             res = _sb().table("fish_milestones").select("fish_id").execute()
