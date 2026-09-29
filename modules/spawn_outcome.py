@@ -7,7 +7,7 @@
 #   Initial = Current + Jarred_alive + Culled_pre + Culled_jarred + Died
 #
 # Where:
-#   Current       = unjarred fry still alive in the batch
+#   Current       = unjarred fry still alive in the batch (DERIVED)
 #   Jarred_alive  = individually tracked fish jarred from THIS batch,
 #                   status not culled/deceased
 #   Culled_pre    = fry culled BEFORE jarring (batch.culled_count)
@@ -15,29 +15,32 @@
 #   Died          = natural deaths (batch.died_count)
 #
 # Survival % = (Current + Jarred_alive) ÷ Initial
-#   Represents "of everything we started with, how many are still alive with us"
 #
 # Verdict uses:
 #   high_pct  = (High+ grade jarred alive) ÷ jarred_alive
 #   cull_rate = (Culled_pre + Culled_jarred) ÷ Initial
 #
 # Session 29 — Batch-scoping fix:
-#   Previously, _compute_from_data(spawn_id) counted ALL fish whose
-#   fish.batch_id == spawn_id (which is really a spawn id, not a
-#   fry_batch id — see fish_manager.register_fish_from_spawn()).
-#   For a spawn that has produced multiple fry batches over time,
-#   every batch card showed the spawn-wide totals — e.g. a 69-fry
-#   batch displayed 159 jarred fish and 230% survival.
+#   _compute_from_data() accepts an optional batch_id. When given,
+#   jarred-fish counts are scoped to only the fish jarred from THAT
+#   batch (discriminated by fish.birth_date == batch.jarring_date).
 #
-#   Now _compute_from_data() accepts an optional batch_id. When
-#   given, jarred-fish counts are scoped to only the fish jarred
-#   from THAT batch, discriminated by:
-#     fish.batch_id == spawn_id   (existing link)
-#     AND
-#     fish.birth_date == batch.jarring_date  (set by jar_fry_bulk)
+# Session 29/F (this revision) — Derived current_count:
+#   current_count is no longer read from the stored DB value. It's
+#   now computed at read time using the same formula as
+#   fry_batch_manager._compute_current_count():
 #
-#   When batch_id is None, behavior falls back to the old
-#   spawn-wide computation (backward-compatible).
+#     current = initial
+#             − jarred_alive
+#             − culled_jarred
+#             − culled_pre
+#             − died
+#
+#   Reason: the stored value drifted out of sync (e.g. "Current 48"
+#   when the true unjarred count was 38 after culls and deaths).
+#   Deriving it makes the outcome panel match the batch card metric,
+#   and guarantees reconciliation always passes when the manual
+#   numbers (initial, culled_pre, died) are correct.
 
 from __future__ import annotations
 
@@ -121,10 +124,7 @@ def _compute_verdict(
     total_culled: int,
     initial: int,
 ) -> tuple[str, str]:
-    """
-    Returns (verdict_key, reason_short).
-    cull_rate = total_culled ÷ initial (of all fry started, how many culled).
-    """
+    """Returns (verdict_key, reason_short)."""
     if jarred_alive == 0 and total_culled > 0:
         return ("failed", f"All {total_culled} culled, none jarred")
 
@@ -166,11 +166,7 @@ def _resolve_batch(
     all_batches: list[dict],
     batch_id: Optional[str] = None,
 ) -> Optional[dict]:
-    """
-    Find the batch row for this spawn. If batch_id is given, match
-    exactly that row. Otherwise, fall back to the first batch for
-    the spawn (old behavior for backward compatibility).
-    """
+    """Find the batch row for this spawn."""
     if batch_id:
         return next(
             (b for b in all_batches
@@ -187,16 +183,7 @@ def _fish_belongs_to_batch(
     *,
     scope_to_batch: bool,
 ) -> bool:
-    """
-    Decide whether a fish counts as jarred from this batch.
-
-    When scope_to_batch is False (legacy spawn-wide mode):
-      Just check fish.batch_id == spawn_id.
-
-    When scope_to_batch is True (new batch-scoped mode):
-      fish.batch_id == spawn_id  AND
-      fish.birth_date matches the batch's jarring_date (if set).
-    """
+    """Decide whether a fish counts as jarred from this batch."""
     if fish.get("batch_id") != spawn_id:
         return False
 
@@ -205,9 +192,6 @@ def _fish_belongs_to_batch(
 
     jarring_date = _iso_date_prefix(batch.get("jarring_date"))
     if not jarring_date:
-        # Batch has no jarring_date recorded — can't discriminate.
-        # Fall back to accepting the fish, but this will over-count
-        # if the spawn had multiple batches. User should set jarring_date.
         return True
 
     fish_date = _iso_date_prefix(fish.get("birth_date"))
@@ -223,13 +207,7 @@ def compute_spawn_outcome(
     *,
     batch_id: Optional[str] = None,
 ) -> dict:
-    """
-    Compute the outcome for one spawn.
-
-    Session 29 — accepts optional batch_id to scope jarred-fish
-    counts to a single fry batch. Without batch_id, falls back to
-    the old spawn-wide behavior.
-    """
+    """Compute the outcome for one spawn."""
     all_fish = get_all_fish()
     all_batches = get_all_fry_batches()
     return _compute_from_data(spawn_id, all_fish, all_batches, batch_id=batch_id)
@@ -242,13 +220,7 @@ def _compute_from_data(
     *,
     batch_id: Optional[str] = None,
 ) -> dict:
-    """
-    Internal: compute using pre-fetched data.
-
-    Session 29 — batch_id is optional. When provided, jarred-fish
-    counts are scoped to only the fish belonging to that specific
-    batch (matched by jarring_date in addition to spawn_id).
-    """
+    """Internal: compute using pre-fetched data."""
     # --- Resolve the batch row ---
     batch = _resolve_batch(spawn_id, all_batches, batch_id=batch_id)
     scope_to_batch = batch_id is not None
@@ -270,17 +242,26 @@ def _compute_from_data(
         if (f.get("status") or "").lower() not in ("culled", "deceased")
     ]
 
-    # --- Batch counts ---
-    current_count     = _safe_int(batch.get("current_count")) if batch else 0
+    # --- Batch counts (manual fields only) ---
     culled_pre        = _safe_int(batch.get("culled_count"))  if batch else 0
     female_count      = _safe_int(batch.get("female_count"))  if batch else 0
     died_count        = _safe_int(batch.get("died_count"))    if batch else 0
     initial_count     = _safe_int(batch.get("initial_count")) if batch else 0
 
-    # --- Counts for the count model ---
+    # --- Session 29/F — DERIVED current_count ---
+    # current = initial − jarred_alive − culled_jarred − culled_pre − died
     jarred_alive   = len(alive_jarred)
     culled_jarred  = len(culled_jarred_fish)
     total_culled   = culled_pre + culled_jarred
+
+    current_count = max(
+        0,
+        initial_count
+        - jarred_alive
+        - culled_jarred
+        - culled_pre
+        - died_count,
+    )
 
     # --- Grade breakdown (over alive jarred only) ---
     breakdown  = _grade_breakdown(alive_jarred)
@@ -346,13 +327,7 @@ def _compute_from_data(
 
 
 def compute_all_spawn_outcomes() -> dict[str, dict]:
-    """
-    Compute outcomes for all spawns in one pass.
-
-    NOTE: this returns spawn-wide results keyed by spawn_id, matching
-    the old behavior. To get batch-scoped results, call
-    compute_spawn_outcome(spawn_id, batch_id=...) per batch.
-    """
+    """Compute outcomes for all spawns in one pass (spawn-wide)."""
     all_spawns  = get_all_spawns()
     all_fish    = get_all_fish()
     all_batches = get_all_fry_batches()
@@ -364,14 +339,7 @@ def compute_all_spawn_outcomes() -> dict[str, dict]:
 
 
 def compute_all_batch_outcomes() -> dict[str, dict]:
-    """
-    Session 29 — compute outcomes keyed by BATCH id, scoped to each
-    batch. Use this in views that iterate batches (e.g. fry_batch_view)
-    so multi-batch spawns show per-batch numbers instead of spawn-wide
-    totals.
-
-    Returns: { batch_id: outcome_dict }
-    """
+    """Compute outcomes keyed by BATCH id, scoped to each batch."""
     all_fish    = get_all_fish()
     all_batches = get_all_fry_batches()
 
@@ -440,14 +408,11 @@ def grade_breakdown_short(outcome: dict) -> str:
 
 
 def reconciliation_html(outcome: dict) -> str:
-    """
-    Return an HTML badge showing whether the counts reconcile.
-    """
+    """Return an HTML badge showing whether the counts reconcile."""
     if not outcome.get("has_batch"):
         return ""
 
     delta = outcome.get("reconciliation_delta", 0)
-    initial = outcome.get("initial_count", 0)
 
     if abs(delta) <= 1:
         return (
