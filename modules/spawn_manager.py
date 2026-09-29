@@ -6,20 +6,16 @@
 #
 # Session 28A — create_new_spawn() accepts optional pairing_date.
 #
-# Session 29/E — Pairing duplicate guard:
-#   • get_active_pairing_fish_ids()
-#   • create_new_spawn() refuses if male == female or either parent
-#     is already on another active spawn.
-#   • Rollback on partial failure.
+# Session 29/E — Pairing duplicate guard.
 #
 # Session 30 — Round H Part 3: get_pairing_performance().
 #
-# Session 32 (this revision) — PAIRING PLANS:
-#   • list_pairing_plans / list_upcoming_pairing_plans
-#   • is_fish_planned
-#   • create_pairing_plan / update_planned_pairing / move_pairing_plan
-#   • abort_pairing_plan / start_pairing_plan
-#   • get_calendar_events — derived event list for the calendar view
+# Session 32 — PAIRING PLANS + get_calendar_events().
+#
+# Session 33 (this revision) — Jarring estimate at 2 months:
+#   • jarring_est now = pairing_date + 67 days (~2 months old)
+#     instead of + 21 days.
+#   • detail text updated to "Estimated jarring window (~2 months old)".
 
 from __future__ import annotations
 
@@ -87,6 +83,11 @@ GRADE_ORDER = [
     "Pet Grade",
 ]
 QUALITY_GRADES = {"Show Grade", "High Grade", "Breeder Grade"}
+
+# Session 33 — Jarring estimate offset (days after pairing).
+# Betta fry are typically jarred ~2 months after hatch. Free swim is
+# ~7 days after pairing, so ~60 more days ≈ 67 days from pairing.
+JARRING_OFFSET_DAYS = 67
 
 
 # ============================================================
@@ -262,11 +263,10 @@ def get_pairing_performance() -> list[dict]:
 
 
 # ============================================================
-# PAIRING PLANS  (Session 32)
+# PAIRING PLANS
 # ============================================================
 
 def list_pairing_plans(status: Optional[str] = None) -> list[dict]:
-    """List pairing plans, optionally filtered by status."""
     plans = get_all_pairing_plans()
     if status:
         plans = [p for p in plans if (p.get("status") or "") == status]
@@ -274,7 +274,6 @@ def list_pairing_plans(status: Optional[str] = None) -> list[dict]:
 
 
 def list_upcoming_pairing_plans(days_ahead: int = 60) -> list[dict]:
-    """Plans with status='planned' and planned_date within the next N days."""
     today = _dt.date.today()
     cutoff = today + _dt.timedelta(days=days_ahead)
     out = []
@@ -289,7 +288,6 @@ def list_upcoming_pairing_plans(days_ahead: int = 60) -> list[dict]:
 
 
 def is_fish_planned(fish_id: str, exclude_plan_id: Optional[str] = None) -> Optional[dict]:
-    """Return the plan if this fish is committed to any active planned pairing."""
     for p in get_all_pairing_plans():
         if (p.get("status") or "") != "planned":
             continue
@@ -308,7 +306,6 @@ def create_pairing_plan(
     line_goal: str = "",
     notes: str = "",
 ) -> Optional[dict]:
-    """Create a pairing plan with validation."""
     if male_id == female_id:
         st.error("Male and female must be different fish.")
         return None
@@ -364,7 +361,6 @@ def create_pairing_plan(
 
 
 def update_planned_pairing(plan_id: str, **fields) -> bool:
-    """Update any subset of plan fields."""
     allowed = {
         "male_id", "female_id", "tank_id",
         "planned_date", "line_goal", "notes",
@@ -376,7 +372,6 @@ def update_planned_pairing(plan_id: str, **fields) -> bool:
 
 
 def move_pairing_plan(plan_id: str, new_date: str) -> bool:
-    """Change a plan's date, keeps status='planned'."""
     plan = get_pairing_plan_by_id(plan_id)
     if not plan:
         st.error("Plan not found.")
@@ -397,7 +392,6 @@ def move_pairing_plan(plan_id: str, new_date: str) -> bool:
 
 
 def abort_pairing_plan(plan_id: str, reason: str) -> bool:
-    """Mark a plan as aborted with a required reason."""
     if not reason or not reason.strip():
         st.error("An abort reason is required.")
         return False
@@ -425,7 +419,6 @@ def abort_pairing_plan(plan_id: str, reason: str) -> bool:
 
 
 def start_pairing_plan(plan_id: str, actual_date: Optional[str] = None) -> Optional[dict]:
-    """Start a planned pairing → creates a real spawn, links spawn_id."""
     plan = get_pairing_plan_by_id(plan_id)
     if not plan:
         st.error("Plan not found.")
@@ -469,12 +462,11 @@ def start_pairing_plan(plan_id: str, actual_date: Optional[str] = None) -> Optio
 
 
 def delete_pairing_plan(plan_id: str) -> bool:
-    """Hard delete a plan."""
     return db_delete_pairing_plan(plan_id)
 
 
 # ============================================================
-# CALENDAR EVENTS  (Session 32)
+# CALENDAR EVENTS
 # ============================================================
 
 def get_calendar_events(days_ahead: int = 60) -> list[dict]:
@@ -486,7 +478,7 @@ def get_calendar_events(days_ahead: int = 60) -> list[dict]:
       • Recovery end — Recovering breeders, on started_at + recovery_days
       • Eggs due     — active spawns 'In Pairing', on pairing_date + 3d
       • Free swim    — active spawns, on pairing_date + 7d (estimate)
-      • Jarring      — active spawns, on pairing_date + 21d (estimate)
+      • Jarring      — active spawns, on pairing_date + JARRING_OFFSET_DAYS
     """
     today = _dt.date.today()
     cutoff = today + _dt.timedelta(days=days_ahead)
@@ -561,13 +553,14 @@ def get_calendar_events(days_ahead: int = 60) -> list[dict]:
                     "meta": {},
                 })
 
-            jarring_est = pairing_date + _dt.timedelta(days=21)
+            # Session 33 — Jarring estimate at ~2 months old (67 days after pairing)
+            jarring_est = pairing_date + _dt.timedelta(days=JARRING_OFFSET_DAYS)
             if today <= jarring_est <= cutoff:
                 events.append({
                     "date": jarring_est.isoformat(),
                     "kind": "jarring_est",
                     "title": f"🫙 Jarring est: {s.get('system_id')}",
-                    "detail": "Estimated jarring window",
+                    "detail": "Estimated jarring window (~2 months old)",
                     "ref_id": s["id"],
                     "ref_type": "spawn",
                     "meta": {},
@@ -618,7 +611,7 @@ def get_calendar_events(days_ahead: int = 60) -> list[dict]:
 
 
 # ============================================================
-# CREATE  (Session 8 + 28A + 29/E)
+# CREATE
 # ============================================================
 
 def create_new_spawn(
@@ -633,11 +626,7 @@ def create_new_spawn(
     Create a new spawn record.
 
     Session 28A — accepts an optional pairing_date (ISO 'YYYY-MM-DD').
-
-    Session 29/E — guards:
-      • Refuses if male == female.
-      • Refuses if either parent is already on another active spawn.
-      • Rolls back if parent-status or tank assignment fails.
+    Session 29/E — guards against duplicates + rollback on failure.
     """
     if male_id == female_id:
         st.error("Male and female must be different fish.")
@@ -735,7 +724,6 @@ def create_new_spawn(
 # ============================================================
 
 def mark_pairing_success_pending(spawn_id: str) -> bool:
-    """Move status to 'Pending (Success)'."""
     ok = update_spawn(spawn_id, {"status": "Pending (Success)"})
     if ok:
         s = get_spawn_by_id(spawn_id)
@@ -754,7 +742,6 @@ def mark_free_swimming(
     est_fry_count: int = 0,
     free_swim_date: Optional[str] = None,
 ) -> bool:
-    """Transition to Free Swimming."""
     spawn = get_spawn_by_id(spawn_id)
     if not spawn:
         return False
@@ -800,7 +787,6 @@ def mark_free_swimming(
 
 
 def mark_pairing_failed(spawn_id: str, failure_reason: str) -> bool:
-    """Mark Failed, log reason, release parents, free tank."""
     spawn = get_spawn_by_id(spawn_id)
     if not spawn:
         return False
@@ -828,7 +814,6 @@ def mark_pairing_failed(spawn_id: str, failure_reason: str) -> bool:
 
 
 def mark_completed(spawn_id: str, fry_count: Optional[int] = None) -> bool:
-    """Final close-out."""
     updates = {"status": "Completed"}
     if fry_count is not None:
         updates["fry_count"] = int(fry_count)
@@ -857,7 +842,6 @@ def update_spawn_details(
     line_goal: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> bool:
-    """Edit arbitrary fields on a spawn. Only non-None args applied."""
     updates = {}
     if batch_name is not None: updates["batch_name"] = batch_name
     if fry_count is not None:  updates["fry_count"] = int(fry_count)
@@ -880,7 +864,6 @@ def update_spawn_details(
 
 
 def delete_spawn_record(spawn_id: str) -> bool:
-    """Delete a spawn. Fish with batch_id pointing here have their FK nulled."""
     spawn = get_spawn_by_id(spawn_id)
     if not spawn:
         return False
