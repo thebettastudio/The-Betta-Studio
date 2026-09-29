@@ -308,13 +308,7 @@ def create_pairing_plan(
     line_goal: str = "",
     notes: str = "",
 ) -> Optional[dict]:
-    """
-    Create a pairing plan. Validation:
-      • male != female
-      • both fish exist
-      • neither is on an active spawn
-      • neither is on another planned pairing
-    """
+    """Create a pairing plan with validation."""
     if male_id == female_id:
         st.error("Male and female must be different fish.")
         return None
@@ -325,7 +319,6 @@ def create_pairing_plan(
         st.error("Both fish must exist.")
         return None
 
-    # Guard: neither can be on an active spawn
     active = get_active_pairing_fish_ids()
     conflicts = []
     if male_id in active:
@@ -339,7 +332,6 @@ def create_pairing_plan(
         )
         return None
 
-    # Guard: neither can be on another planned pairing
     if is_fish_planned(male_id):
         st.error(f"⛔ {sire.get('system_id')} is already on a planned pairing.")
         return None
@@ -433,11 +425,7 @@ def abort_pairing_plan(plan_id: str, reason: str) -> bool:
 
 
 def start_pairing_plan(plan_id: str, actual_date: Optional[str] = None) -> Optional[dict]:
-    """
-    Start a planned pairing now (or on a given date). Creates a real
-    spawn via create_new_spawn(), links the plan's spawn_id, marks the
-    plan as 'started'.
-    """
+    """Start a planned pairing → creates a real spawn, links spawn_id."""
     plan = get_pairing_plan_by_id(plan_id)
     if not plan:
         st.error("Plan not found.")
@@ -481,7 +469,7 @@ def start_pairing_plan(plan_id: str, actual_date: Optional[str] = None) -> Optio
 
 
 def delete_pairing_plan(plan_id: str) -> bool:
-    """Hard delete a plan (only for aborted plans or corrections)."""
+    """Hard delete a plan."""
     return db_delete_pairing_plan(plan_id)
 
 
@@ -492,17 +480,6 @@ def delete_pairing_plan(plan_id: str) -> bool:
 def get_calendar_events(days_ahead: int = 60) -> list[dict]:
     """
     Return a flat list of calendar events for the next N days.
-
-    Event shape:
-      {
-        "date":    ISO 'YYYY-MM-DD',
-        "kind":    'plan' | 'recovery_end' | 'eggs_due' | 'free_swim_est' | 'jarring_est',
-        "title":   short string,
-        "detail":  longer string,
-        "ref_id":  uuid (plan id or spawn id),
-        "ref_type":"pairing_plan" | "spawn",
-        "meta":    dict (extra data for the card)
-      }
 
     Derived events:
       • Plan         — status='planned', on planned_date
@@ -559,7 +536,6 @@ def get_calendar_events(days_ahead: int = 60) -> list[dict]:
         female = fish_by_id.get(s.get("female_id")) or {}
 
         if status == "In Pairing":
-            # Eggs due ~3 days after pairing
             eggs_due = pairing_date + _dt.timedelta(days=3)
             if today <= eggs_due <= cutoff:
                 events.append({
@@ -573,7 +549,6 @@ def get_calendar_events(days_ahead: int = 60) -> list[dict]:
                 })
 
         if status in ("In Pairing", "Pending (Success)"):
-            # Free swim estimate ~7 days after pairing
             free_swim_est = pairing_date + _dt.timedelta(days=7)
             if today <= free_swim_est <= cutoff:
                 events.append({
@@ -586,7 +561,6 @@ def get_calendar_events(days_ahead: int = 60) -> list[dict]:
                     "meta": {},
                 })
 
-            # Jarring estimate ~21 days after pairing
             jarring_est = pairing_date + _dt.timedelta(days=21)
             if today <= jarring_est <= cutoff:
                 events.append({
@@ -641,3 +615,280 @@ def get_calendar_events(days_ahead: int = 60) -> list[dict]:
 
     events.sort(key=lambda e: e["date"])
     return events
+
+
+# ============================================================
+# CREATE  (Session 8 + 28A + 29/E)
+# ============================================================
+
+def create_new_spawn(
+    male_id: str,
+    female_id: str,
+    tank_id: Optional[str] = None,
+    line_goal: str = "",
+    notes: str = "",
+    pairing_date: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Create a new spawn record.
+
+    Session 28A — accepts an optional pairing_date (ISO 'YYYY-MM-DD').
+
+    Session 29/E — guards:
+      • Refuses if male == female.
+      • Refuses if either parent is already on another active spawn.
+      • Rolls back if parent-status or tank assignment fails.
+    """
+    if male_id == female_id:
+        st.error("Male and female must be different fish.")
+        return None
+
+    sire = get_fish_by_id(male_id)
+    dam = get_fish_by_id(female_id)
+    if not sire or not dam:
+        st.error("Both parents must be valid fish.")
+        return None
+
+    active_fish_ids = get_active_pairing_fish_ids()
+    conflicts = []
+    if male_id in active_fish_ids:
+        conflicts.append(sire.get("system_id") or male_id)
+    if female_id in active_fish_ids:
+        conflicts.append(dam.get("system_id") or female_id)
+    if conflicts:
+        st.error(
+            f"⛔ Cannot start pairing — already In Pairing: "
+            f"{', '.join(conflicts)}. "
+            f"Finish or cancel that spawn first."
+        )
+        return None
+
+    line_code, generation = calculate_child_lineage(
+        male_line=sire.get("line_code") or "UNK",
+        male_gen=sire.get("generation") or "P1",
+        female_line=dam.get("line_code") or "UNK",
+        female_gen=dam.get("generation") or "P1",
+    )
+
+    system_id = generate_spawn_system_id(
+        male_line=sire.get("line_code") or "UNK",
+        male_gen=sire.get("generation") or "P1",
+        female_line=dam.get("line_code") or "UNK",
+        female_gen=dam.get("generation") or "P1",
+    )
+    spawn_code = generate_spawn_code()
+
+    resolved_pairing_date = pairing_date or _dt.date.today().isoformat()
+
+    pairing_timestamp = _dt.datetime.combine(
+        _dt.date.fromisoformat(resolved_pairing_date),
+        _dt.time(12, 0, 0),
+    ).isoformat(timespec="seconds")
+
+    record = {
+        "system_id": system_id,
+        "spawn_code": spawn_code,
+        "line_code": line_code,
+        "generation": generation,
+        "male_id": male_id,
+        "female_id": female_id,
+        "pairing_date": resolved_pairing_date,
+        "status": "In Pairing",
+        "tank_id": tank_id,
+        "line_goal": line_goal,
+        "notes": notes,
+    }
+
+    saved = create_spawn(record)
+    if not saved:
+        return None
+
+    try:
+        sync_breeder_status(male_id, "In Pairing", timestamp=pairing_timestamp)
+        sync_breeder_status(female_id, "In Pairing", timestamp=pairing_timestamp)
+
+        if tank_id:
+            from database import assign_occupant
+            assign_occupant(tank_id, None, f"Spawn {system_id}")
+    except Exception as e:
+        try:
+            delete_spawn(saved["id"])
+        except Exception:
+            pass
+        st.error(f"Pairing failed partway through — spawn rolled back. ({e})")
+        return None
+
+    log_activity(
+        action_type="spawn_created",
+        description=(
+            f"Started pairing {sire.get('system_id')} × {dam.get('system_id')} "
+            f"({system_id}) — {resolved_pairing_date}"
+        ),
+        entity_type="spawn",
+        entity_id=saved["id"],
+    )
+    return saved
+
+
+# ============================================================
+# LIFECYCLE
+# ============================================================
+
+def mark_pairing_success_pending(spawn_id: str) -> bool:
+    """Move status to 'Pending (Success)'."""
+    ok = update_spawn(spawn_id, {"status": "Pending (Success)"})
+    if ok:
+        s = get_spawn_by_id(spawn_id)
+        log_activity(
+            action_type="spawn_pending_success",
+            description=f"{s.get('system_id')} marked Pending (Success)",
+            entity_type="spawn",
+            entity_id=spawn_id,
+        )
+    return ok
+
+
+def mark_free_swimming(
+    spawn_id: str,
+    batch_name: str,
+    est_fry_count: int = 0,
+    free_swim_date: Optional[str] = None,
+) -> bool:
+    """Transition to Free Swimming."""
+    spawn = get_spawn_by_id(spawn_id)
+    if not spawn:
+        return False
+
+    resolved_free_swim_date = free_swim_date or _dt.date.today().isoformat()
+
+    free_swim_timestamp = _dt.datetime.combine(
+        _dt.date.fromisoformat(resolved_free_swim_date),
+        _dt.time(12, 0, 0),
+    ).isoformat(timespec="seconds")
+
+    ok = update_spawn(spawn_id, {
+        "status": "Free Swimming",
+        "batch_name": batch_name,
+        "free_swimming_date": resolved_free_swim_date,
+        "estimated_fry_count": int(est_fry_count or 0),
+    })
+    if not ok:
+        return False
+
+    male_id = spawn.get("male_id")
+    female_id = spawn.get("female_id")
+
+    if male_id:
+        sync_breeder_status(male_id, "Recovering", timestamp=free_swim_timestamp)
+    if female_id:
+        sync_breeder_status(female_id, "Recovering", timestamp=free_swim_timestamp)
+
+    if spawn.get("tank_id"):
+        unassign_tank(spawn["tank_id"])
+
+    log_activity(
+        action_type="spawn_free_swimming",
+        description=(
+            f"{spawn.get('system_id')} free swimming ({resolved_free_swim_date}) — "
+            f"batch '{batch_name}', ~{est_fry_count} fry. "
+            f"Male → Recovering (4d), Female → Recovering (14d)."
+        ),
+        entity_type="spawn",
+        entity_id=spawn_id,
+    )
+    return True
+
+
+def mark_pairing_failed(spawn_id: str, failure_reason: str) -> bool:
+    """Mark Failed, log reason, release parents, free tank."""
+    spawn = get_spawn_by_id(spawn_id)
+    if not spawn:
+        return False
+
+    ok = update_spawn(spawn_id, {
+        "status": "Failed",
+        "failure_reason": failure_reason or "",
+    })
+    if not ok:
+        return False
+
+    sync_breeder_status(spawn.get("male_id"), "Available")
+    sync_breeder_status(spawn.get("female_id"), "Available")
+
+    if spawn.get("tank_id"):
+        unassign_tank(spawn["tank_id"])
+
+    log_activity(
+        action_type="spawn_failed",
+        description=f"{spawn.get('system_id')} failed — {failure_reason or 'no reason given'}",
+        entity_type="spawn",
+        entity_id=spawn_id,
+    )
+    return True
+
+
+def mark_completed(spawn_id: str, fry_count: Optional[int] = None) -> bool:
+    """Final close-out."""
+    updates = {"status": "Completed"}
+    if fry_count is not None:
+        updates["fry_count"] = int(fry_count)
+
+    ok = update_spawn(spawn_id, updates)
+    if ok:
+        s = get_spawn_by_id(spawn_id)
+        log_activity(
+            action_type="spawn_completed",
+            description=f"{s.get('system_id')} completed",
+            entity_type="spawn",
+            entity_id=spawn_id,
+        )
+    return ok
+
+
+# ============================================================
+# EDIT
+# ============================================================
+
+def update_spawn_details(
+    spawn_id: str,
+    batch_name: Optional[str] = None,
+    fry_count: Optional[int] = None,
+    status: Optional[str] = None,
+    line_goal: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> bool:
+    """Edit arbitrary fields on a spawn. Only non-None args applied."""
+    updates = {}
+    if batch_name is not None: updates["batch_name"] = batch_name
+    if fry_count is not None:  updates["fry_count"] = int(fry_count)
+    if status is not None:     updates["status"] = status
+    if line_goal is not None:  updates["line_goal"] = line_goal
+    if notes is not None:      updates["notes"] = notes
+
+    if not updates:
+        return False
+
+    ok = update_spawn(spawn_id, updates)
+    if ok:
+        log_activity(
+            action_type="spawn_updated",
+            description=f"Updated {spawn_id}: {', '.join(updates.keys())}",
+            entity_type="spawn",
+            entity_id=spawn_id,
+        )
+    return ok
+
+
+def delete_spawn_record(spawn_id: str) -> bool:
+    """Delete a spawn. Fish with batch_id pointing here have their FK nulled."""
+    spawn = get_spawn_by_id(spawn_id)
+    if not spawn:
+        return False
+    ok = delete_spawn(spawn_id)
+    if ok:
+        log_activity(
+            action_type="spawn_deleted",
+            description=f"Deleted {spawn.get('system_id')}",
+            entity_type="spawn",
+        )
+    return ok
