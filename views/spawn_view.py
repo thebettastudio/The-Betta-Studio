@@ -8,15 +8,16 @@
 # Session 28A/B1 — Start New Pairing: Pairing Date picker;
 #   Mark Free Swimming: Free Swim Date picker.
 #
-# Session 29/E — Pairing duplicate guard:
-#   • Male / Female dropdowns exclude fish already In Pairing.
-#   • Success / error messages survive st.rerun() via session_state.
+# Session 29/E — Pairing duplicate guard.
 #
-# Session 30 — Round H Part 3 (this revision):
-#   • New "📊 Pairing Performance" tab: per parent-pair rollup of
-#     batches, fry, grade counts, and quality score.
-#   • Uses get_pairing_performance() from spawn_manager.
-#   • No changes to existing tabs.
+# Session 30 — Round H Part 3: Pairing Performance tab.
+#   Breeder-only pairing dropdowns.
+#
+# Session 32 (this revision) — PAIRING PLANS:
+#   • Start New Pairing tab now has a radio "Start now / Plan for later"
+#   • Planning mode: creates a pairing_plan instead of a spawn
+#   • Uses create_pairing_plan + is_fish_planned from spawn_manager
+#   • No changes to other tabs
 
 import datetime
 from typing import Optional
@@ -36,6 +37,8 @@ from modules.spawn_manager import (
     update_spawn_details,
     get_active_pairing_fish_ids,
     get_pairing_performance,
+    create_pairing_plan,
+    is_fish_planned,
 )
 from modules.fish_manager import (
     get_fish_dropdown_items,
@@ -63,10 +66,8 @@ from modules.spawn_outcome import (
 
 _SPAWN_MESSAGE_KEY = "_spawn_pending_message"
 
-# Session 30 — breeder_status values that are eligible for pairing.
 PAIRABLE_BREEDER_STATUSES = {"Available", "Conditioning", "Ready", "Idle"}
 
-# Grade order for the pairing performance table.
 GRADE_COLUMNS = [
     "Show Grade",
     "High Grade",
@@ -105,7 +106,6 @@ def _drain_spawn_message() -> None:
 # ============================================================
 
 def _fish_display(fish: Optional[dict], fallback_id: str = "?") -> dict:
-    """Return a display-friendly dict from a fish row, with safe fallbacks."""
     if not fish:
         return {
             "system_id": fallback_id,
@@ -126,7 +126,6 @@ def _fish_display(fish: Optional[dict], fallback_id: str = "?") -> dict:
 
 
 def _render_breeder_block(fish: dict, fallback_id: str, gender_label: str):
-    """Render one breeder's info + image. Compact 2-column inner layout."""
     info = _fish_display(fish, fallback_id)
     col_info, col_img = st.columns([2, 1.5])
 
@@ -145,7 +144,6 @@ def _render_breeder_block(fish: dict, fallback_id: str, gender_label: str):
 
 
 def _default_batch_name(spawn: dict) -> str:
-    """Generate a default batch name from line_code + generation."""
     line = (spawn.get("line_code") or "").strip()
     gen = (spawn.get("generation") or "").strip()
     if not line or line == "UNK" or len(line) > 12:
@@ -372,7 +370,7 @@ def render_active_pairings_tab():
 
 
 # ============================================================
-# TAB 2: START NEW PAIRING
+# TAB 2: START NEW PAIRING  (Session 32 — with Plan mode)
 # ============================================================
 
 def _render_lineage_check(male_uuid: str, female_uuid: str) -> dict:
@@ -418,7 +416,6 @@ def render_start_pairing_tab():
 
     already_paired = get_active_pairing_fish_ids()
 
-    # Session 30 — breeder-only filter.
     males_dd, females_dd = [], []
     for f in all_fish:
         if not f.get("system_id"):
@@ -481,6 +478,25 @@ def render_start_pairing_tab():
         )
         return
 
+    # Session 32 — Start now vs Plan for later
+    st.markdown("##### Mode")
+    mode = st.radio(
+        "Do you want to start this pairing now, or plan it for a future date?",
+        options=["▶️ Start now", "📅 Plan for later"],
+        horizontal=True,
+        key="pairing_mode",
+        label_visibility="collapsed",
+    )
+
+    is_plan_mode = mode.startswith("📅")
+
+    if is_plan_mode:
+        st.info(
+            "📅 **Planning mode.** This creates a reminder on the Pairing Calendar. "
+            "You can start, move, or abort it any time.",
+            icon="📅",
+        )
+
     if not tank_dd:
         st.error("⚠️ No available Spawning-purpose tanks. Create or free up a tank first.")
         return
@@ -492,6 +508,7 @@ def render_start_pairing_tab():
             "Select Male Breeder",
             options=range(len(males_dd)),
             format_func=lambda i: males_dd[i]["label"],
+            key="start_male_sel",
         )
         male_uuid = males_dd[male_idx]["id"]
 
@@ -499,28 +516,55 @@ def render_start_pairing_tab():
             "Select Spawning Tank",
             options=range(len(tank_dd)),
             format_func=lambda i: tank_dd[i]["label"],
+            key="start_tank_sel",
         )
         tank_uuid = tank_dd[tank_idx]["id"]
 
-        pairing_date = st.date_input(
-            "Pairing Date",
-            value=datetime.date.today(),
-            key="pairing_date_new",
-            help="Backdate if the pairing started earlier. Both parents' "
-                 "breeding countdowns start from this date.",
-        )
+        if is_plan_mode:
+            planned_date = st.date_input(
+                "Planned Pairing Date",
+                value=datetime.date.today() + datetime.timedelta(days=7),
+                key="planned_pairing_date",
+                help="Target date for this pairing. You can move it later.",
+            )
+            pairing_date = None
+        else:
+            pairing_date = st.date_input(
+                "Pairing Date",
+                value=datetime.date.today(),
+                key="pairing_date_new",
+                help="Backdate if the pairing started earlier. Both parents' "
+                     "breeding countdowns start from this date.",
+            )
+            planned_date = None
 
     with col2:
         female_idx = st.selectbox(
             "Select Female Breeder",
             options=range(len(females_dd)),
             format_func=lambda i: females_dd[i]["label"],
+            key="start_female_sel",
         )
         female_uuid = females_dd[female_idx]["id"]
 
         line_goal = st.text_input(
             "Line / Breeding Goal",
             placeholder="e.g. Improve caudal spread & clean dorsal",
+            key="start_line_goal",
+        )
+
+    # Session 32 — check for conflicting plans
+    male_conflict = is_fish_planned(male_uuid)
+    female_conflict = is_fish_planned(female_uuid)
+    conflicts = []
+    if male_conflict:
+        conflicts.append(f"♂️ {males_dd[male_idx]['label'].split('|')[0].strip()} is already planned for {male_conflict.get('planned_date')}")
+    if female_conflict:
+        conflicts.append(f"♀️ {females_dd[female_idx]['label'].split('|')[0].strip()} is already planned for {female_conflict.get('planned_date')}")
+    if conflicts:
+        st.warning(
+            "⚠️ **Planned-pairing conflict.**\n\n- " + "\n- ".join(conflicts),
+            icon="📅",
         )
 
     lineage_result = _render_lineage_check(male_uuid, female_uuid)
@@ -546,6 +590,7 @@ def render_start_pairing_tab():
     notes = st.text_area(
         "Pairing Notes",
         placeholder="e.g. Both pre-conditioned for 7 days on bloodworms",
+        key="start_notes",
     )
 
     dangerous = lineage_result.get("level") == "dangerous"
@@ -558,35 +603,67 @@ def render_start_pairing_tab():
 
     submit_disabled = dangerous and not confirm_dangerous
 
+    if is_plan_mode:
+        btn_label = "📅 Save Plan"
+        btn_key = "plan_pairing_btn"
+    else:
+        btn_label = "💞 Initiate Pairing"
+        btn_key = "start_pairing_btn"
+
     if st.button(
-        "💞 Initiate Pairing",
+        btn_label,
         type="primary",
         use_container_width=True,
         disabled=submit_disabled,
+        key=btn_key,
     ):
-        with st.spinner("Setting up pairing..."):
-            saved = create_new_spawn(
+        if is_plan_mode:
+            saved_plan = create_pairing_plan(
                 male_id=male_uuid,
                 female_id=female_uuid,
+                planned_date=str(planned_date),
                 tank_id=tank_uuid,
                 line_goal=line_goal,
                 notes=notes,
-                pairing_date=str(pairing_date),
             )
-        if not saved:
-            _queue_spawn_message(
-                "error",
-                "Failed to create spawn — see message above.",
-            )
-            st.rerun()
+            if not saved_plan:
+                _queue_spawn_message(
+                    "error",
+                    "Failed to save plan — see message above.",
+                )
+                st.rerun()
+            else:
+                _queue_spawn_message(
+                    "success",
+                    f"📅 Pairing planned for **{planned_date}** — "
+                    f"{male_fish.get('system_id')} × {female_fish.get('system_id')}. "
+                    f"Open **📅 Pairing Calendar** to see it.",
+                )
+                st.rerun()
         else:
-            _queue_spawn_message(
-                "success",
-                f"Pairing initiated! **{saved.get('system_id')}** "
-                f"(code: {saved.get('spawn_code')}) assigned to tank — "
-                f"pairing date {pairing_date}.",
-            )
-            st.rerun()
+            with st.spinner("Setting up pairing..."):
+                saved = create_new_spawn(
+                    male_id=male_uuid,
+                    female_id=female_uuid,
+                    tank_id=tank_uuid,
+                    line_goal=line_goal,
+                    notes=notes,
+                    pairing_date=str(pairing_date),
+                )
+            if not saved:
+                _queue_spawn_message(
+                    "error",
+                    "Failed to create spawn — see message above.",
+                )
+                st.rerun()
+            else:
+                _queue_spawn_message(
+                    "success",
+                    f"Pairing initiated! **{saved.get('system_id')}** "
+                    f"(code: {saved.get('spawn_code')}) assigned to tank — "
+                    f"pairing date {pairing_date}.",
+                )
+                st.rerun()
 
 
 # ============================================================
@@ -669,7 +746,7 @@ def render_history_tab():
 
 
 # ============================================================
-# TAB 4: PAIRING PERFORMANCE  (Session 30 — Round H Part 3)
+# TAB 4: PAIRING PERFORMANCE
 # ============================================================
 
 def render_pairing_performance_tab():
@@ -688,7 +765,6 @@ def render_pairing_performance_tab():
         )
         return
 
-    # Build display DataFrame
     df_rows = []
     for r in rows:
         counts = r.get("counts") or {}
@@ -731,7 +807,6 @@ def render_pairing_performance_tab():
 
     st.markdown("---")
 
-    # --- Top / bottom callouts ---
     top = rows[0] if rows else None
     bottom = rows[-1] if len(rows) > 1 else None
 
