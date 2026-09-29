@@ -8,12 +8,17 @@
 # Session 28A/B1 — Start New Pairing: Pairing Date picker;
 #   Mark Free Swimming: Free Swim Date picker.
 #
-# Session 29/E (this revision) — Pairing duplicate guard:
+# Session 29/E — Pairing duplicate guard:
 #   • Male / Female dropdowns exclude fish already In Pairing
 #     on another active spawn (via get_active_pairing_fish_ids).
 #   • Success / error messages survive st.rerun() via session_state.
-#   • Clearer empty-state when no available males/females.
-#   • All other UI unchanged.
+#
+# Session 30 (this revision) — Breeder-only pairing dropdowns:
+#   • Dropdowns now show only PROMOTED breeders (is_breeder = True).
+#   • Non-breeders, retired/inactive breeders, and anything already
+#     In Pairing are excluded.
+#   • Each dropdown item shows breeder_status (Available/Ready/etc).
+#   • Clearer empty-state messages pointing to Fish Registry.
 
 import datetime
 from typing import Optional
@@ -58,6 +63,9 @@ from modules.spawn_outcome import (
 # ============================================================
 
 _SPAWN_MESSAGE_KEY = "_spawn_pending_message"
+
+# Session 30 — breeder_status values that are eligible for pairing.
+PAIRABLE_BREEDER_STATUSES = {"Available", "Conditioning", "Ready", "Idle"}
 
 
 # ============================================================
@@ -403,23 +411,47 @@ def render_start_pairing_tab():
     from database import get_all_fish
     all_fish = get_all_fish()
 
-    # Session 29/E — fish already In Pairing on an active spawn
     already_paired = get_active_pairing_fish_ids()
 
+    # Session 30 — breeder-only filter.
+    # Only PROMOTED breeders with a pairable breeder_status appear.
+    # Non-breeders, retired/inactive breeders, fish already In Pairing,
+    # and fish with non-active statuses are all excluded.
     males_dd, females_dd = [], []
     for f in all_fish:
         if not f.get("system_id"):
             continue
+
+        # Must be a promoted breeder
+        if not f.get("is_breeder"):
+            continue
+
+        bs = (f.get("breeder_status") or "").strip()
+
+        # Exclude "In Pairing" even without an active spawn (orphan state)
+        if bs == "In Pairing":
+            continue
+
+        # Must be in a pairable breeder status
+        if bs not in PAIRABLE_BREEDER_STATUSES:
+            continue
+
+        # Skip non-active fish statuses
         status = (f.get("status") or "").lower()
         if status in ("deceased", "sold", "retired", "culled"):
             continue
-        # Session 29/E — skip fish that are already pairing
+
+        # Skip fish already on an active pairing
         if f["id"] in already_paired:
             continue
+
         gender = (f.get("gender") or "").lower()
         item = {
             "id": f["id"],
-            "label": f"{f['system_id']} | {f.get('variety') or 'no variety'}",
+            "label": (
+                f"{f['system_id']} | {f.get('variety') or 'no variety'}"
+                f" | {bs}"
+            ),
         }
         if gender == "male":
             males_dd.append(item)
@@ -430,17 +462,26 @@ def render_start_pairing_tab():
 
     if not males_dd and not females_dd:
         st.warning(
-            "⚠️ All breeders are currently In Pairing. Finish or cancel an "
-            "existing pairing before starting a new one."
+            "⚠️ No promoted breeders available for pairing. "
+            "Go to **Fish Registry**, open a fish, and click "
+            "**⭐ Promote to Breeder** to make it selectable here."
         )
         return
 
     if not males_dd:
-        st.warning("⚠️ No available Male breeders — all males are In Pairing or inactive.")
+        st.warning(
+            "⚠️ No promoted **Male** breeders available. "
+            "Promote a male in Fish Registry, or check that existing "
+            "breeders aren't already In Pairing."
+        )
         return
 
     if not females_dd:
-        st.warning("⚠️ No available Female breeders — all females are In Pairing or inactive.")
+        st.warning(
+            "⚠️ No promoted **Female** breeders available. "
+            "Promote a female in Fish Registry, or check that existing "
+            "breeders aren't already In Pairing."
+        )
         return
 
     if not tank_dd:
@@ -637,7 +678,6 @@ def render_history_tab():
 def render_spawn_page():
     st.title("🧬 Pair & Spawn Tracker")
 
-    # Session 29/E — replay any pending pairing message from prior run
     _drain_spawn_message()
 
     tab1, tab2, tab3 = st.tabs([
