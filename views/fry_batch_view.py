@@ -9,14 +9,13 @@
 # Session 29 — Fry batch fixes + M/F layout.
 # Session 29/C — Batch-scoped outcomes.
 # Session 29/D — Undo Jar + Delete Batch & Fish.
+# Session 29/F — DERIVED current_count.
 #
-# Session 29/F (this revision) — DERIVED current_count:
-#   • Update Counts popover no longer has a "Current" input.
-#     It now has "Initial fry count" (editable) + a read-only
-#     caption showing the derived Current.
-#   • Jar Fry handler no longer calls set_current_count().
-#   • Batch card shows a red warning when the derived Current
-#     would be negative (data inconsistency signal).
+# Session 30 — Round H Part 2 (this revision):
+#   • New Quality panel on each batch card: per-grade counts +
+#     visual bar + quality score (Option C layout).
+#   • Uses get_batch_grade_breakdown() from fry_batch_manager.
+#   • No other behavior changed.
 
 import datetime
 from typing import Optional
@@ -31,8 +30,10 @@ from modules.fry_batch_manager import (
     create_batch_from_spawn,
     get_batch_parents,
     count_batch_jarred_fish,
+    get_batch_grade_breakdown,
     edit_batch,
     advance_stage,
+    set_current_count,
     assign_batch_tank,
     jar_fry_bulk,
     undo_batch_jar,
@@ -40,6 +41,7 @@ from modules.fry_batch_manager import (
     delete_batch_and_fish,
     VALID_STAGES,
     ACTIVE_STAGES,
+    GRADE_ORDER,
 )
 from modules.tank_registry import get_tank_dropdown_items
 from modules.fish_manager import (
@@ -84,6 +86,23 @@ MF_COL_WEIGHT = 65
 
 _JAR_MESSAGE_KEY = "_fry_jar_pending_message"
 _DANGER_MESSAGE_KEY = "_fry_danger_pending_message"
+
+# Session 30 — grade bar styling
+GRADE_EMOJI = {
+    "Show Grade":     "🏆",
+    "High Grade":     "🥇",
+    "Breeder Grade":  "🥈",
+    "Material Grade": "🥉",
+    "Pet Grade":      "🐟",
+}
+GRADE_BAR_COLOR = {
+    "Show Grade":     "#FFD700",
+    "High Grade":     "#C0C0C0",
+    "Breeder Grade":  "#CD7F32",
+    "Material Grade": "#9CA3AF",
+    "Pet Grade":      "#D1D5DB",
+}
+GRADE_BAR_WIDTH = 24  # max blocks per row
 
 
 # ============================================================
@@ -161,6 +180,74 @@ def _drain_message(key: str) -> None:
         st.error(text)
     else:
         st.info(text)
+
+
+# ============================================================
+# QUALITY PANEL (Session 30 — Round H Part 2)
+# ============================================================
+
+def _render_quality_panel(batch: dict):
+    """
+    Renders per-grade counts + a visual bar + quality score for the
+    fish jarred by this batch.
+
+    Layout (Option C):
+        Batch AVT-F1 (45 fry)  Quality: 51%
+
+        🏆 Show     ██               3
+        🥇 High     ██████           8
+        🥈 Breeder  █████████       12
+        🥉 Material ███████████     15
+        🐟 Pet      █████            7
+    """
+    breakdown = get_batch_grade_breakdown(batch)
+
+    if not breakdown.get("has_data"):
+        st.markdown("##### 📊 Batch Quality")
+        st.caption("_No graded fish in this batch yet. Grade fish via their Milestones or Molt Checks._")
+        return
+
+    total = breakdown["total"]
+    counts = breakdown["counts"]
+    quality = breakdown["quality_score"]
+    batch_tag = batch.get("batch_tag") or "?"
+
+    st.markdown("##### 📊 Batch Quality")
+    st.markdown(
+        f'<div style="font-size:13px;color:#6B7280;margin-bottom:8px;">'
+        f'<b>{batch_tag}</b> ({total} fish) &nbsp;·&nbsp; '
+        f'<b style="color:#111827;">Quality: {quality}%</b>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Compute the max for bar scaling
+    max_count = max(counts.values()) if counts else 0
+
+    # Build one row per grade tier
+    rows_html = []
+    for grade in GRADE_ORDER:
+        count = counts.get(grade, 0)
+        emoji = GRADE_EMOJI.get(grade, "•")
+        color = GRADE_BAR_COLOR.get(grade, "#9CA3AF")
+        # Scale blocks relative to the max
+        blocks = (
+            int(round((count / max_count) * GRADE_BAR_WIDTH))
+            if max_count > 0 else 0
+        )
+        bar = "█" * blocks if blocks > 0 else ""
+        # pad the bar with invisible spaces so columns line up
+        padded_bar = bar.ljust(GRADE_BAR_WIDTH, "\u2007")
+
+        rows_html.append(
+            f'<div style="font-family:monospace;font-size:13px;'
+            f'line-height:1.65;white-space:pre;">'
+            f'{emoji} {grade:<14} <span style="color:{color};">{padded_bar}</span>'
+            f'<span style="color:#6B7280; margin-left:8px;">{count:>3}</span>'
+            f'</div>'
+        )
+
+    st.markdown("".join(rows_html), unsafe_allow_html=True)
 
 
 # ============================================================
@@ -486,8 +573,6 @@ def _render_jar_popover(batch: dict):
             )
 
             if created:
-                # Session 29/F — derived count updates automatically.
-                # No set_current_count() call.
                 new_derived = max(0, current_count - len(created))
 
                 if failed:
@@ -519,7 +604,7 @@ def _render_jar_popover(batch: dict):
 
 
 # ============================================================
-# COUNTS POPOVER  (Session 29/F — derived Current)
+# COUNTS POPOVER
 # ============================================================
 
 def _render_counts_popover(batch: dict):
@@ -534,7 +619,6 @@ def _render_counts_popover(batch: dict):
             "Edit Initial, Culled, Died, or Females below."
         )
 
-        # --- Read-only derived Current ---
         st.markdown(
             f'<div style="background:#F3F4F6;border-radius:8px;padding:10px;'
             f'margin-bottom:8px;">'
@@ -546,7 +630,6 @@ def _render_counts_popover(batch: dict):
             unsafe_allow_html=True,
         )
 
-        # --- Editable Initial ---
         new_initial = st.number_input(
             "Initial fry count (total at hatch)",
             min_value=0,
@@ -556,7 +639,6 @@ def _render_counts_popover(batch: dict):
             help="Total fry counted at hatch. If wrong, correct it here.",
         )
 
-        # --- Editable Culled (pre-jar) ---
         new_culled_pre = st.number_input(
             "Culled (pre-jar)",
             min_value=0,
@@ -565,7 +647,6 @@ def _render_counts_popover(batch: dict):
             key=f"count_culled_{batch_uuid}",
         )
 
-        # --- Editable Died ---
         new_died = st.number_input(
             "Died (natural loss, pre-jar)",
             min_value=0,
@@ -574,7 +655,6 @@ def _render_counts_popover(batch: dict):
             key=f"count_died_{batch_uuid}",
         )
 
-        # --- Editable Female count ---
         new_female = st.number_input(
             "Female count (kept in sorority)",
             min_value=0,
@@ -769,7 +849,6 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         if hint:
             st.info(hint, icon="⏰")
 
-        # Session 29/F — negative-derived warning
         if derived.get("negative_warning"):
             st.error(
                 f"⚠️ **Data inconsistency.** Derived Current would be "
@@ -798,12 +877,15 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         if batch.get("notes"):
             st.info(batch["notes"])
 
+        # ---- Outcome | Quality | Parents ----
         if outcome and outcome.get("verdict_key") not in ("unknown",):
             st.divider()
             col_outcome, col_mf = st.columns([OUTCOME_COL_WEIGHT, MF_COL_WEIGHT])
 
             with col_outcome:
                 _render_outcome_panel(outcome)
+                st.divider()
+                _render_quality_panel(batch)
 
             with col_mf:
                 with st.container(border=True):
