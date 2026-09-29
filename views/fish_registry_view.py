@@ -6,13 +6,16 @@
 # Session 28A/B3 — Register form: Birth Date picker (defaults today);
 #   passes birth_date to register_new_fish().
 #
-# Session 28B — Round 3 (this revision): PERFORMANCE
-#   • Batched fish→tank location map (get_all_occupants_for_fish +
-#     cached get_all_tanks) replaces per-tile/per-row DB calls.
-#   • _get_available_tank_options() now @st.cache_data(ttl=45).
-#   • Grid tiles, table rows, and Manage popovers all read from
-#     the pre-built map instead of N+1 queries.
-#   • No visible behavior change.
+# Session 28B — Round 3: batched fish→tank map, cached tank options.
+#
+# Session 30 (this revision) — Round H Part 1:
+#   • Molt check popover: added Grade selector to 3mo + 4mo forms.
+#     Saving the grade updates fish.grade immediately.
+#   • Milestone add form: added Grade selector.
+#     Grade is saved on the milestone row AND written through to
+#     fish.grade via add_milestone()'s write-through.
+#   • Current readings display now shows the fish's grade.
+#   • No other behavior changed.
 
 import io
 import datetime
@@ -89,6 +92,7 @@ from modules.fish_milestones import (
     compute_trend,
     suggest_action,
     MILESTONE_INTERVAL_DAYS,
+    VALID_MILESTONE_GRADES,
 )
 from modules.color_detector import (
     analyze_photo,
@@ -240,18 +244,12 @@ def _delete_strain(name: str) -> bool:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def _get_available_tank_options() -> list[dict]:
-    """Cached (Session 28B) — was hitting DB on every call, including
-    once per fish tile inside the Manage popover."""
+    """Cached (Session 28B)."""
     return get_tank_dropdown_items()
 
 
 def _build_fish_location_map() -> dict[str, dict]:
-    """
-    Session 28B — build { fish_id: tank_row } in two queries total.
-
-    Replaces N calls to _get_current_tank_for_fish() in grid tiles,
-    table rows, and Manage popovers.
-    """
+    """Session 28B — build { fish_id: tank_row } in two queries total."""
     try:
         occupants_by_fish = get_all_occupants_for_fish()
     except Exception:
@@ -275,10 +273,7 @@ def _build_fish_location_map() -> dict[str, dict]:
 
 
 def _get_current_tank_for_fish(fish_id: str) -> Optional[dict]:
-    """
-    Slow-path fallback (unchanged). Grid/table/actions no longer call
-    this in a loop — they receive a pre-built map instead.
-    """
+    """Slow-path fallback. Grid/table/actions no longer call this in a loop."""
     try:
         occupants = get_occupants_for_fish(fish_id)
     except Exception:
@@ -1098,7 +1093,7 @@ def _render_side_photos_popover(fish: dict):
 
 
 # ============================================================
-# 🎨 MOLT CHECKS POPOVER
+# 🎨 MOLT CHECKS POPOVER  (Session 30 — Grade added)
 # ============================================================
 
 def _molt_status_banner(fish: dict, age_days: Optional[int]):
@@ -1131,7 +1126,8 @@ def _render_molt_checks_popover(fish: dict):
         st.markdown(f"### 🎨 Molt Checks — {system_id}")
         st.caption(
             "Variety starts as a placeholder (parent cross). "
-            "Record 3-month and 4-month readings as the fish colors up."
+            "Record 3-month and 4-month readings as the fish colors up. "
+            "Setting a Grade here also updates the fish's grade."
         )
 
         _molt_status_banner(fish, age_days)
@@ -1144,11 +1140,13 @@ def _render_molt_checks_popover(fish: dict):
         d3 = fish.get("variety_3mo_date") or ""
         v4 = fish.get("variety_4mo") or "—"
         d4 = fish.get("variety_4mo_date") or ""
+        current_grade = fish.get("grade") or "—"
 
         st.markdown(f"**Initial (registration):** `{initial}`")
         st.markdown(f"**3-month reading:** `{v3}` {'— ' + str(d3) if d3 else ''}")
         st.markdown(f"**4-month reading:** `{v4}` {'— ' + str(d4) if d4 else ''}")
         st.markdown(f"**Displayed variety:** **{variety_of(fish)}**")
+        st.markdown(f"**Current Grade:** `{current_grade}`")
 
         st.markdown("---")
         st.markdown("**📝 Record 3-month reading**")
@@ -1170,6 +1168,21 @@ def _render_molt_checks_popover(fish: dict):
                 value=datetime.date.today(),
                 key=f"molt3_d_{fish_uuid}",
             )
+
+            # Session 30 — grade at 3mo
+            cur_grade = fish.get("grade") or "Pet Grade"
+            grade_idx = (
+                VALID_MILESTONE_GRADES.index(cur_grade)
+                if cur_grade in VALID_MILESTONE_GRADES else 0
+            )
+            new_g3 = st.selectbox(
+                "Grade (3mo)",
+                options=VALID_MILESTONE_GRADES,
+                index=grade_idx,
+                key=f"molt3_g_{fish_uuid}",
+                help="Set the fish's grade based on form + color + overall quality.",
+            )
+
             save3 = st.form_submit_button("Save 3-month reading", type="primary", use_container_width=True)
 
         if save3:
@@ -1179,9 +1192,10 @@ def _render_molt_checks_popover(fish: dict):
                 ok = edit_fish(fish_uuid, {
                     "variety_3mo": new_v3,
                     "variety_3mo_date": str(new_d3),
+                    "grade": new_g3,
                 })
                 if ok:
-                    st.success(f"3-month reading saved: {new_v3}")
+                    st.success(f"3-month reading saved: {new_v3} — grade {new_g3}")
                     st.rerun()
 
         st.markdown("---")
@@ -1204,6 +1218,21 @@ def _render_molt_checks_popover(fish: dict):
                 value=datetime.date.today(),
                 key=f"molt4_d_{fish_uuid}",
             )
+
+            # Session 30 — grade at 4mo
+            cur_grade = fish.get("grade") or "Pet Grade"
+            grade_idx = (
+                VALID_MILESTONE_GRADES.index(cur_grade)
+                if cur_grade in VALID_MILESTONE_GRADES else 0
+            )
+            new_g4 = st.selectbox(
+                "Grade (4mo)",
+                options=VALID_MILESTONE_GRADES,
+                index=grade_idx,
+                key=f"molt4_g_{fish_uuid}",
+                help="Set the fish's final grade based on form + color + overall quality.",
+            )
+
             save4 = st.form_submit_button("Save 4-month reading", type="primary", use_container_width=True)
 
         if save4:
@@ -1213,14 +1242,15 @@ def _render_molt_checks_popover(fish: dict):
                 ok = edit_fish(fish_uuid, {
                     "variety_4mo": new_v4,
                     "variety_4mo_date": str(new_d4),
+                    "grade": new_g4,
                 })
                 if ok:
-                    st.success(f"4-month reading saved: {new_v4}")
+                    st.success(f"4-month reading saved: {new_v4} — grade {new_g4}")
                     st.rerun()
 
 
 # ============================================================
-# MILESTONE UI
+# MILESTONE UI  (Session 30 — Grade added to add form)
 # ============================================================
 
 def _render_milestone_add_form(fish: dict):
@@ -1267,6 +1297,20 @@ def _render_milestone_add_form(fish: dict):
                 key=f"m_shape_{fish_uuid}",
             )
 
+        # Session 30 — grade at milestone
+        cur_grade = fish.get("grade") or "Pet Grade"
+        grade_idx = (
+            VALID_MILESTONE_GRADES.index(cur_grade)
+            if cur_grade in VALID_MILESTONE_GRADES else 0
+        )
+        m_grade = st.selectbox(
+            "Grade",
+            options=VALID_MILESTONE_GRADES,
+            index=grade_idx,
+            key=f"m_grade_{fish_uuid}",
+            help="Setting a grade here updates the fish's grade immediately.",
+        )
+
         st.caption("Optional re-score (leave blank to skip):")
         chk_col, _ = st.columns([3, 2])
         with chk_col:
@@ -1306,6 +1350,7 @@ def _render_milestone_add_form(fish: dict):
         form_score=score,
         body_shape=m_shape,
         fin_checks=checks if any_check else {},
+        grade=m_grade,
         notes=notes,
     )
 
@@ -1338,6 +1383,8 @@ def _render_milestone_timeline(milestones: list[dict]):
                 st.caption("📷 *No photo*")
             if m.get("form_score") is not None:
                 st.caption(f"Score: **{m['form_score']}**")
+            if m.get("grade"):
+                st.caption(f"Grade: **{m['grade']}**")
             if m.get("body_shape"):
                 st.caption(f"Shape: {m['body_shape']}")
             if m.get("notes"):
@@ -1371,11 +1418,7 @@ def _render_milestones_section(fish: dict, milestones: list[dict]):
 # ============================================================
 
 def _render_card_actions(fish: dict, fish_location: Optional[dict] = None):
-    """
-    Session 28B — accepts optional fish_location (tank row) so we
-    don't hit the DB again per tile. Falls back to the slow path if
-    called standalone.
-    """
+    """Session 28B — accepts optional fish_location (tank row)."""
     fish_uuid = fish["id"]
     system_id = fish.get("system_id") or "?"
     current_status = (fish.get("status") or "").lower()
@@ -1427,7 +1470,6 @@ def _render_card_actions(fish: dict, fish_location: Optional[dict] = None):
                     st.rerun()
 
     if current_status not in ("culled", "deceased", "retired"):
-        # Session 28B — use pre-built location map when provided.
         if fish_location is not None:
             current_tank = fish_location
         else:
@@ -1584,10 +1626,7 @@ def _render_highlight_strip(all_fish: list[dict], milestone_counts: dict):
 
 def _render_grid_tile(fish: dict, milestone_count: int = 0,
                       fish_location: Optional[dict] = None):
-    """
-    Session 28B — accepts optional fish_location (tank row) so we
-    don't hit the DB per tile. Falls back to slow path if absent.
-    """
+    """Session 28B — accepts optional fish_location (tank row)."""
     system_id = fish.get("system_id") or "?"
     status = (fish.get("status") or "Active").lower()
     is_culled = status in ("culled", "deceased")
@@ -1641,7 +1680,6 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0,
         if fish.get("iridescence_level") and fish["iridescence_level"] != "none":
             badges.append(f"✨ {fish['iridescence_level']}")
 
-        # Session 28B — use pre-built location map when provided.
         if fish_location is not None:
             current_tank = fish_location
         else:
@@ -1684,10 +1722,7 @@ def _render_grid_tile(fish: dict, milestone_count: int = 0,
 
 def _render_table_view(filtered: list[dict], milestone_counts: dict,
                        location_map: Optional[dict] = None):
-    """
-    Session 28B — accepts optional location_map {fish_id: tank_row}
-    so we don't fire N per-row DB calls.
-    """
+    """Session 28B — accepts optional location_map {fish_id: tank_row}."""
     location_map = location_map or {}
     rows = []
     for f in filtered:
@@ -1697,7 +1732,6 @@ def _render_table_view(filtered: list[dict], milestone_counts: dict,
 
         current_tank = location_map.get(f["id"])
         if current_tank is None and not location_map:
-            # Only fall back to slow path when no map was provided at all.
             current_tank = _get_current_tank_for_fish(f["id"])
         tank_loc = current_tank.get("location_code") if current_tank else "—"
 
@@ -1751,7 +1785,6 @@ def render_list_tab():
 
     milestone_counts = get_milestone_counts_by_fish()
 
-    # Session 28B — one batched location map for the whole page.
     location_map = _build_fish_location_map()
 
     alive = [
