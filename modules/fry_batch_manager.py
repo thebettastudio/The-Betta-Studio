@@ -463,7 +463,6 @@ def undo_batch_jar(
                 failed += 1
                 continue
 
-            # Optionally delete the Drive file(s) first.
             if delete_photos:
                 try:
                     from modules.photo_service import delete_drive_file
@@ -471,7 +470,6 @@ def undo_batch_jar(
                         if f.get(key):
                             delete_drive_file(f[key])
                 except Exception:
-                    # Non-fatal — proceed with row delete.
                     pass
 
             ok = delete_fish(fid)
@@ -480,14 +478,12 @@ def undo_batch_jar(
             else:
                 failed += 1
 
-        # Restore count + clear jarring state
         restored_count = (batch.get("current_count") or 0) + deleted
         current_stage = (batch.get("stage") or "").lower()
         updates = {
             "current_count": restored_count,
             "jarring_date": None,
         }
-        # Only step back to free_swimming if we were still in jarred.
         if current_stage == "jarred":
             updates["stage"] = "free_swimming"
 
