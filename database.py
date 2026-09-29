@@ -15,9 +15,15 @@
 #               birth_date; advance_breeder_status() normalizes timestamps.
 # Session 28B — PERFORMANCE OPTIMIZATION ROUND 1: caching, batch
 #               occupant fetch, cache invalidation.
-# Session 30 (this revision) — Round H Part 1:
-#   • MILESTONE_FIELDS: added "grade" so grades set at molt/milestone
-#     are persisted on the milestone row.
+# Session 30 — MILESTONE_FIELDS: added "grade".
+# Session 31 — (no database.py change; Round G deferred count was
+#               handled with existing nullable column).
+# Session 32 (this revision) — PAIRING PLANS:
+#   • New table pairing_plans (created via SQL migration).
+#   • PAIRING_PLAN_FIELDS whitelist + CRUD helpers:
+#     get_all_pairing_plans, get_pairing_plan_by_id,
+#     create_pairing_plan, update_pairing_plan, delete_pairing_plan.
+#   • "get_all_pairing_plans" added to _CACHE_NAMES.
 
 from __future__ import annotations
 
@@ -48,13 +54,11 @@ def _now_iso() -> str:
 
 
 # ============================================================
-# CACHE CONTROL  (Session 28B)
+# CACHE CONTROL
 # ============================================================
 
-# TTL in seconds for cached reads.
 CACHE_TTL = 45
 
-# Names used by invalidate_all_caches() / _bust_cache().
 _CACHE_NAMES = (
     "get_all_fish",
     "get_all_tanks",
@@ -63,6 +67,7 @@ _CACHE_NAMES = (
     "get_all_strains",
     "get_all_tank_occupants",
     "get_milestone_counts_by_fish",
+    "get_all_pairing_plans",
 )
 
 
@@ -96,13 +101,10 @@ FISH_FIELDS = [
     "breeder_status_started_at",
     "birth_date",
     "notes",
-    # molt checkpoints (Session 27A Q1)
     "variety_3mo", "variety_3mo_date",
     "variety_4mo", "variety_4mo_date",
-    # color analysis (Session 26A)
     "color_primary", "color_secondary", "color_palette",
     "pattern_hint", "iridescence_level",
-    # starring (Session 26H.7 Step 5)
     "is_starred", "starred_reason",
 ]
 
@@ -129,10 +131,7 @@ STAGE_LABELS = {
 
 
 def _fish_age_date(fish: dict) -> Optional[_dt.date]:
-    """
-    Return the date to use for age/stage computation.
-    Prefers birth_date (may be backdated); falls back to created_at.
-    """
+    """Return the date to use for age/stage computation."""
     birth = fish.get("birth_date")
     if birth:
         try:
@@ -197,22 +196,7 @@ FEMALE_RECOVERY_DAYS = 14
 
 
 def advance_breeder_status(fish: dict) -> Optional[str]:
-    """
-    Auto-flip a fish's breeder_status if its current state has
-    exceeded its duration.
-
-    Rules (Session 27A Q2):
-      MALE:
-        Recovering   → after 4 days  → Conditioning
-        Conditioning → after 10 days → Available
-      FEMALE:
-        Recovering   → after 14 days → Available
-
-    Returns the new breeder_status if a flip happened, else None.
-
-    Session 28A fix — normalizes both timestamps to UTC-aware before
-    subtracting, so naive and aware values can be compared safely.
-    """
+    """Auto-flip a fish's breeder_status if its duration has expired."""
     bs = (fish.get("breeder_status") or "").strip()
     started = fish.get("breeder_status_started_at")
     if not bs or not started:
@@ -248,7 +232,7 @@ def advance_breeder_status(fish: dict) -> Optional[str]:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_fish() -> list[dict]:
-    """Return every fish row, newest first. Cached (Session 28B)."""
+    """Return every fish row, newest first."""
     try:
         res = _sb().table("fish").select("*").order("created_at", desc=True).execute()
         return res.data or []
@@ -258,7 +242,6 @@ def get_all_fish() -> list[dict]:
 
 
 def get_fish_by_id(fish_id: str) -> Optional[dict]:
-    """Fetch one fish by its uuid."""
     try:
         res = _sb().table("fish").select("*").eq("id", fish_id).limit(1).execute()
         return (res.data or [None])[0]
@@ -268,7 +251,6 @@ def get_fish_by_id(fish_id: str) -> Optional[dict]:
 
 
 def get_fish_by_system_id(system_id: str) -> Optional[dict]:
-    """Fetch one fish by its human-readable ID (e.g. FISH-0042)."""
     try:
         res = _sb().table("fish").select("*").eq("system_id", system_id).limit(1).execute()
         return (res.data or [None])[0]
@@ -278,7 +260,6 @@ def get_fish_by_system_id(system_id: str) -> Optional[dict]:
 
 
 def create_fish(data: dict) -> Optional[dict]:
-    """Insert a new fish row. `data` keys must match FISH_FIELDS."""
     payload = {k: data.get(k) for k in FISH_FIELDS if k in data}
     try:
         res = _sb().table("fish").insert(payload).execute()
@@ -290,7 +271,6 @@ def create_fish(data: dict) -> Optional[dict]:
 
 
 def update_fish(fish_id: str, updates: dict) -> bool:
-    """Update a fish row by uuid. Only FISH_FIELDS keys are accepted."""
     payload = {k: v for k, v in updates.items() if k in FISH_FIELDS}
     if not payload:
         return False
@@ -314,7 +294,6 @@ def delete_fish(fish_id: str) -> bool:
 
 
 def promote_fish_to_breeder(fish_id: str, breeder_status: str = "Available") -> bool:
-    """Flip is_breeder=true and set breeder_status."""
     return update_fish(fish_id, {
         "is_breeder": True,
         "breeder_status": breeder_status,
@@ -324,7 +303,6 @@ def promote_fish_to_breeder(fish_id: str, breeder_status: str = "Available") -> 
 
 
 def retire_fish(fish_id: str, reason: str = "", extra_notes: str = "") -> bool:
-    """Retire a breeder — clears tank link, sets status."""
     fish = get_fish_by_id(fish_id)
     if not fish:
         return False
@@ -347,7 +325,6 @@ def retire_fish(fish_id: str, reason: str = "", extra_notes: str = "") -> bool:
 
 
 def get_available_breeders() -> list[dict]:
-    """Active breeders ready for pairing."""
     try:
         res = (_sb().table("fish")
                .select("*")
@@ -361,7 +338,6 @@ def get_available_breeders() -> list[dict]:
 
 
 def get_next_fish_sequence(prefix: str = "FISH-") -> str:
-    """Generate FISH-NNNN by counting existing system_ids with the prefix."""
     try:
         res = _sb().table("fish").select("system_id").like("system_id", f"{prefix}%").execute()
         nums = []
@@ -382,7 +358,6 @@ def get_next_fish_sequence(prefix: str = "FISH-") -> str:
 # ============================================================
 
 def get_fish_photos(fish_id: str) -> list[dict]:
-    """All side photos for a fish, newest first."""
     try:
         res = (_sb().table("fish_photos")
                .select("*")
@@ -404,7 +379,6 @@ def add_fish_photo(
     analysis: Optional[dict] = None,
     notes: str = "",
 ) -> Optional[dict]:
-    """Add a side photo for a fish."""
     try:
         record = {
             "fish_id": fish_id,
@@ -423,7 +397,6 @@ def add_fish_photo(
 
 
 def set_profile_photo(fish_id: str, photo_id: str) -> bool:
-    """Mark a photo as the profile for a fish."""
     try:
         (_sb().table("fish_photos")
          .update({"is_profile": False})
@@ -444,7 +417,6 @@ def set_profile_photo(fish_id: str, photo_id: str) -> bool:
 
 
 def delete_fish_photo(photo_row_id: str) -> bool:
-    """Delete a fish_photos row (does NOT delete the Drive file)."""
     try:
         _sb().table("fish_photos").delete().eq("id", photo_row_id).execute()
         return True
@@ -479,7 +451,6 @@ RESERVATION_FIELDS = [
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_tanks() -> list[dict]:
-    """Return every tank row. Cached (Session 28B)."""
     try:
         res = _sb().table("tanks").select("*").order("created_at", desc=True).execute()
         return res.data or []
@@ -523,7 +494,6 @@ def update_tank(tank_id: str, updates: dict) -> bool:
 
 
 def delete_tank(tank_id: str) -> bool:
-    """Raw delete — does NOT check occupants."""
     try:
         _sb().table("tanks").delete().eq("id", tank_id).execute()
         invalidate_all_caches()
@@ -534,7 +504,6 @@ def delete_tank(tank_id: str) -> bool:
 
 
 def get_next_tank_sequence() -> str:
-    """Sequential integer string ("1", "2", "3", ...)."""
     try:
         res = _sb().table("tanks").select("system_id").execute()
         nums = [int(r["system_id"]) for r in (res.data or []) if str(r.get("system_id", "")).isdigit()]
@@ -545,7 +514,6 @@ def get_next_tank_sequence() -> str:
 
 
 def get_tank_stats() -> dict:
-    """Dashboard-level tank counts. Available = Empty / Idle only."""
     tanks = get_all_tanks()
 
     def _c(label: str) -> int:
@@ -567,9 +535,6 @@ def get_tank_stats() -> dict:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_tank_occupants() -> dict[str, list[dict]]:
-    """
-    Session 28B — batch fetch every tank occupant in ONE query.
-    """
     try:
         res = (_sb().table("tank_occupants")
                .select("*")
@@ -587,9 +552,6 @@ def get_all_tank_occupants() -> dict[str, list[dict]]:
 
 
 def get_all_occupants_for_fish() -> dict[str, list[dict]]:
-    """
-    Session 28B — batch fish→tanks lookup.
-    """
     try:
         all_occ = get_all_tank_occupants()
         by_fish: dict[str, list[dict]] = {}
@@ -606,7 +568,6 @@ def get_all_occupants_for_fish() -> dict[str, list[dict]]:
 
 
 def get_tank_occupants(tank_id: str) -> list[dict]:
-    """All occupants of a tank. Uses batch cache when available."""
     try:
         batch = get_all_tank_occupants()
         if batch:
@@ -626,7 +587,6 @@ def get_tank_occupants(tank_id: str) -> list[dict]:
 
 
 def get_occupants_for_fish(fish_id: str) -> list[dict]:
-    """Find which tank(s) a fish is in."""
     try:
         res = (_sb().table("tank_occupants")
                .select("*")
@@ -640,7 +600,6 @@ def get_occupants_for_fish(fish_id: str) -> list[dict]:
 
 
 def get_occupants_for_fry_batch(batch_id: str) -> list[dict]:
-    """Find which tank(s) a fry batch is in."""
     try:
         res = (_sb().table("tank_occupants")
                .select("*")
@@ -660,7 +619,6 @@ def add_tank_occupant(
     role: str = "primary",
     spawn_id: Optional[str] = None,
 ) -> Optional[dict]:
-    """Add an occupant to a tank. Auto-cancels any reservation."""
     try:
         tank = get_tank_by_id(tank_id)
         if tank and tank.get("status") == "Reserved":
@@ -693,7 +651,6 @@ def add_tank_occupant(
 
 
 def remove_tank_occupant(tank_id: str, occupant_type: str, occupant_id: str) -> bool:
-    """Remove an occupant from a tank."""
     try:
         (_sb().table("tank_occupants")
          .delete()
@@ -710,14 +667,11 @@ def remove_tank_occupant(tank_id: str, occupant_type: str, occupant_id: str) -> 
         return False
 
 
-# ---------- Backward-compat wrappers ----------
-
 def assign_occupant(
     tank_id: str,
     fish_id: Optional[str],
     label: Optional[str] = None,
 ) -> bool:
-    """Backward-compatible occupant assignment."""
     try:
         if fish_id:
             if not label:
@@ -749,7 +703,6 @@ def assign_occupant(
 
 
 def clear_occupant(tank_id: str) -> bool:
-    """Remove ALL occupants from a tank."""
     try:
         occupants = get_tank_occupants(tank_id)
 
@@ -770,10 +723,7 @@ def clear_occupant(tank_id: str) -> bool:
         return False
 
 
-# ---------- Internal cache refresh ----------
-
 def _stash_reservation_warning(tank: dict) -> None:
-    """Record a one-shot warning for the UI that a reservation was auto-cancelled."""
     try:
         warnings = st.session_state.setdefault("_reservation_warnings", [])
         warnings.append({
@@ -788,7 +738,6 @@ def _stash_reservation_warning(tank: dict) -> None:
 
 
 def _refresh_tank_cache(tank_id: str) -> None:
-    """Recompute occupant_fish_id / occupant_label / status for a tank."""
     try:
         occupants = get_tank_occupants(tank_id)
         current = get_tank_by_id(tank_id)
@@ -843,8 +792,6 @@ def _refresh_tank_cache(tank_id: str) -> None:
         st.error(f"_refresh_tank_cache failed: {e}")
 
 
-# ---------- Transfer ----------
-
 def transfer_occupant(
     fish_id: str,
     from_tank_id: Optional[str],
@@ -852,7 +799,6 @@ def transfer_occupant(
     role: str = "primary",
     occupant_type: str = "fish",
 ) -> bool:
-    """Move an occupant (fish OR fry batch) from one tank to another."""
     try:
         if from_tank_id:
             remove_tank_occupant(from_tank_id, occupant_type, fish_id)
@@ -869,13 +815,10 @@ def transfer_occupant(
         return False
 
 
-# ---------- Safe delete ----------
-
 def delete_tank_safely_impl(
     tank_id: str,
     transfers: Optional[dict] = None,
 ) -> tuple[bool, str]:
-    """Delete a tank only if it has no occupants, OR if transfers map is complete."""
     try:
         tank = get_tank_by_id(tank_id)
         if not tank:
@@ -925,7 +868,6 @@ def reserve_tank(
     reserved_until: Optional[str] = None,
     reserved_ref_id: Optional[str] = None,
 ) -> bool:
-    """Set a reservation on a tank. Cannot reserve a tank with occupants."""
     try:
         tank = get_tank_by_id(tank_id)
         if not tank:
@@ -950,7 +892,6 @@ def reserve_tank(
 
 
 def cancel_reservation(tank_id: str) -> bool:
-    """Clear reservation and flip to Empty / Idle."""
     try:
         return update_tank(tank_id, {
             "status": "Empty / Idle",
@@ -965,7 +906,6 @@ def cancel_reservation(tank_id: str) -> bool:
 
 
 def move_reservation(from_tank_id: str, to_tank_id: str) -> bool:
-    """Move a reservation from one tank to another."""
     try:
         src = get_tank_by_id(from_tank_id)
         if not src or src.get("status") != "Reserved":
@@ -995,7 +935,6 @@ def move_reservation(from_tank_id: str, to_tank_id: str) -> bool:
 
 
 def get_expiring_reservations(days_ahead: int = 3) -> list[dict]:
-    """Reservations whose reserved_until is within days_ahead days or already past."""
     try:
         today = _dt.date.today()
         cutoff = today + _dt.timedelta(days=days_ahead)
@@ -1021,7 +960,6 @@ def regenerate_tape_code(
     tank_id: str,
     new_purpose: str,
 ) -> Optional[tuple[str, str]]:
-    """Regenerate a tank's tape code after a purpose change."""
     try:
         from modules.id_generator import generate_tape_code
 
@@ -1065,7 +1003,6 @@ SPAWN_FIELDS = [
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_spawns() -> list[dict]:
-    """Return every spawn row, newest first. Cached (Session 28B)."""
     try:
         res = _sb().table("spawns").select("*").order("created_at", desc=True).execute()
         return res.data or []
@@ -1118,7 +1055,6 @@ def delete_spawn(spawn_id: str) -> bool:
 
 
 def get_next_spawn_code() -> str:
-    """SPN-YY-NN, resetting per year."""
     yy = _dt.date.today().strftime("%y")
     prefix = f"SPN-{yy}-"
     try:
@@ -1141,7 +1077,6 @@ def get_next_spawn_code() -> str:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_strains() -> list[dict]:
-    """Return every strain row, ordered by name. Cached (Session 28B)."""
     try:
         res = _sb().table("strains").select("*").order("name").execute()
         return res.data or []
@@ -1163,7 +1098,6 @@ def create_strain(name: str, line_code: str = "", description: str = "") -> Opti
 
 
 def delete_strain(strain_id: str) -> bool:
-    """Delete a strain by uuid."""
     try:
         _sb().table("strains").delete().eq("id", strain_id).execute()
         invalidate_all_caches()
@@ -1229,7 +1163,6 @@ FRY_BATCH_FIELDS = [
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_all_fry_batches() -> list[dict]:
-    """Return every fry batch row, newest first. Cached (Session 28B)."""
     try:
         res = _sb().table("fry_batches").select("*").order("created_at", desc=True).execute()
         return res.data or []
@@ -1263,7 +1196,6 @@ def update_fry_batch(batch_id: str, updates: dict) -> bool:
 
 
 def get_fry_batch_by_id(batch_id: str) -> Optional[dict]:
-    """Fetch one fry batch by uuid."""
     try:
         res = _sb().table("fry_batches").select("*").eq("id", batch_id).limit(1).execute()
         return (res.data or [None])[0]
@@ -1273,7 +1205,6 @@ def get_fry_batch_by_id(batch_id: str) -> Optional[dict]:
 
 
 def get_fry_batches_for_spawn(spawn_id: str) -> list[dict]:
-    """All batches linked to a specific spawn."""
     try:
         res = (_sb().table("fry_batches")
                .select("*")
@@ -1287,7 +1218,6 @@ def get_fry_batches_for_spawn(spawn_id: str) -> list[dict]:
 
 
 def delete_fry_batch(batch_id: str) -> bool:
-    """Delete a fry batch by uuid."""
     try:
         _sb().table("fry_batches").delete().eq("id", batch_id).execute()
         invalidate_all_caches()
@@ -1310,7 +1240,6 @@ MILESTONE_FIELDS = [
 
 
 def get_milestones_for_fish(fish_id: str) -> list[dict]:
-    """All milestones for a fish, newest first."""
     try:
         res = (_sb().table("fish_milestones")
                .select("*")
@@ -1324,7 +1253,6 @@ def get_milestones_for_fish(fish_id: str) -> list[dict]:
 
 
 def get_milestone_by_id(milestone_id: str) -> Optional[dict]:
-    """Fetch one milestone by uuid."""
     try:
         res = _sb().table("fish_milestones").select("*").eq("id", milestone_id).limit(1).execute()
         return (res.data or [None])[0]
@@ -1334,7 +1262,6 @@ def get_milestone_by_id(milestone_id: str) -> Optional[dict]:
 
 
 def create_milestone(data: dict) -> Optional[dict]:
-    """Insert a milestone. `data` keys must match MILESTONE_FIELDS."""
     payload = {k: data.get(k) for k in MILESTONE_FIELDS if k in data}
     try:
         res = _sb().table("fish_milestones").insert(payload).execute()
@@ -1346,7 +1273,6 @@ def create_milestone(data: dict) -> Optional[dict]:
 
 
 def update_milestone(milestone_id: str, updates: dict) -> bool:
-    """Update a milestone. Only MILESTONE_FIELDS keys are accepted."""
     payload = {k: v for k, v in updates.items() if k in MILESTONE_FIELDS}
     if not payload:
         return False
@@ -1360,7 +1286,6 @@ def update_milestone(milestone_id: str, updates: dict) -> bool:
 
 
 def delete_milestone(milestone_id: str) -> bool:
-    """Delete a milestone by uuid."""
     try:
         _sb().table("fish_milestones").delete().eq("id", milestone_id).execute()
         _bust_cache("get_milestone_counts_by_fish")
@@ -1372,12 +1297,6 @@ def delete_milestone(milestone_id: str) -> bool:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_milestone_counts_by_fish() -> dict:
-    """
-    Returns { fish_id: count } for all fish that have milestones.
-
-    Session 28B — uses Supabase count aggregation (head=True) per
-    distinct fish_id so we never fetch row bodies.
-    """
     counts: dict[str, int] = {}
     try:
         ids_res = _sb().table("fish_milestones").select("fish_id").execute()
@@ -1415,11 +1334,81 @@ def get_milestone_counts_by_fish() -> dict:
 
 
 # ============================================================
+# PAIRING PLANS  (Session 32)
+# ============================================================
+
+PAIRING_PLAN_FIELDS = [
+    "male_id", "female_id", "tank_id",
+    "planned_date", "status",
+    "abort_reason", "spawn_id",
+    "line_goal", "notes",
+    "updated_at",
+]
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def get_all_pairing_plans() -> list[dict]:
+    """All pairing plans, newest planned_date first. Cached."""
+    try:
+        res = (_sb().table("pairing_plans")
+               .select("*")
+               .order("planned_date", desc=True)
+               .execute())
+        return res.data or []
+    except Exception as e:
+        st.error(f"get_all_pairing_plans failed: {e}")
+        return []
+
+
+def get_pairing_plan_by_id(plan_id: str) -> Optional[dict]:
+    try:
+        res = (_sb().table("pairing_plans").select("*").eq("id", plan_id).limit(1).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"get_pairing_plan_by_id failed: {e}")
+        return None
+
+
+def create_pairing_plan(data: dict) -> Optional[dict]:
+    payload = {k: data.get(k) for k in PAIRING_PLAN_FIELDS if k in data}
+    try:
+        res = _sb().table("pairing_plans").insert(payload).execute()
+        invalidate_all_caches()
+        return (res.data or [None])[0]
+    except Exception as e:
+        st.error(f"create_pairing_plan failed: {e}")
+        return None
+
+
+def update_pairing_plan(plan_id: str, updates: dict) -> bool:
+    payload = {k: v for k, v in updates.items() if k in PAIRING_PLAN_FIELDS}
+    payload["updated_at"] = _now_iso()
+    if not payload:
+        return False
+    try:
+        _sb().table("pairing_plans").update(payload).eq("id", plan_id).execute()
+        invalidate_all_caches()
+        return True
+    except Exception as e:
+        st.error(f"update_pairing_plan failed: {e}")
+        return False
+
+
+def delete_pairing_plan(plan_id: str) -> bool:
+    try:
+        _sb().table("pairing_plans").delete().eq("id", plan_id).execute()
+        invalidate_all_caches()
+        return True
+    except Exception as e:
+        st.error(f"delete_pairing_plan failed: {e}")
+        return False
+
+
+# ============================================================
 # DASHBOARD AGGREGATES
 # ============================================================
 
 def get_dashboard_counts() -> dict:
-    """Returns the KPI numbers the dashboard needs in one call."""
     try:
         fish = _sb().table("fish").select("id,is_breeder,breeder_status,status,gender").execute().data or []
         tanks = _sb().table("tanks").select("id,status").execute().data or []
