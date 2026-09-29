@@ -10,6 +10,14 @@
 #   - If last 2+ scores are rising → suggest promote to breeder
 #   - If last 2+ scores are falling → suggest reconsider / retire
 #   - Otherwise → no suggestion
+#
+# Session 30 — Round H Part 1 (this revision):
+#   • add_milestone() accepts optional `grade`. When passed, it's stored
+#     on the milestone record AND written back to fish.grade so the fish
+#     row's grade stays current after a molt/milestone check.
+#   • edit_milestone() accepts optional `grade` in updates with the same
+#     write-through behavior.
+#   • Activity log notes the grade when it's set.
 
 from __future__ import annotations
 
@@ -24,6 +32,7 @@ from database import (
     update_milestone,
     delete_milestone,
     get_fish_by_id,
+    update_fish,
     log_activity,
 )
 from modules.photo_service import upload_photo, delete_drive_file
@@ -39,6 +48,15 @@ MILESTONE_INTERVAL_DAYS = 30
 TREND_DELTA = 5              # min score change to count as "rising"/"falling"
 MIN_TREND_POINTS = 2         # need this many milestones to even suggest
 PROMOTE_SCORE_FLOOR = 70     # only suggest promote if latest score >= this
+
+# Valid grades — kept in sync with fish_manager.VALID_GRADES
+VALID_MILESTONE_GRADES = [
+    "Show Grade",
+    "High Grade",
+    "Breeder Grade",
+    "Material Grade",
+    "Pet Grade",
+]
 
 
 # ============================================================
@@ -60,8 +78,20 @@ def _latest_milestone(milestones: list[dict]) -> Optional[dict]:
     """Return the newest milestone by date."""
     if not milestones:
         return None
-    # Assume caller passes them sorted newest-first from get_milestones_for_fish
     return milestones[0]
+
+
+def _write_grade_through(fish_id: str, grade: str) -> None:
+    """
+    Session 30 — write the grade to the fish row so it stays current.
+    Non-fatal: logs a warning if it fails.
+    """
+    if not grade:
+        return
+    try:
+        update_fish(fish_id, {"grade": grade})
+    except Exception as e:
+        st.warning(f"Milestone saved, but fish grade update failed: {e}")
 
 
 def milestone_is_due(fish: dict, milestones: list[dict]) -> bool:
@@ -193,16 +223,24 @@ def add_milestone(
     form_score: Optional[int] = None,
     body_shape: str = "",
     fin_checks: Optional[dict] = None,
+    grade: Optional[str] = None,
     notes: str = "",
 ) -> Optional[dict]:
     """
     Add a milestone. Uploads photo to Drive if provided.
     Logs activity on success.
+
+    Session 30 — accepts optional `grade`. When passed, it's saved on
+    the milestone AND written back to the fish row (fish.grade) so the
+    fish stays current after a molt/milestone check.
     """
     fish = get_fish_by_id(fish_id)
     if not fish:
         st.error("Fish not found.")
         return None
+
+    # Normalize grade: empty string → None
+    resolved_grade = (grade or "").strip() or None
 
     photo_id = None
     if photo_file is not None:
@@ -218,20 +256,28 @@ def add_milestone(
         "form_score": form_score,
         "body_shape": body_shape or None,
         "fin_checks": fin_checks or {},
+        "grade": resolved_grade,
         "notes": notes or None,
     }
 
     saved = create_milestone(record)
-    if saved:
-        log_activity(
-            action_type="fish_milestone_added",
-            description=(
-                f"Milestone for {fish.get('system_id')}"
-                + (f" (score {form_score})" if form_score is not None else "")
-            ),
-            entity_type="fish",
-            entity_id=fish_id,
-        )
+    if not saved:
+        return None
+
+    # Session 30 — write-through to fish.grade
+    if resolved_grade:
+        _write_grade_through(fish_id, resolved_grade)
+
+    log_activity(
+        action_type="fish_milestone_added",
+        description=(
+            f"Milestone for {fish.get('system_id')}"
+            + (f" (score {form_score})" if form_score is not None else "")
+            + (f" — grade set to {resolved_grade}" if resolved_grade else "")
+        ),
+        entity_type="fish",
+        entity_id=fish_id,
+    )
     return saved
 
 
@@ -241,7 +287,12 @@ def edit_milestone(
     photo_file=None,
     updates: Optional[dict] = None,
 ) -> bool:
-    """Edit an existing milestone. If photo_file is passed, replaces the photo."""
+    """
+    Edit an existing milestone. If photo_file is passed, replaces the photo.
+
+    Session 30 — if `updates` contains a 'grade', it's written through
+    to the parent fish row so fish.grade stays current.
+    """
     updates = dict(updates or {})
 
     if photo_file is not None:
@@ -255,7 +306,22 @@ def edit_milestone(
             if old_photo:
                 delete_drive_file(old_photo)
 
-    return update_milestone(milestone_id, updates)
+    # Capture grade before applying (for write-through)
+    grade_change = updates.get("grade")
+    fish_id_for_grade = None
+    if grade_change:
+        from database import get_milestone_by_id
+        ms = get_milestone_by_id(milestone_id)
+        if ms:
+            fish_id_for_grade = ms.get("fish_id")
+
+    ok = update_milestone(milestone_id, updates)
+
+    # Session 30 — write-through to fish.grade
+    if ok and grade_change and fish_id_for_grade:
+        _write_grade_through(fish_id_for_grade, grade_change)
+
+    return ok
 
 
 def remove_milestone(milestone_id: str) -> bool:
@@ -289,7 +355,6 @@ def get_fish_due_for_milestone() -> list[dict]:
     Uses the same rule as milestone_is_due().
     """
     from database import get_all_fish
-    from database import get_milestone_counts_by_fish  # not needed but keep imports lazy
 
     due = []
     for fish in get_all_fish():
