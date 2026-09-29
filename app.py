@@ -6,12 +6,13 @@
 # Session 26B — WebRTC test page removed from production.
 # Session 26E — Temp Video Debug page added to sidebar nav.
 #
-# Session 27B — Round 3A (this revision):
-#   • Removed the Video Debug nav entry + import (file deleted)
-#   • Auto-run process_breeder_transitions() on app load — flips
-#     Recovering → Conditioning → Available based on elapsed time
-#     (Session 27A Q2)
-#   • Removed the temp Video Debug nav item
+# Session 27B — Round 3A:
+#   • Removed the Video Debug nav entry + import.
+#   • Auto-run process_breeder_transitions() on app load.
+#
+# Session 32 (this revision) — PAIRING CALENDAR:
+#   • Added import + sidebar entry + routing for the new
+#     📅 Pairing Calendar page.
 
 import datetime
 
@@ -28,6 +29,7 @@ from views.fry_batch_view       import render_fry_batch_page
 from views.lineage_view         import render_lineage_page
 from views.lines_view           import render_lines_page
 from views.inheritance_view     import render_inheritance_page
+from views.pairing_calendar_view import render_pairing_calendar_page
 from modules.dashboard          import render_dashboard
 
 
@@ -133,7 +135,6 @@ def _run_load_time_transitions():
         if flipped:
             st.toast(f"⚙️ Auto-flipped {flipped} breeder status(es).", icon="🔁")
     except Exception as e:
-        # Non-fatal: log and continue
         print(f"process_breeder_transitions issue: {e}")
     st.session_state["_breeder_transitions_ran"] = True
 
@@ -173,7 +174,7 @@ def run_supabase_diagnostic():
 
         st.divider()
         st.caption(
-            f"Session: 27B · Build: {datetime.date.today().isoformat()}"
+            f"Session: 32 · Build: {datetime.date.today().isoformat()}"
         )
 
 
@@ -190,6 +191,7 @@ page = st.sidebar.radio("Navigation", [
     "🐟 Breeder Registry",
     "🪣 Tank & Container Registry",
     "❤️ Pair & Spawn Tracker",
+    "📅 Pairing Calendar",
     "🐣 Fry Batch Tracking",
     "🌳 Lineage Tree",
     "🧬 Lines & Varieties",
@@ -224,6 +226,8 @@ elif page == "🪣 Tank & Container Registry":
     render_tank_page()
 elif page == "❤️ Pair & Spawn Tracker":
     render_spawn_page()
+elif page == "📅 Pairing Calendar":
+    render_pairing_calendar_page()
 elif page == "🐣 Fry Batch Tracking":
     render_fry_batch_page()
 elif page == "🌳 Lineage Tree":
