@@ -11,11 +11,15 @@
 # Session 29/D — Undo Jar + Delete Batch & Fish.
 # Session 29/F — DERIVED current_count.
 #
-# Session 30 — Round H Part 2 (this revision):
-#   • New Quality panel on each batch card: per-grade counts +
-#     visual bar + quality score (Option C layout).
-#   • Uses get_batch_grade_breakdown() from fry_batch_manager.
-#   • No other behavior changed.
+# Session 30 — Round H Part 2: Batch Quality panel.
+#
+# Session 31 — Round G (this revision) — DEFERRED INITIAL COUNT:
+#   • Create Batch form has "Skip initial count (count later)" checkbox.
+#   • Batch card shows ⏳ Awaiting count badge when deferred.
+#   • New "📝 Set Initial Count" button opens a modal to set it later.
+#   • List filter adds "Awaiting count".
+#   • Stats row adds an "Awaiting count" metric.
+#   • Outcome panel hides Initial/Current/Survival while deferred.
 
 import datetime
 from typing import Optional
@@ -31,6 +35,8 @@ from modules.fry_batch_manager import (
     get_batch_parents,
     count_batch_jarred_fish,
     get_batch_grade_breakdown,
+    is_count_deferred,
+    set_initial_count,
     edit_batch,
     advance_stage,
     set_current_count,
@@ -87,7 +93,6 @@ MF_COL_WEIGHT = 65
 _JAR_MESSAGE_KEY = "_fry_jar_pending_message"
 _DANGER_MESSAGE_KEY = "_fry_danger_pending_message"
 
-# Session 30 — grade bar styling
 GRADE_EMOJI = {
     "Show Grade":     "🏆",
     "High Grade":     "🥇",
@@ -102,7 +107,7 @@ GRADE_BAR_COLOR = {
     "Material Grade": "#9CA3AF",
     "Pet Grade":      "#D1D5DB",
 }
-GRADE_BAR_WIDTH = 24  # max blocks per row
+GRADE_BAR_WIDTH = 24
 
 
 # ============================================================
@@ -122,7 +127,9 @@ def _format_date(val) -> str:
         return str(val)
 
 
-def _survival_label(survival: Optional[float]) -> str:
+def _survival_label(survival: Optional[float], deferred: bool = False) -> str:
+    if deferred:
+        return "—"
     if survival is None:
         return "—"
     return f"{survival * 100:.0f}%"
@@ -183,23 +190,49 @@ def _drain_message(key: str) -> None:
 
 
 # ============================================================
-# QUALITY PANEL (Session 30 — Round H Part 2)
+# SET INITIAL COUNT MODAL
+# ============================================================
+
+@st.dialog("📝 Set Initial Count")
+def _modal_set_initial_count(batch: dict):
+    batch_uuid = batch["id"]
+    batch_tag = batch.get("batch_tag") or "?"
+
+    st.caption(
+        f"Enter the final fry count for batch **{batch_tag}**. "
+        f"This becomes the Initial value used in all metrics."
+    )
+
+    new_count = st.number_input(
+        "Initial fry count",
+        min_value=0,
+        value=0,
+        step=1,
+        key=f"modal_initial_{batch_uuid}",
+    )
+
+    col_cancel, col_save = st.columns(2)
+
+    with col_cancel:
+        if st.button("Cancel", use_container_width=True, key=f"modal_cancel_{batch_uuid}"):
+            st.rerun()
+
+    with col_save:
+        if st.button("Save", type="primary", use_container_width=True, key=f"modal_save_{batch_uuid}"):
+            if set_initial_count(batch_uuid, int(new_count)):
+                _queue_message(
+                    _DANGER_MESSAGE_KEY, "success",
+                    f"Initial count set to **{new_count}** for batch '{batch_tag}'.",
+                )
+                st.rerun()
+
+
+# ============================================================
+# QUALITY PANEL
 # ============================================================
 
 def _render_quality_panel(batch: dict):
-    """
-    Renders per-grade counts + a visual bar + quality score for the
-    fish jarred by this batch.
-
-    Layout (Option C):
-        Batch AVT-F1 (45 fry)  Quality: 51%
-
-        🏆 Show     ██               3
-        🥇 High     ██████           8
-        🥈 Breeder  █████████       12
-        🥉 Material ███████████     15
-        🐟 Pet      █████            7
-    """
+    """Per-grade counts + visual bar + quality score (Option C)."""
     breakdown = get_batch_grade_breakdown(batch)
 
     if not breakdown.get("has_data"):
@@ -221,22 +254,18 @@ def _render_quality_panel(batch: dict):
         unsafe_allow_html=True,
     )
 
-    # Compute the max for bar scaling
     max_count = max(counts.values()) if counts else 0
 
-    # Build one row per grade tier
     rows_html = []
     for grade in GRADE_ORDER:
         count = counts.get(grade, 0)
         emoji = GRADE_EMOJI.get(grade, "•")
         color = GRADE_BAR_COLOR.get(grade, "#9CA3AF")
-        # Scale blocks relative to the max
         blocks = (
             int(round((count / max_count) * GRADE_BAR_WIDTH))
             if max_count > 0 else 0
         )
         bar = "█" * blocks if blocks > 0 else ""
-        # pad the bar with invisible spaces so columns line up
         padded_bar = bar.ljust(GRADE_BAR_WIDTH, "\u2007")
 
         rows_html.append(
@@ -401,15 +430,35 @@ def _render_create_section():
                 help="Short label for this batch.",
             )
 
+        # Session 31 — deferred count checkbox
+        skip_count = st.checkbox(
+            "☐ Skip initial count (count later)",
+            value=False,
+            key="create_batch_skip_count",
+            help="Check this if some fry are injured/weak and you want "
+                 "to defer counting for 2–3 weeks. The batch will be "
+                 "created without an Initial count; you set it later "
+                 "from the batch card.",
+        )
+
         col3, col4, col5 = st.columns([1, 1, 2])
         with col3:
-            initial_count = st.number_input(
-                "Initial Fry Count",
-                min_value=0,
-                value=default_count,
-                step=1,
-                key="create_batch_initial",
-            )
+            if skip_count:
+                st.markdown(
+                    '<div style="background:#FEF3C7;border-radius:8px;'
+                    'padding:8px;color:#92400E;font-size:13px;text-align:center;'
+                    'margin-top:8px;">Initial: <b>deferred</b></div>',
+                    unsafe_allow_html=True,
+                )
+                initial_count = 0
+            else:
+                initial_count = st.number_input(
+                    "Initial Fry Count",
+                    min_value=0,
+                    value=default_count,
+                    step=1,
+                    key="create_batch_initial",
+                )
         with col4:
             hatch_date = st.date_input(
                 "Hatch Date",
@@ -432,9 +481,16 @@ def _render_create_section():
                 initial_count=int(initial_count),
                 notes=notes,
                 hatch_date=str(hatch_date),
+                skip_initial_count=bool(skip_count),
             )
             if saved:
-                st.success(f"Batch '{saved.get('batch_tag')}' created.")
+                if skip_count:
+                    st.success(
+                        f"Batch '{saved.get('batch_tag')}' created — "
+                        f"Initial count deferred."
+                    )
+                else:
+                    st.success(f"Batch '{saved.get('batch_tag')}' created.")
                 st.rerun()
 
 
@@ -442,8 +498,15 @@ def _render_create_section():
 # OUTCOME PANEL
 # ============================================================
 
-def _render_outcome_panel(outcome: dict):
+def _render_outcome_panel(outcome: dict, deferred: bool = False):
     st.markdown("##### 📊 Batch Outcome")
+
+    if deferred:
+        st.info(
+            "⏳ Initial count not yet set. Set it to unlock metrics.",
+            icon="⏳",
+        )
+        return
 
     initial   = outcome.get("initial_count", 0)
     current   = outcome.get("current_count", 0)
@@ -504,6 +567,7 @@ def _render_jar_popover(batch: dict):
     batch_uuid = batch["id"]
     batch_tag = batch.get("batch_tag") or "?"
     current_count = int(batch.get("current_count") or 0)
+    deferred = is_count_deferred(batch)
 
     with st.popover("🫙 Jar Fry", use_container_width=True):
         st.markdown(f"**Jar fry from batch '{batch_tag}'**")
@@ -512,7 +576,14 @@ def _render_jar_popover(batch: dict):
             "and details later in Fish Registry."
         )
 
-        if current_count == 0:
+        if deferred:
+            st.warning(
+                "⚠️ Initial count is deferred. Set it from the card first "
+                "so jarring counts make sense.",
+                icon="⏳",
+            )
+
+        if not deferred and current_count == 0:
             st.warning(
                 "⚠️ This batch has **0 unjarred fry** (derived). "
                 "Nothing to jar. Check Initial count if this is wrong.",
@@ -562,6 +633,7 @@ def _render_jar_popover(batch: dict):
             type="primary",
             key=f"jar_confirm_{batch_uuid}",
             use_container_width=True,
+            disabled=deferred,
         ):
             created, failed = jar_fry_bulk(
                 batch_id=batch_uuid,
@@ -610,30 +682,39 @@ def _render_jar_popover(batch: dict):
 def _render_counts_popover(batch: dict):
     batch_uuid = batch["id"]
     current_count = int(batch.get("current_count") or 0)
+    deferred = is_count_deferred(batch)
 
     with st.popover("🔢 Update Counts", use_container_width=True):
         st.markdown("**Update batch counts**")
         st.caption(
-            "**Current** is now derived automatically: "
-            "`Initial − Jarred − Culled(pre) − Died`. "
-            "Edit Initial, Culled, Died, or Females below."
+            "**Current** is derived automatically: "
+            "`Initial − Jarred − Culled(pre) − Died`."
         )
 
-        st.markdown(
-            f'<div style="background:#F3F4F6;border-radius:8px;padding:10px;'
-            f'margin-bottom:8px;">'
-            f'<div style="font-size:11px;color:#6B7280;font-weight:600;'
-            f'text-transform:uppercase;letter-spacing:0.5px;">Current (derived)</div>'
-            f'<div style="font-size:22px;color:#111827;font-weight:700;'
-            f'margin-top:2px;">{current_count}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+        if deferred:
+            st.warning(
+                "⏳ Initial count deferred. Use **📝 Set Initial Count** "
+                "on the card to set it.",
+                icon="⏳",
+            )
 
+        if not deferred:
+            st.markdown(
+                f'<div style="background:#F3F4F6;border-radius:8px;padding:10px;'
+                f'margin-bottom:8px;">'
+                f'<div style="font-size:11px;color:#6B7280;font-weight:600;'
+                f'text-transform:uppercase;letter-spacing:0.5px;">Current (derived)</div>'
+                f'<div style="font-size:22px;color:#111827;font-weight:700;'
+                f'margin-top:2px;">{current_count}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        default_initial = int(batch.get("initial_count") or 0)
         new_initial = st.number_input(
             "Initial fry count (total at hatch)",
             min_value=0,
-            value=int(batch.get("initial_count") or 0),
+            value=default_initial,
             step=1,
             key=f"count_init_{batch_uuid}",
             help="Total fry counted at hatch. If wrong, correct it here.",
@@ -718,8 +799,7 @@ def _render_edit_delete_popover(batch: dict):
             )
             if jarred_count == 0:
                 st.info(
-                    "No matching jarred fish found. (Requires fish with "
-                    "birth_date matching this batch's jarring_date.)",
+                    "No matching jarred fish found.",
                     icon="ℹ️",
                 )
             if st.button(
@@ -819,11 +899,16 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
     batch_tag = batch.get("batch_tag") or "?"
     stage = (batch.get("stage") or "fry").lower()
     icon = _stage_icon(stage)
+    deferred = bool(derived.get("deferred"))
 
     parents = get_batch_parents(batch)
 
     with st.container(border=True):
-        st.markdown(f"### {icon} `{batch_tag}`")
+        if deferred:
+            st.markdown(f"### {icon} `{batch_tag}`  &nbsp; ⏳ _Awaiting count_")
+        else:
+            st.markdown(f"### {icon} `{batch_tag}`")
+
         if spawn:
             st.caption(
                 f"From spawn **{spawn.get('system_id')}** — "
@@ -849,7 +934,8 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         if hint:
             st.info(hint, icon="⏰")
 
-        if derived.get("negative_warning"):
+        # Negative-derived warning (skip when deferred)
+        if not deferred and derived.get("negative_warning"):
             st.error(
                 f"⚠️ **Data inconsistency.** Derived Current would be "
                 f"**{derived.get('raw_current')}** (negative). "
@@ -858,11 +944,34 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
                 icon="🚨",
             )
 
+        # Metrics
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Initial", batch.get("initial_count") or 0)
-        col2.metric("Current", batch.get("current_count") or 0)
-        col3.metric("Survival", _survival_label(survival))
+
+        if deferred:
+            col1.metric("Initial", "—")
+            col2.metric("Current", "—")
+            col3.metric("Survival", "—")
+        else:
+            col1.metric("Initial", batch.get("initial_count") or 0)
+            col2.metric("Current", batch.get("current_count") or 0)
+            col3.metric("Survival", _survival_label(survival, deferred=False))
+
         col4.metric("Stage", f"{icon} {stage}")
+
+        # Awaiting count CTA
+        if deferred:
+            st.info(
+                "⏳ Initial count not yet set. Fry are still in the batch — "
+                "set the count when they've stabilized (2–3 weeks).",
+                icon="📝",
+            )
+            if st.button(
+                "📝 Set Initial Count",
+                type="primary",
+                key=f"set_initial_btn_{batch_uuid}",
+                use_container_width=True,
+            ):
+                _modal_set_initial_count(batch)
 
         culled_pre_n = batch.get("culled_count") or 0
         died_n = batch.get("died_count") or 0
@@ -877,13 +986,26 @@ def _render_batch_card(item: dict, outcome: Optional[dict] = None):
         if batch.get("notes"):
             st.info(batch["notes"])
 
-        # ---- Outcome | Quality | Parents ----
-        if outcome and outcome.get("verdict_key") not in ("unknown",):
+        # Outcome | Quality | Parents
+        if deferred:
             st.divider()
             col_outcome, col_mf = st.columns([OUTCOME_COL_WEIGHT, MF_COL_WEIGHT])
 
             with col_outcome:
-                _render_outcome_panel(outcome)
+                _render_outcome_panel({}, deferred=True)
+                st.divider()
+                _render_quality_panel(batch)
+
+            with col_mf:
+                with st.container(border=True):
+                    _render_mf_showcase(parents, batch_uuid=batch_uuid)
+
+        elif outcome and outcome.get("verdict_key") not in ("unknown",):
+            st.divider()
+            col_outcome, col_mf = st.columns([OUTCOME_COL_WEIGHT, MF_COL_WEIGHT])
+
+            with col_outcome:
+                _render_outcome_panel(outcome, deferred=False)
                 st.divider()
                 _render_quality_panel(batch)
 
@@ -946,7 +1068,7 @@ def _render_list_section():
     with col_filter:
         view_filter = st.selectbox(
             "Show",
-            options=["All", "Active only", "Mature only"],
+            options=["All", "Active only", "Mature only", "Awaiting count"],
             key="batch_filter",
         )
 
@@ -961,6 +1083,11 @@ def _render_list_section():
         items = [
             d for d in all_items
             if (d["batch"].get("stage") or "").lower() not in ACTIVE_STAGES
+        ]
+    elif view_filter == "Awaiting count":
+        items = [
+            d for d in all_items
+            if (d.get("derived") or {}).get("deferred")
         ]
     else:
         items = all_items
@@ -1006,11 +1133,12 @@ def render_fry_batch_page():
     _drain_message(_DANGER_MESSAGE_KEY)
 
     stats = get_batch_stats()
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total Batches", stats["total_batches"])
     c2.metric("Active", stats["active_batches"])
     c3.metric("Mature", stats["mature_batches"])
     c4.metric("Total Fry Alive", stats["total_fry_alive"])
+    c5.metric("⏳ Awaiting count", stats.get("awaiting_count", 0))
 
     st.markdown("---")
 
