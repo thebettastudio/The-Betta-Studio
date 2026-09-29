@@ -8,9 +8,10 @@
 #
 # Where:
 #   Current       = unjarred fry still alive in the batch
-#   Jarred_alive  = individually tracked fish with this batch_id, status not culled/deceased
+#   Jarred_alive  = individually tracked fish jarred from THIS batch,
+#                   status not culled/deceased
 #   Culled_pre    = fry culled BEFORE jarring (batch.culled_count)
-#   Culled_jarred = fish jarred then later culled (fish.status = "Culled" with this batch_id)
+#   Culled_jarred = fish jarred from THIS batch then later culled
 #   Died          = natural deaths (batch.died_count)
 #
 # Survival % = (Current + Jarred_alive) ÷ Initial
@@ -19,6 +20,24 @@
 # Verdict uses:
 #   high_pct  = (High+ grade jarred alive) ÷ jarred_alive
 #   cull_rate = (Culled_pre + Culled_jarred) ÷ Initial
+#
+# Session 29 — Batch-scoping fix:
+#   Previously, _compute_from_data(spawn_id) counted ALL fish whose
+#   fish.batch_id == spawn_id (which is really a spawn id, not a
+#   fry_batch id — see fish_manager.register_fish_from_spawn()).
+#   For a spawn that has produced multiple fry batches over time,
+#   every batch card showed the spawn-wide totals — e.g. a 69-fry
+#   batch displayed 159 jarred fish and 230% survival.
+#
+#   Now _compute_from_data() accepts an optional batch_id. When
+#   given, jarred-fish counts are scoped to only the fish jarred
+#   from THAT batch, discriminated by:
+#     fish.batch_id == spawn_id   (existing link)
+#     AND
+#     fish.birth_date == batch.jarring_date  (set by jar_fry_bulk)
+#
+#   When batch_id is None, behavior falls back to the old
+#   spawn-wide computation (backward-compatible).
 
 from __future__ import annotations
 
@@ -106,11 +125,9 @@ def _compute_verdict(
     Returns (verdict_key, reason_short).
     cull_rate = total_culled ÷ initial (of all fry started, how many culled).
     """
-    # Failed: no jarred survivors, but something was culled
     if jarred_alive == 0 and total_culled > 0:
         return ("failed", f"All {total_culled} culled, none jarred")
 
-    # Pending: no jarring yet
     if jarred_alive == 0 and total_culled == 0:
         return ("pending", "No jarring or culling recorded yet")
 
@@ -122,41 +139,127 @@ def _compute_verdict(
 
     summary = f"{high_pct*100:.0f}% High+ · {cull_rate*100:.0f}% culled"
 
-    # Excellent
     if high_pct >= 0.50 and cull_rate < 0.20:
         return ("excellent", summary)
 
-    # Weak (checked before Mixed so cull rate dominates if extreme)
     if high_pct < 0.10 or cull_rate > 0.60:
         return ("weak", summary)
 
-    # Solid
     if high_pct >= 0.25 and cull_rate <= 0.40:
         return ("solid", summary)
 
-    # Mixed (fallback)
     return ("mixed", summary)
+
+
+def _iso_date_prefix(val) -> Optional[str]:
+    """Return YYYY-MM-DD from a value, or None if it can't be parsed."""
+    if not val:
+        return None
+    s = str(val)[:10]
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        return s
+    return None
+
+
+def _resolve_batch(
+    spawn_id: str,
+    all_batches: list[dict],
+    batch_id: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Find the batch row for this spawn. If batch_id is given, match
+    exactly that row. Otherwise, fall back to the first batch for
+    the spawn (old behavior for backward compatibility).
+    """
+    if batch_id:
+        return next(
+            (b for b in all_batches
+             if b.get("id") == batch_id and b.get("spawn_id") == spawn_id),
+            None,
+        )
+    return next((b for b in all_batches if b.get("spawn_id") == spawn_id), None)
+
+
+def _fish_belongs_to_batch(
+    fish: dict,
+    spawn_id: str,
+    batch: Optional[dict],
+    *,
+    scope_to_batch: bool,
+) -> bool:
+    """
+    Decide whether a fish counts as jarred from this batch.
+
+    When scope_to_batch is False (legacy spawn-wide mode):
+      Just check fish.batch_id == spawn_id.
+
+    When scope_to_batch is True (new batch-scoped mode):
+      fish.batch_id == spawn_id  AND
+      fish.birth_date matches the batch's jarring_date (if set).
+    """
+    if fish.get("batch_id") != spawn_id:
+        return False
+
+    if not scope_to_batch or not batch:
+        return True
+
+    jarring_date = _iso_date_prefix(batch.get("jarring_date"))
+    if not jarring_date:
+        # Batch has no jarring_date recorded — can't discriminate.
+        # Fall back to accepting the fish, but this will over-count
+        # if the spawn had multiple batches. User should set jarring_date.
+        return True
+
+    fish_date = _iso_date_prefix(fish.get("birth_date"))
+    return fish_date == jarring_date
 
 
 # ============================================================
 # MAIN API
 # ============================================================
 
-def compute_spawn_outcome(spawn_id: str) -> dict:
-    """Compute the outcome for one spawn."""
+def compute_spawn_outcome(
+    spawn_id: str,
+    *,
+    batch_id: Optional[str] = None,
+) -> dict:
+    """
+    Compute the outcome for one spawn.
+
+    Session 29 — accepts optional batch_id to scope jarred-fish
+    counts to a single fry batch. Without batch_id, falls back to
+    the old spawn-wide behavior.
+    """
     all_fish = get_all_fish()
     all_batches = get_all_fry_batches()
-    return _compute_from_data(spawn_id, all_fish, all_batches)
+    return _compute_from_data(spawn_id, all_fish, all_batches, batch_id=batch_id)
 
 
 def _compute_from_data(
     spawn_id: str,
     all_fish: list[dict],
     all_batches: list[dict],
+    *,
+    batch_id: Optional[str] = None,
 ) -> dict:
-    """Internal: compute using pre-fetched data."""
-    # --- Jarred fish (any status) that came from this spawn ---
-    all_from_spawn = [f for f in all_fish if f.get("batch_id") == spawn_id]
+    """
+    Internal: compute using pre-fetched data.
+
+    Session 29 — batch_id is optional. When provided, jarred-fish
+    counts are scoped to only the fish belonging to that specific
+    batch (matched by jarring_date in addition to spawn_id).
+    """
+    # --- Resolve the batch row ---
+    batch = _resolve_batch(spawn_id, all_batches, batch_id=batch_id)
+    scope_to_batch = batch_id is not None
+
+    # --- Jarred fish (any status) that came from this batch ---
+    all_from_spawn = [
+        f for f in all_fish
+        if _fish_belongs_to_batch(
+            f, spawn_id, batch, scope_to_batch=scope_to_batch,
+        )
+    ]
 
     culled_jarred_fish = [
         f for f in all_from_spawn
@@ -167,9 +270,7 @@ def _compute_from_data(
         if (f.get("status") or "").lower() not in ("culled", "deceased")
     ]
 
-    # --- Batch record (fry_batches) ---
-    batch = next((b for b in all_batches if b.get("spawn_id") == spawn_id), None)
-
+    # --- Batch counts ---
     current_count     = _safe_int(batch.get("current_count")) if batch else 0
     culled_pre        = _safe_int(batch.get("culled_count"))  if batch else 0
     female_count      = _safe_int(batch.get("female_count"))  if batch else 0
@@ -193,10 +294,10 @@ def _compute_from_data(
     if initial_count > 0:
         survival = (current_count + jarred_alive) / initial_count
 
-    # --- Reconciliation: Initial = Current + Jarred_alive + Culled_pre + Culled_jarred + Died ---
+    # --- Reconciliation ---
     expected_sum = current_count + jarred_alive + culled_pre + culled_jarred + died_count
     reconciliation_delta = initial_count - expected_sum
-    reconciles = abs(reconciliation_delta) <= 1  # allow ±1 for rounding noise
+    reconciles = abs(reconciliation_delta) <= 1
 
     # --- Verdict ---
     verdict_key, verdict_reason = _compute_verdict(
@@ -210,8 +311,8 @@ def _compute_from_data(
 
     return {
         "spawn_id": spawn_id,
+        "batch_id": batch_id,
 
-        # Core counts
         "initial_count":   initial_count,
         "current_count":   current_count,
         "jarred_alive":    jarred_alive,
@@ -222,34 +323,36 @@ def _compute_from_data(
         "died":            died_count,
         "female_count":    female_count,
 
-        # Quality
         "survival":        survival,
         "grade_breakdown": breakdown,
         "high_plus_count": high_plus,
         "avg_form_score":  avg_score,
         "best_fish":       best,
 
-        # Verdict
         "verdict_key":     verdict_key,
         "verdict_icon":    VERDICT_ICONS.get(verdict_key, "—"),
         "verdict_reason":  verdict_reason,
 
-        # Reconciliation
         "expected_sum":    expected_sum,
         "reconciliation_delta": reconciliation_delta,
         "reconciles":      reconciles,
 
-        # Meta
         "has_batch":       batch is not None,
+        "scope_to_batch":  scope_to_batch,
 
-        # Aliases for backward-compat with earlier code
-        "jarred_count":    jarred_alive,   # older field name
-        "culled_count":    total_culled,   # older field name
+        "jarred_count":    jarred_alive,
+        "culled_count":    total_culled,
     }
 
 
 def compute_all_spawn_outcomes() -> dict[str, dict]:
-    """Compute outcomes for all spawns in one pass."""
+    """
+    Compute outcomes for all spawns in one pass.
+
+    NOTE: this returns spawn-wide results keyed by spawn_id, matching
+    the old behavior. To get batch-scoped results, call
+    compute_spawn_outcome(spawn_id, batch_id=...) per batch.
+    """
     all_spawns  = get_all_spawns()
     all_fish    = get_all_fish()
     all_batches = get_all_fry_batches()
@@ -257,6 +360,28 @@ def compute_all_spawn_outcomes() -> dict[str, dict]:
     out = {}
     for s in all_spawns:
         out[s["id"]] = _compute_from_data(s["id"], all_fish, all_batches)
+    return out
+
+
+def compute_all_batch_outcomes() -> dict[str, dict]:
+    """
+    Session 29 — compute outcomes keyed by BATCH id, scoped to each
+    batch. Use this in views that iterate batches (e.g. fry_batch_view)
+    so multi-batch spawns show per-batch numbers instead of spawn-wide
+    totals.
+
+    Returns: { batch_id: outcome_dict }
+    """
+    all_fish    = get_all_fish()
+    all_batches = get_all_fry_batches()
+
+    out = {}
+    for b in all_batches:
+        bid = b.get("id")
+        sid = b.get("spawn_id")
+        if not bid or not sid:
+            continue
+        out[bid] = _compute_from_data(sid, all_fish, all_batches, batch_id=bid)
     return out
 
 
