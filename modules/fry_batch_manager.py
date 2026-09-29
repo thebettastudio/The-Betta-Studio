@@ -15,17 +15,12 @@
 # Session 29/D — Undo Jar + Delete Batch & Fish.
 #
 # Session 29/F — DERIVED current_count:
-#   current_count is now COMPUTED, not stored-and-edited:
+#   current = initial − jarred_alive − culled_jarred − culled_count − died_count
 #
-#     current = initial
-#             − jarred_alive
-#             − culled_jarred
-#             − culled_count
-#             − died_count
-#
-#   list_all_batches() overrides the stored value with the derived
-#   value. get_batch_stats() uses derived totals too. set_current_count()
-#   is deprecated but kept for backward compatibility.
+# Session 30 — Round H Part 2 (this revision):
+#   • get_batch_grade_breakdown(batch) → per-grade counts for the fry
+#     jarred by this batch, plus a quality score. Used by the batch card
+#     in fry_batch_view.py for the quality rollup panel.
 
 from __future__ import annotations
 
@@ -70,6 +65,18 @@ ACTIVE_STAGES = {"egg", "fry", "free_swimming"}
 MATURE_STAGES = {"jarred", "juvenile", "sub_adult", "adult"}
 
 DEFAULT_HATCH_OFFSET_DAYS = 3
+
+# Grade tiers used by the batch quality rollup.
+GRADE_ORDER = [
+    "Show Grade",
+    "High Grade",
+    "Breeder Grade",
+    "Material Grade",
+    "Pet Grade",
+]
+
+# Which grades count toward the "quality" percentage
+QUALITY_GRADES = {"Show Grade", "High Grade", "Breeder Grade"}
 
 
 # ============================================================
@@ -290,6 +297,63 @@ def count_batch_jarred_fish(batch: dict) -> int:
         return 0
 
 
+def get_batch_grade_breakdown(batch: dict) -> dict:
+    """
+    Session 30 — Round H Part 2.
+
+    Return per-grade counts for all fish jarred by this batch, plus a
+    quality score (0–100) = (Show + High + Breeder) / total × 100.
+
+    Return shape:
+      {
+        "total": int,                  # fish counted (any grade)
+        "counts": { grade_name: int }, # ordered by GRADE_ORDER
+        "quality_score": int,          # 0–100, or 0 if no fish
+        "quality_count": int,          # Show + High + Breeder
+        "has_data": bool,              # False if batch has no jarred fish
+      }
+    """
+    try:
+        fish = get_batch_jarred_fish(batch)
+        # Exclude culled/deceased from the grade rollup
+        alive = [
+            f for f in fish
+            if (f.get("status") or "").lower() not in ("culled", "deceased")
+        ]
+
+        counts = {g: 0 for g in GRADE_ORDER}
+        unspecified = 0
+        for f in alive:
+            g = (f.get("grade") or "").strip()
+            if g in counts:
+                counts[g] += 1
+            else:
+                unspecified += 1
+
+        total = len(alive)
+        quality_count = sum(counts[g] for g in QUALITY_GRADES)
+        quality_score = int(round((quality_count / total) * 100)) if total > 0 else 0
+
+        return {
+            "total": total,
+            "counts": counts,
+            "quality_score": quality_score,
+            "quality_count": quality_count,
+            "unspecified": unspecified,
+            "has_data": total > 0,
+        }
+    except Exception as e:
+        st.warning(f"get_batch_grade_breakdown failed: {e}")
+        return {
+            "total": 0,
+            "counts": {g: 0 for g in GRADE_ORDER},
+            "quality_score": 0,
+            "quality_count": 0,
+            "unspecified": 0,
+            "has_data": False,
+        }
+
+
 # ============================================================
 # CREATE
 # ============================================================
@@ -499,8 +563,6 @@ def undo_batch_jar(
     """
     Reverse a batch's jarring: delete every fish jarred by this
     batch, clear jarring_date, flip stage back to free_swimming.
-
-    Session 29/F — no longer writes current_count (derived).
     """
     try:
         batch_id = batch.get("id")
