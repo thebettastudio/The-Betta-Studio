@@ -5,25 +5,32 @@
 # One batch per spawn (Q2=A1). Manual stage advancement (Q4=A1).
 # Hybrid jarring: bulk-create placeholder fish rows (Q3=A3).
 #
-# Session 28A/B2b — jar_fry_bulk() accepts optional jarring_date;
-#   each jarred fish inherits birth_date = jarring_date; batch's own
-#   jarring_date set on first jarring if empty.
+# Session 28A/B2b — jar_fry_bulk() accepts optional jarring_date.
 #
 # Session 29 — Fry batch fixes:
-#   • create_batch_from_spawn() accepts hatch_date (defaults to
-#     free_swimming_date - 3 days) — fixes hatch_date bug.
-#   • jar_fry_bulk() auto-advances batch stage → jarred after bulk
-#     create; returns (created, failed_count).
-#   • New get_batch_parents(batch) → {male, female} for thumbnails.
-#   • Removed unused get_all_fish import.
+#   • create_batch_from_spawn() accepts hatch_date.
+#   • jar_fry_bulk() auto-advances stage → jarred.
+#   • get_batch_parents(batch) → {male, female}.
 #
-# Session 29/D — Undo Jar + Delete Batch & Fish:
-#   • get_batch_jarred_fish(batch) → fish rows jarred by this batch
-#   • count_batch_jarred_fish(batch) → fast count for preview
-#   • undo_batch_jar(batch, delete_photos=True) → deletes jarred
-#     fish, restores current_count, clears jarring_date, stage→free_swimming
-#   • delete_batch_and_fish(batch, delete_photos=True) → deletes all
-#     jarred fish + the batch itself
+# Session 29/D — Undo Jar + Delete Batch & Fish.
+#
+# Session 29/F (this revision) — DERIVED current_count:
+#   current_count is now COMPUTED, not stored-and-edited:
+#
+#     current = initial
+#             − jarred_alive
+#             − culled_jarred
+#             − culled_count
+#             − died_count
+#
+#   list_all_batches() overrides the stored value with the derived
+#   value. get_batch_stats() uses derived totals too. set_current_count()
+#   is deprecated but kept for backward compatibility.
+#
+#   Reason: manual Current was drifting out of sync with the fish
+#   rows, causing "Off by -10" reconciliation failures. Deriving it
+#   makes reconciliation a tautology — the badge should never fire
+#   again unless Initial or Culled/Died is manually wrong.
 
 from __future__ import annotations
 
@@ -71,25 +78,119 @@ DEFAULT_HATCH_OFFSET_DAYS = 3
 
 
 # ============================================================
+# HELPERS
+# ============================================================
+
+def _iso_date_prefix(val) -> Optional[str]:
+    """Return YYYY-MM-DD from a value, or None if it can't be parsed."""
+    if not val:
+        return None
+    s = str(val)[:10]
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        return s
+    return None
+
+
+def _safe_int(val, default: int = 0) -> int:
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _fish_belongs_to_batch(fish: dict, batch: dict) -> bool:
+    """
+    Return True if this fish row was jarred by this specific batch.
+    Discriminator: fish.batch_id == spawn_id AND birth_date == jarring_date.
+    """
+    spawn_id = batch.get("spawn_id")
+    if not spawn_id or fish.get("batch_id") != spawn_id:
+        return False
+    batch_jd = _iso_date_prefix(batch.get("jarring_date"))
+    if not batch_jd:
+        return False
+    return _iso_date_prefix(fish.get("birth_date")) == batch_jd
+
+
+def _compute_current_count(
+    batch: dict,
+    all_fish: list[dict],
+) -> dict:
+    """
+    Session 29/F — derive current_count from other fields + fish rows.
+
+    Returns a dict:
+      {
+        "current":            int (clamped to 0),
+        "raw_current":        int (may be negative),
+        "jarred_alive":       int,
+        "culled_jarred":      int,
+        "negative_warning":   bool,
+        "delta":              int (raw_current clamped vs stored),
+      }
+    """
+    initial    = _safe_int(batch.get("initial_count"))
+    culled_pre = _safe_int(batch.get("culled_count"))
+    died       = _safe_int(batch.get("died_count"))
+
+    jarred_alive = 0
+    culled_jarred = 0
+    for f in all_fish:
+        if not _fish_belongs_to_batch(f, batch):
+            continue
+        status = (f.get("status") or "").lower()
+        if status in ("culled", "deceased"):
+            culled_jarred += 1
+        else:
+            jarred_alive += 1
+
+    raw_current = initial - jarred_alive - culled_jarred - culled_pre - died
+    clamped = max(0, raw_current)
+
+    return {
+        "current":          clamped,
+        "raw_current":      raw_current,
+        "jarred_alive":     jarred_alive,
+        "culled_jarred":    culled_jarred,
+        "negative_warning": raw_current < 0,
+    }
+
+
+# ============================================================
 # READ
 # ============================================================
 
 def list_all_batches() -> list[dict]:
-    """All fry batches enriched with spawn, tank, survival."""
+    """
+    All fry batches enriched with spawn, tank, survival, and
+    DERIVED current_count.
+
+    Session 29/F — current_count on the returned batch dict is
+    overridden with the derived value. The stored DB value is left
+    alone but not used by the UI.
+    """
     spawn_by_id = {s["id"]: s for s in get_all_spawns()}
     tank_by_id = {t["id"]: t for t in get_all_tanks()}
+    all_fish = get_all_fish()
 
     out = []
     for b in get_all_fry_batches():
+        derived = _compute_current_count(b, all_fish)
         initial = b.get("initial_count") or 0
-        current = b.get("current_count") or 0
-        survival = (current / initial) if initial > 0 else None
+
+        # Override the batch's current_count with the derived value
+        b_view = dict(b)
+        b_view["current_count"] = derived["current"]
+        b_view["_derived"] = derived  # extra info for the view
+
+        survival = (derived["current"] / initial) if initial > 0 else None
 
         out.append({
-            "batch": b,
+            "batch": b_view,
             "spawn": spawn_by_id.get(b.get("spawn_id")),
             "tank": tank_by_id.get(b.get("tank_id")),
             "survival": survival,
+            "derived": derived,
         })
     return out
 
@@ -107,16 +208,25 @@ def list_batches_for_spawn(spawn_id: str) -> list[dict]:
 
 
 def get_batch_stats() -> dict:
+    """
+    Counts for the batch view header.
+    Session 29/F — uses DERIVED current_count.
+    """
     all_batches = get_all_fry_batches()
-    alive_count = sum(
-        (b.get("current_count") or 0)
-        for b in all_batches
-        if (b.get("stage") or "").lower() in ACTIVE_STAGES
-    )
+    all_fish = get_all_fish()
+
+    active_count = 0
+    alive_count = 0
+    for b in all_batches:
+        stage = (b.get("stage") or "").lower()
+        if stage in ACTIVE_STAGES:
+            active_count += 1
+            derived = _compute_current_count(b, all_fish)
+            alive_count += derived["current"]
 
     return {
         "total_batches": len(all_batches),
-        "active_batches": sum(1 for b in all_batches if (b.get("stage") or "").lower() in ACTIVE_STAGES),
+        "active_batches": active_count,
         "mature_batches": sum(1 for b in all_batches if (b.get("stage") or "").lower() in MATURE_STAGES),
         "total_fry_alive": alive_count,
     }
@@ -165,30 +275,12 @@ def get_batch_parents(batch: dict) -> dict:
 
 
 # ============================================================
-# BATCH ↔ FISH LINKING (Session 29/D)
+# BATCH ↔ FISH LINKING
 # ============================================================
-
-def _iso_date_prefix(val) -> Optional[str]:
-    """Return YYYY-MM-DD from a value, or None if it can't be parsed."""
-    if not val:
-        return None
-    s = str(val)[:10]
-    if len(s) == 10 and s[4] == "-" and s[7] == "-":
-        return s
-    return None
-
 
 def get_batch_jarred_fish(batch: dict) -> list[dict]:
     """
     Return all fish rows that were jarred by this specific batch.
-
-    Discriminator: fish.batch_id == spawn_id (spawn id, not fry_batch
-    id — see register_fish_from_spawn) AND fish.birth_date matches
-    the batch's jarring_date.
-
-    If the batch has no jarring_date, returns [] — we can't safely
-    discriminate which fish belong to which batch of a multi-batch
-    spawn. Set jarring_date first.
     """
     try:
         spawn_id = batch.get("spawn_id")
@@ -277,6 +369,7 @@ def create_batch_from_spawn(
         "spawn_id": spawn_id,
         "hatch_date": resolved_hatch,
         "initial_count": int(initial_count or 0),
+        # current_count stored as initial; the app derives it at read time.
         "current_count": int(initial_count or 0),
         "stage": "fry",
         "notes": notes,
@@ -337,17 +430,13 @@ def advance_stage(batch_id: str, new_stage: str) -> bool:
 
 
 def set_current_count(batch_id: str, count: int) -> bool:
+    """
+    DEPRECATED (Session 29/F). current_count is now derived, not stored.
+    Kept for backward compatibility — writes the raw value to the DB,
+    but the UI ignores it in favor of the derived value.
+    """
     count = max(0, int(count))
-    ok = update_fry_batch(batch_id, {"current_count": count})
-    if ok:
-        b = get_fry_batch_by_id(batch_id)
-        log_activity(
-            action_type="fry_batch_count_updated",
-            description=f"Batch '{b.get('batch_tag')}' count set to {count}",
-            entity_type="fry_batch",
-            entity_id=batch_id,
-        )
-    return ok
+    return update_fry_batch(batch_id, {"current_count": count})
 
 
 def assign_batch_tank(batch_id: str, tank_id: Optional[str]) -> bool:
@@ -379,6 +468,8 @@ def jar_fry_bulk(
     """
     Bulk-create `count` placeholder fish rows linked to the batch's spawn.
     Returns (created_fish_rows, failed_count).
+
+    Session 29/F — does NOT touch current_count (derived at read time).
     """
     batch = get_fry_batch_by_id(batch_id)
     if not batch:
@@ -433,7 +524,7 @@ def jar_fry_bulk(
 
 
 # ============================================================
-# UNDO JAR  (Session 29/D)
+# UNDO JAR
 # ============================================================
 
 def undo_batch_jar(
@@ -443,10 +534,9 @@ def undo_batch_jar(
 ) -> tuple[int, int, Optional[str]]:
     """
     Reverse a batch's jarring: delete every fish jarred by this
-    batch, restore current_count, clear jarring_date, flip stage
-    back to free_swimming.
+    batch, clear jarring_date, flip stage back to free_swimming.
 
-    Returns: (deleted_count, failed_count, error_message_or_None).
+    Session 29/F — no longer writes current_count (derived).
     """
     try:
         batch_id = batch.get("id")
@@ -478,12 +568,8 @@ def undo_batch_jar(
             else:
                 failed += 1
 
-        restored_count = (batch.get("current_count") or 0) + deleted
         current_stage = (batch.get("stage") or "").lower()
-        updates = {
-            "current_count": restored_count,
-            "jarring_date": None,
-        }
+        updates = {"jarring_date": None}
         if current_stage == "jarred":
             updates["stage"] = "free_swimming"
 
@@ -493,7 +579,7 @@ def undo_batch_jar(
             action_type="fry_batch_jar_undone",
             description=(
                 f"Undid jar for batch '{batch.get('batch_tag')}': "
-                f"deleted {deleted} fish, restored current_count to {restored_count}"
+                f"deleted {deleted} fish"
                 + (f" ({failed} failed)" if failed else "")
             ),
             entity_type="fry_batch",
@@ -505,7 +591,7 @@ def undo_batch_jar(
 
 
 # ============================================================
-# DELETE BATCH & FISH  (Session 29/D)
+# DELETE BATCH & FISH
 # ============================================================
 
 def delete_batch_and_fish(
