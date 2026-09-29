@@ -9,21 +9,25 @@
 #
 # Session 29 — Fry batch fixes + M/F layout:
 #   • Parent thumbnails removed from card header.
-#   • New M/F showcase panel (right column, 65% width) with
-#     wide 4:3 rounded-square parent photos.
+#   • New M/F showcase panel (right column, 65% width) with wide
+#     4:3 rounded-square parent photos.
 #   • Batch Outcome panel moved to left column (35% width).
 #   • StreamlitDuplicateElementKey fixed via batch_uuid in keys.
 #   • Jarring messages survive st.rerun().
 #   • Stage-due hint anchored to free_swimming_date.
 #
-# Session 29/D (this revision) — Undo Jar + Delete Batch & Fish:
+# Session 29/C — Batch-scoped outcomes:
+#   • Uses compute_all_batch_outcomes() so multi-batch spawns show
+#     per-batch numbers (fixes 159-vs-69 outcome bug).
+#
+# Session 29/D — Undo Jar + Delete Batch & Fish:
 #   • ⚙️ Edit / Delete popover now contains:
-#       ↩️ Undo Jar — reverses a jarring (deletes jarred fish,
+#       ↩️ Undo Jar — reverses jarring; deletes jarred fish,
 #          restores current_count, clears jarring_date, stage back
-#          to free_swimming). Preview shows fish count + new count.
+#          to free_swimming. Preview shows count + new value.
 #       🔥 Delete Batch & Jarred Fish — requires typing the batch
 #          tag to confirm. Nukes fish AND batch.
-#       🗑️ Delete Batch Only — existing behavior (checkbox confirm).
+#       🗑️ Delete Batch Only — existing behavior.
 
 import datetime
 from typing import Optional
@@ -37,7 +41,6 @@ from modules.fry_batch_manager import (
     suggest_batch_tag,
     create_batch_from_spawn,
     get_batch_parents,
-    get_batch_jarred_fish,
     count_batch_jarred_fish,
     edit_batch,
     advance_stage,
@@ -59,7 +62,7 @@ from modules.fish_manager import (
 )
 from modules.photo_service import photo_url
 from modules.spawn_outcome import (
-    compute_all_spawn_outcomes,
+    compute_all_batch_outcomes,
     verdict_badge_html,
     grade_breakdown_short,
     reconciliation_html,
@@ -581,13 +584,12 @@ def _render_counts_popover(batch: dict):
 
 
 # ============================================================
-# EDIT / DELETE POPOVER  (Session 29/D: Undo Jar + Delete & Fish)
+# EDIT / DELETE POPOVER (Session 29/D)
 # ============================================================
 
 def _render_edit_delete_popover(batch: dict):
     batch_uuid = batch["id"]
     batch_tag = batch.get("batch_tag") or "?"
-    stage = (batch.get("stage") or "").lower()
     jarring_date = batch.get("jarring_date")
 
     with st.popover("⚙️ Edit / Delete", use_container_width=True):
@@ -609,9 +611,7 @@ def _render_edit_delete_popover(batch: dict):
 
         st.divider()
 
-        # ---- Undo Jar ----
-        # Only show if the batch actually has a jarring_date — otherwise
-        # there's nothing to reverse.
+        # ---- Undo Jar (only if there's something to undo) ----
         if jarring_date:
             jarred_count = count_batch_jarred_fish(batch)
             restored_count = (batch.get("current_count") or 0) + jarred_count
@@ -620,7 +620,7 @@ def _render_edit_delete_popover(batch: dict):
             st.caption(
                 f"Deletes all **{jarred_count}** fish jarred by this batch "
                 f"and restores current_count to **{restored_count}**. "
-                f"Clears jarring_date. Reversible — you can re-jar any time."
+                f"Clears jarring_date."
             )
             if jarred_count == 0:
                 st.info(
@@ -653,8 +653,8 @@ def _render_edit_delete_popover(batch: dict):
             st.divider()
 
         # ---- Delete Batch & Jarred Fish ----
-        st.markdown("**🔥 Delete Batch & Jarred Fish**")
         jarred_count = count_batch_jarred_fish(batch)
+        st.markdown("**🔥 Delete Batch & Jarred Fish**")
         st.caption(
             f"Deletes the batch **AND** all **{jarred_count}** fish jarred "
             f"by it. This is **permanent**. Type the batch tag "
@@ -692,7 +692,7 @@ def _render_edit_delete_popover(batch: dict):
 
         st.divider()
 
-        # ---- Delete Batch Only (existing behavior) ----
+        # ---- Delete Batch Only ----
         st.markdown("**🗑️ Delete Batch Only**")
         st.caption("Deletes the batch record. Jarred fish are kept in Fish Registry.")
         confirm_del = st.checkbox(
@@ -888,12 +888,13 @@ def _render_list_section():
         st.info("No batches match the current filter.")
         return
 
-    outcome_map = compute_all_spawn_outcomes()
+    # Session 29/C — batch-scoped outcomes (fixes 159-vs-69)
+    outcome_map = compute_all_batch_outcomes()
 
     for it in items:
         batch = it["batch"]
-        spawn_id = batch.get("spawn_id")
-        outcome = outcome_map.get(spawn_id) if spawn_id else None
+        batch_id = batch.get("id")
+        outcome = outcome_map.get(batch_id) if batch_id else None
         _render_batch_card(it, outcome=outcome)
 
 
