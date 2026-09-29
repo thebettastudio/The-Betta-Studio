@@ -5,11 +5,15 @@
 # Session 19 — Added inbreeding/lineage check to the pairing screen.
 # Session 24B — Show computed batch outcome in History + Active cards.
 #
-# Session 28A/B1 (this revision):
-#   • Start New Pairing: Pairing Date picker (defaults today)
-#   • Mark Free Swimming: Free Swim Date picker (defaults today)
-#   • Passes to spawn_manager.create_new_spawn(pairing_date=...)
-#     and mark_free_swimming(free_swim_date=...)
+# Session 28A/B1 — Start New Pairing: Pairing Date picker;
+#   Mark Free Swimming: Free Swim Date picker.
+#
+# Session 29/E (this revision) — Pairing duplicate guard:
+#   • Male / Female dropdowns exclude fish already In Pairing
+#     on another active spawn (via get_active_pairing_fish_ids).
+#   • Success / error messages survive st.rerun() via session_state.
+#   • Clearer empty-state when no available males/females.
+#   • All other UI unchanged.
 
 import datetime
 from typing import Optional
@@ -27,6 +31,7 @@ from modules.spawn_manager import (
     mark_pairing_failed,
     mark_completed,
     update_spawn_details,
+    get_active_pairing_fish_ids,
 )
 from modules.fish_manager import (
     get_fish_dropdown_items,
@@ -46,6 +51,37 @@ from modules.spawn_outcome import (
     verdict_badge_html,
     grade_breakdown_short,
 )
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+_SPAWN_MESSAGE_KEY = "_spawn_pending_message"
+
+
+# ============================================================
+# MESSAGE QUEUE (Session 29/E)
+# ============================================================
+
+def _queue_spawn_message(kind: str, text: str) -> None:
+    st.session_state[_SPAWN_MESSAGE_KEY] = {"kind": kind, "text": text}
+
+
+def _drain_spawn_message() -> None:
+    msg = st.session_state.pop(_SPAWN_MESSAGE_KEY, None)
+    if not msg:
+        return
+    kind = msg.get("kind")
+    text = msg.get("text") or ""
+    if kind == "success":
+        st.success(text)
+    elif kind == "warning":
+        st.warning(text)
+    elif kind == "error":
+        st.error(text)
+    else:
+        st.info(text)
 
 
 # ============================================================
@@ -367,12 +403,18 @@ def render_start_pairing_tab():
     from database import get_all_fish
     all_fish = get_all_fish()
 
+    # Session 29/E — fish already In Pairing on an active spawn
+    already_paired = get_active_pairing_fish_ids()
+
     males_dd, females_dd = [], []
     for f in all_fish:
         if not f.get("system_id"):
             continue
         status = (f.get("status") or "").lower()
         if status in ("deceased", "sold", "retired", "culled"):
+            continue
+        # Session 29/E — skip fish that are already pairing
+        if f["id"] in already_paired:
             continue
         gender = (f.get("gender") or "").lower()
         item = {
@@ -386,8 +428,19 @@ def render_start_pairing_tab():
 
     tank_dd = get_tank_dropdown_items(purpose="Spawning")
 
-    if not males_dd or not females_dd:
-        st.warning("⚠️ You need at least one Male and one Female fish to create a pair.")
+    if not males_dd and not females_dd:
+        st.warning(
+            "⚠️ All breeders are currently In Pairing. Finish or cancel an "
+            "existing pairing before starting a new one."
+        )
+        return
+
+    if not males_dd:
+        st.warning("⚠️ No available Male breeders — all males are In Pairing or inactive.")
+        return
+
+    if not females_dd:
+        st.warning("⚠️ No available Female breeders — all females are In Pairing or inactive.")
         return
 
     if not tank_dd:
@@ -483,14 +536,19 @@ def render_start_pairing_tab():
                 pairing_date=str(pairing_date),
             )
         if not saved:
-            st.error("Failed to create spawn.")
-            return
-        st.success(
-            f"Pairing initiated! **{saved.get('system_id')}** "
-            f"(code: {saved.get('spawn_code')}) assigned to tank — "
-            f"pairing date {pairing_date}."
-        )
-        st.rerun()
+            _queue_spawn_message(
+                "error",
+                "Failed to create spawn — see message above.",
+            )
+            st.rerun()
+        else:
+            _queue_spawn_message(
+                "success",
+                f"Pairing initiated! **{saved.get('system_id')}** "
+                f"(code: {saved.get('spawn_code')}) assigned to tank — "
+                f"pairing date {pairing_date}.",
+            )
+            st.rerun()
 
 
 # ============================================================
@@ -578,6 +636,9 @@ def render_history_tab():
 
 def render_spawn_page():
     st.title("🧬 Pair & Spawn Tracker")
+
+    # Session 29/E — replay any pending pairing message from prior run
+    _drain_spawn_message()
 
     tab1, tab2, tab3 = st.tabs([
         "💞 Active Pairings",
