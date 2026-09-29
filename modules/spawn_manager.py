@@ -12,10 +12,16 @@
 #
 # Session 32 — PAIRING PLANS + get_calendar_events().
 #
-# Session 33 (this revision) — Jarring estimate at 2 months:
-#   • jarring_est now = pairing_date + 67 days (~2 months old)
-#     instead of + 21 days.
-#   • detail text updated to "Estimated jarring window (~2 months old)".
+# Session 33 — Jarring estimate at 2 months (JARRING_OFFSET_DAYS=67).
+#
+# Session 34 — Survival Analytics helper (get_survival_analytics).
+#
+# Session 35 (this revision) — CANCEL PAIRING:
+#   • New status "Cancelled" added to VALID_SPAWN_STATUSES.
+#   • New cancel_pairing(spawn_id, reason) — soft exit for a
+#     pairing you started by mistake or want to back out of.
+#     Sets status="Cancelled", releases parents (→Available),
+#     releases the tank.
 
 from __future__ import annotations
 
@@ -68,6 +74,7 @@ VALID_SPAWN_STATUSES = [
     "Free Swimming",
     "Failed",
     "Completed",
+    "Cancelled",   # Session 35 — soft exit
 ]
 
 ACTIVE_STATUSES = {"In Pairing", "Pending (Success)"}
@@ -84,9 +91,7 @@ GRADE_ORDER = [
 ]
 QUALITY_GRADES = {"Show Grade", "High Grade", "Breeder Grade"}
 
-# Session 33 — Jarring estimate offset (days after pairing).
-# Betta fry are typically jarred ~2 months after hatch. Free swim is
-# ~7 days after pairing, so ~60 more days ≈ 67 days from pairing.
+# Jarring estimate offset (days after pairing) — Session 33.
 JARRING_OFFSET_DAYS = 67
 
 
@@ -260,6 +265,190 @@ def get_pairing_performance() -> list[dict]:
     except Exception as e:
         st.error(f"get_pairing_performance failed: {e}")
         return []
+
+
+def get_survival_analytics() -> dict:
+    """
+    Session 34 — roll up survival metrics by pair and by generation.
+
+    Returns:
+      {
+        "by_pair": [ {pair_label, generation, initial, alive, culled,
+                      died, survival_pct, spawn_ids, insufficient_data} ],
+        "by_generation": [ {generation, initial, alive, culled, died,
+                            survival_pct, batch_count} ],
+        "overall": {initial, alive, culled, died, survival_pct},
+        "monthly": [ {month, initial, alive, survival_pct} ],
+      }
+    """
+    try:
+        spawns = get_all_spawns()
+        batches = get_all_fry_batches()
+        all_fish = get_all_fish()
+
+        fish_by_id = {f["id"]: f for f in all_fish}
+
+        # Index batches by spawn_id
+        batches_by_spawn: dict[str, list[dict]] = {}
+        for b in batches:
+            sid = b.get("spawn_id")
+            if sid:
+                batches_by_spawn.setdefault(sid, []).append(b)
+
+        # Index fish by batch key
+        fish_by_spawn_date: dict[tuple, list[dict]] = {}
+        for f in all_fish:
+            sid = f.get("batch_id")
+            bd = _iso_date_prefix(f.get("birth_date"))
+            if sid and bd:
+                fish_by_spawn_date.setdefault((sid, bd), []).append(f)
+
+        # ---- Per pair ----
+        by_pair: dict[tuple, dict] = {}
+        by_gen: dict[str, dict] = {}
+        overall = {"initial": 0, "alive": 0, "culled": 0, "died": 0}
+        monthly: dict[str, dict] = {}
+
+        for s in spawns:
+            mid = s.get("male_id")
+            fid = s.get("female_id")
+            if not mid or not fid:
+                continue
+
+            gen = s.get("generation") or "?"
+            key = (mid, fid)
+            if key not in by_pair:
+                male_row = fish_by_id.get(mid) or {}
+                female_row = fish_by_id.get(fid) or {}
+                male_sid = male_row.get("system_id") or "?"
+                female_sid = female_row.get("system_id") or "?"
+                by_pair[key] = {
+                    "pair_label":       f"{male_sid} × {female_sid}",
+                    "generation":       gen,
+                    "initial":          0,
+                    "alive":            0,
+                    "culled":           0,
+                    "died":             0,
+                    "spawn_ids":        [],
+                }
+
+            if gen not in by_gen:
+                by_gen[gen] = {
+                    "generation":  gen,
+                    "initial":     0,
+                    "alive":       0,
+                    "culled":      0,
+                    "died":        0,
+                    "batch_count": 0,
+                }
+
+            for b in batches_by_spawn.get(s["id"], []):
+                jd = _iso_date_prefix(b.get("jarring_date"))
+                if not jd:
+                    continue
+
+                bucket = fish_by_spawn_date.get((s["id"], jd), [])
+                if not bucket:
+                    continue
+
+                initial_here = len(bucket)
+                alive_here = 0
+                culled_here = 0
+                died_here = 0
+                for f in bucket:
+                    st_ = (f.get("status") or "").lower()
+                    if st_ in ("culled",):
+                        culled_here += 1
+                    elif st_ in ("deceased",):
+                        died_here += 1
+                    elif st_ in ("sold", "retired"):
+                        # Treated as alive for survival purposes
+                        alive_here += 1
+                    else:
+                        alive_here += 1
+
+                by_pair[key]["initial"] += initial_here
+                by_pair[key]["alive"]   += alive_here
+                by_pair[key]["culled"]  += culled_here
+                by_pair[key]["died"]    += died_here
+
+                by_gen[gen]["initial"] += initial_here
+                by_gen[gen]["alive"]   += alive_here
+                by_gen[gen]["culled"]  += culled_here
+                by_gen[gen]["died"]    += died_here
+                by_gen[gen]["batch_count"] += 1
+
+                overall["initial"] += initial_here
+                overall["alive"]   += alive_here
+                overall["culled"]  += culled_here
+                overall["died"]    += died_here
+
+                # Monthly bucket by jarring_date
+                month_key = jd[:7]  # YYYY-MM
+                if month_key not in monthly:
+                    monthly[month_key] = {
+                        "month":     month_key,
+                        "initial":   0,
+                        "alive":     0,
+                    }
+                monthly[month_key]["initial"] += initial_here
+                monthly[month_key]["alive"]   += alive_here
+
+            by_pair[key]["spawn_ids"].append(s["id"])
+
+        # ---- Finalize ----
+        pair_rows = []
+        for row in by_pair.values():
+            initial = row["initial"]
+            alive = row["alive"]
+            row["survival_pct"] = (
+                round((alive / initial) * 100, 1) if initial > 0 else None
+            )
+            row["insufficient_data"] = initial < 5
+            pair_rows.append(row)
+        pair_rows.sort(
+            key=lambda r: (r["survival_pct"] is None, -(r["survival_pct"] or 0))
+        )
+
+        gen_rows = []
+        for row in by_gen.values():
+            initial = row["initial"]
+            alive = row["alive"]
+            row["survival_pct"] = (
+                round((alive / initial) * 100, 1) if initial > 0 else None
+            )
+            gen_rows.append(row)
+        gen_rows.sort(key=lambda r: r["generation"])
+
+        overall["survival_pct"] = (
+            round((overall["alive"] / overall["initial"]) * 100, 1)
+            if overall["initial"] > 0 else None
+        )
+
+        monthly_rows = []
+        for row in monthly.values():
+            initial = row["initial"]
+            alive = row["alive"]
+            row["survival_pct"] = (
+                round((alive / initial) * 100, 1) if initial > 0 else None
+            )
+            monthly_rows.append(row)
+        monthly_rows.sort(key=lambda r: r["month"])
+
+        return {
+            "by_pair": pair_rows,
+            "by_generation": gen_rows,
+            "overall": overall,
+            "monthly": monthly_rows,
+        }
+    except Exception as e:
+        st.error(f"get_survival_analytics failed: {e}")
+        return {
+            "by_pair": [],
+            "by_generation": [],
+            "overall": {"initial": 0, "alive": 0, "culled": 0, "died": 0, "survival_pct": None},
+            "monthly": [],
+        }
 
 
 # ============================================================
@@ -470,16 +659,7 @@ def delete_pairing_plan(plan_id: str) -> bool:
 # ============================================================
 
 def get_calendar_events(days_ahead: int = 60) -> list[dict]:
-    """
-    Return a flat list of calendar events for the next N days.
-
-    Derived events:
-      • Plan         — status='planned', on planned_date
-      • Recovery end — Recovering breeders, on started_at + recovery_days
-      • Eggs due     — active spawns 'In Pairing', on pairing_date + 3d
-      • Free swim    — active spawns, on pairing_date + 7d (estimate)
-      • Jarring      — active spawns, on pairing_date + JARRING_OFFSET_DAYS
-    """
+    """Return a flat list of calendar events for the next N days."""
     today = _dt.date.today()
     cutoff = today + _dt.timedelta(days=days_ahead)
 
@@ -553,7 +733,6 @@ def get_calendar_events(days_ahead: int = 60) -> list[dict]:
                     "meta": {},
                 })
 
-            # Session 33 — Jarring estimate at ~2 months old (67 days after pairing)
             jarring_est = pairing_date + _dt.timedelta(days=JARRING_OFFSET_DAYS)
             if today <= jarring_est <= cutoff:
                 events.append({
@@ -622,12 +801,7 @@ def create_new_spawn(
     notes: str = "",
     pairing_date: Optional[str] = None,
 ) -> Optional[dict]:
-    """
-    Create a new spawn record.
-
-    Session 28A — accepts an optional pairing_date (ISO 'YYYY-MM-DD').
-    Session 29/E — guards against duplicates + rollback on failure.
-    """
+    """Create a new spawn record."""
     if male_id == female_id:
         st.error("Male and female must be different fish.")
         return None
@@ -787,6 +961,7 @@ def mark_free_swimming(
 
 
 def mark_pairing_failed(spawn_id: str, failure_reason: str) -> bool:
+    """Mark Failed, log reason, release parents, free tank."""
     spawn = get_spawn_by_id(spawn_id)
     if not spawn:
         return False
@@ -807,6 +982,62 @@ def mark_pairing_failed(spawn_id: str, failure_reason: str) -> bool:
     log_activity(
         action_type="spawn_failed",
         description=f"{spawn.get('system_id')} failed — {failure_reason or 'no reason given'}",
+        entity_type="spawn",
+        entity_id=spawn_id,
+    )
+    return True
+
+
+def cancel_pairing(spawn_id: str, reason: str) -> bool:
+    """
+    Session 35 — soft exit: cancel a pairing without recording a failure.
+
+    Unlike mark_pairing_failed(), this is for "I changed my mind" — a
+    pairing that shouldn't have been started, or that you want to back
+    out of before anything happened.
+
+    Effects:
+      • spawn.status = "Cancelled"
+      • spawn.failure_reason = reason (reused field for the cancel note)
+      • Both parents → breeder_status = "Available"
+      • Tank released
+      • Activity log entry: "spawn_cancelled"
+    """
+    if not reason or not reason.strip():
+        st.error("A cancel reason is required.")
+        return False
+
+    spawn = get_spawn_by_id(spawn_id)
+    if not spawn:
+        st.error("Spawn not found.")
+        return False
+
+    current_status = (spawn.get("status") or "")
+    if current_status not in ACTIVE_STATUSES:
+        st.error(
+            f"Only active pairings can be cancelled. "
+            f"This spawn is '{current_status}'."
+        )
+        return False
+
+    ok = update_spawn(spawn_id, {
+        "status": "Cancelled",
+        "failure_reason": reason.strip(),
+    })
+    if not ok:
+        return False
+
+    sync_breeder_status(spawn.get("male_id"), "Available")
+    sync_breeder_status(spawn.get("female_id"), "Available")
+
+    if spawn.get("tank_id"):
+        unassign_tank(spawn["tank_id"])
+
+    log_activity(
+        action_type="spawn_cancelled",
+        description=(
+            f"{spawn.get('system_id')} cancelled — {reason.strip()}"
+        ),
         entity_type="spawn",
         entity_id=spawn_id,
     )
