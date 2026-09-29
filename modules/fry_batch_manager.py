@@ -14,13 +14,21 @@
 #
 # Session 29/D — Undo Jar + Delete Batch & Fish.
 #
-# Session 29/F — DERIVED current_count:
-#   current = initial − jarred_alive − culled_jarred − culled_count − died_count
+# Session 29/F — DERIVED current_count.
 #
-# Session 30 — Round H Part 2 (this revision):
-#   • get_batch_grade_breakdown(batch) → per-grade counts for the fry
-#     jarred by this batch, plus a quality score. Used by the batch card
-#     in fry_batch_view.py for the quality rollup panel.
+# Session 30 — Round H Part 2: get_batch_grade_breakdown().
+#
+# Session 31 — Round G (this revision) — DEFERRED INITIAL COUNT:
+#   • create_batch_from_spawn() accepts skip_initial_count=True.
+#     When set, initial_count is stored as NULL.
+#   • set_initial_count(batch_id, count) — sets Initial and
+#     clears the deferred state.
+#   • is_count_deferred(batch) — True when initial_count is None.
+#   • _compute_current_count() returns deferred=True when initial
+#     is None; callers hide derived metrics.
+#   • list_all_batches() propagates derived["deferred"] and sets
+#     survival=None for deferred batches.
+#   • get_batch_stats() includes "awaiting_count".
 
 from __future__ import annotations
 
@@ -66,7 +74,6 @@ MATURE_STAGES = {"jarred", "juvenile", "sub_adult", "adult"}
 
 DEFAULT_HATCH_OFFSET_DAYS = 3
 
-# Grade tiers used by the batch quality rollup.
 GRADE_ORDER = [
     "Show Grade",
     "High Grade",
@@ -75,7 +82,6 @@ GRADE_ORDER = [
     "Pet Grade",
 ]
 
-# Which grades count toward the "quality" percentage
 QUALITY_GRADES = {"Show Grade", "High Grade", "Breeder Grade"}
 
 
@@ -100,6 +106,11 @@ def _safe_int(val, default: int = 0) -> int:
         return default
 
 
+def is_count_deferred(batch: dict) -> bool:
+    """Session 31 — True when the batch's Initial count hasn't been set yet."""
+    return batch.get("initial_count") is None
+
+
 def _fish_belongs_to_batch(fish: dict, batch: dict) -> bool:
     """Return True if this fish row was jarred by this specific batch."""
     spawn_id = batch.get("spawn_id")
@@ -113,11 +124,10 @@ def _fish_belongs_to_batch(fish: dict, batch: dict) -> bool:
 
 def _compute_current_count(batch: dict, all_fish: list[dict]) -> dict:
     """
-    Session 29/F — derive current_count from other fields + fish rows.
+    Derive current_count. Session 31 — if initial_count is None
+    (deferred), returns deferred=True and zero-value metrics.
     """
-    initial    = _safe_int(batch.get("initial_count"))
-    culled_pre = _safe_int(batch.get("culled_count"))
-    died       = _safe_int(batch.get("died_count"))
+    raw_initial = batch.get("initial_count")
 
     jarred_alive = 0
     culled_jarred = 0
@@ -130,12 +140,31 @@ def _compute_current_count(batch: dict, all_fish: list[dict]) -> dict:
         else:
             jarred_alive += 1
 
+    # --- Deferred path ---
+    if raw_initial is None:
+        return {
+            "deferred":         True,
+            "current":          0,
+            "raw_current":      0,
+            "initial":          None,
+            "jarred_alive":     jarred_alive,
+            "culled_jarred":    culled_jarred,
+            "negative_warning": False,
+        }
+
+    # --- Normal path ---
+    initial    = _safe_int(raw_initial)
+    culled_pre = _safe_int(batch.get("culled_count"))
+    died       = _safe_int(batch.get("died_count"))
+
     raw_current = initial - jarred_alive - culled_jarred - culled_pre - died
     clamped = max(0, raw_current)
 
     return {
+        "deferred":         False,
         "current":          clamped,
         "raw_current":      raw_current,
+        "initial":          initial,
         "jarred_alive":     jarred_alive,
         "culled_jarred":    culled_jarred,
         "negative_warning": raw_current < 0,
@@ -148,8 +177,8 @@ def _compute_current_count(batch: dict, all_fish: list[dict]) -> dict:
 
 def list_all_batches() -> list[dict]:
     """
-    All fry batches enriched with spawn, tank, survival, and
-    DERIVED current_count.
+    All fry batches enriched with spawn, tank, survival, and derived
+    current_count. Deferred batches have survival=None.
     """
     spawn_by_id = {s["id"]: s for s in get_all_spawns()}
     tank_by_id = {t["id"]: t for t in get_all_tanks()}
@@ -158,13 +187,16 @@ def list_all_batches() -> list[dict]:
     out = []
     for b in get_all_fry_batches():
         derived = _compute_current_count(b, all_fish)
-        initial = b.get("initial_count") or 0
 
         b_view = dict(b)
         b_view["current_count"] = derived["current"]
         b_view["_derived"] = derived
 
-        survival = (derived["current"] / initial) if initial > 0 else None
+        if derived["deferred"]:
+            survival = None
+        else:
+            initial = b.get("initial_count") or 0
+            survival = (derived["current"] / initial) if initial > 0 else None
 
         out.append({
             "batch": b_view,
@@ -195,18 +227,26 @@ def get_batch_stats() -> dict:
 
     active_count = 0
     alive_count = 0
+    awaiting_count = 0
+
     for b in all_batches:
         stage = (b.get("stage") or "").lower()
+        derived = _compute_current_count(b, all_fish)
+
+        if derived["deferred"]:
+            awaiting_count += 1
+
         if stage in ACTIVE_STAGES:
             active_count += 1
-            derived = _compute_current_count(b, all_fish)
-            alive_count += derived["current"]
+            if not derived["deferred"]:
+                alive_count += derived["current"]
 
     return {
-        "total_batches": len(all_batches),
-        "active_batches": active_count,
-        "mature_batches": sum(1 for b in all_batches if (b.get("stage") or "").lower() in MATURE_STAGES),
+        "total_batches":   len(all_batches),
+        "active_batches":  active_count,
+        "mature_batches":  sum(1 for b in all_batches if (b.get("stage") or "").lower() in MATURE_STAGES),
         "total_fry_alive": alive_count,
+        "awaiting_count":  awaiting_count,
     }
 
 
@@ -298,24 +338,9 @@ def count_batch_jarred_fish(batch: dict) -> int:
 
 
 def get_batch_grade_breakdown(batch: dict) -> dict:
-    """
-    Session 30 — Round H Part 2.
-
-    Return per-grade counts for all fish jarred by this batch, plus a
-    quality score (0–100) = (Show + High + Breeder) / total × 100.
-
-    Return shape:
-      {
-        "total": int,                  # fish counted (any grade)
-        "counts": { grade_name: int }, # ordered by GRADE_ORDER
-        "quality_score": int,          # 0–100, or 0 if no fish
-        "quality_count": int,          # Show + High + Breeder
-        "has_data": bool,              # False if batch has no jarred fish
-      }
-    """
+    """Per-grade counts for all fish jarred by this batch, plus quality score."""
     try:
         fish = get_batch_jarred_fish(batch)
-        # Exclude culled/deceased from the grade rollup
         alive = [
             f for f in fish
             if (f.get("status") or "").lower() not in ("culled", "deceased")
@@ -362,11 +387,18 @@ def create_batch_from_spawn(
     spawn_id: str,
     *,
     batch_tag: str,
-    initial_count: int,
+    initial_count: Optional[int] = 0,
     notes: str = "",
     hatch_date: Optional[str] = None,
+    skip_initial_count: bool = False,
 ) -> Optional[dict]:
-    """Create a fry batch linked to a spawn. Enforces one-per-spawn."""
+    """
+    Create a fry batch linked to a spawn. Enforces one-per-spawn.
+
+    Session 31 — pass skip_initial_count=True to create the batch
+    with initial_count = NULL. Use set_initial_count() later once
+    the fry have been counted.
+    """
     spawn = get_spawn_by_id(spawn_id)
     if not spawn:
         st.error(f"Spawn {spawn_id} not found.")
@@ -393,13 +425,20 @@ def create_batch_from_spawn(
         else:
             resolved_hatch = today
 
+    if skip_initial_count:
+        stored_initial = None
+        stored_current = 0
+    else:
+        stored_initial = int(initial_count or 0)
+        stored_current = stored_initial
+
     record = {
         "batch_tag": batch_tag.strip() or suggest_batch_tag(spawn),
         "batch_code": spawn.get("spawn_code") or spawn.get("system_id") or "",
         "spawn_id": spawn_id,
         "hatch_date": resolved_hatch,
-        "initial_count": int(initial_count or 0),
-        "current_count": int(initial_count or 0),
+        "initial_count": stored_initial,
+        "current_count": stored_current,
         "stage": "fry",
         "notes": notes,
     }
@@ -410,8 +449,10 @@ def create_batch_from_spawn(
             action_type="fry_batch_created",
             description=(
                 f"Created batch '{saved.get('batch_tag')}' from "
-                f"{spawn.get('system_id')} with {initial_count} fry "
-                f"(hatch {resolved_hatch})"
+                f"{spawn.get('system_id')}"
+                + (" (initial count deferred)" if skip_initial_count
+                   else f" with {stored_initial} fry")
+                + f" (hatch {resolved_hatch})"
             ),
             entity_type="fry_batch",
             entity_id=saved["id"],
@@ -429,6 +470,24 @@ def edit_batch(batch_id: str, updates: dict) -> bool:
         log_activity(
             action_type="fry_batch_updated",
             description=f"Updated batch fields: {', '.join(updates.keys())}",
+            entity_type="fry_batch",
+            entity_id=batch_id,
+        )
+    return ok
+
+
+def set_initial_count(batch_id: str, count: int) -> bool:
+    """
+    Session 31 — set the Initial count on a deferred batch,
+    or update it on a counted batch.
+    """
+    count = max(0, int(count))
+    ok = update_fry_batch(batch_id, {"initial_count": count})
+    if ok:
+        b = get_fry_batch_by_id(batch_id)
+        log_activity(
+            action_type="fry_batch_initial_set",
+            description=f"Batch '{b.get('batch_tag')}' initial count set to {count}",
             entity_type="fry_batch",
             entity_id=batch_id,
         )
@@ -493,12 +552,7 @@ def jar_fry_bulk(
     location: str = "",
     jarring_date: Optional[str] = None,
 ) -> tuple[list[dict], int]:
-    """
-    Bulk-create `count` placeholder fish rows linked to the batch's spawn.
-    Returns (created_fish_rows, failed_count).
-
-    Session 29/F — does NOT touch current_count (derived at read time).
-    """
+    """Bulk-create fish rows linked to the batch's spawn."""
     batch = get_fry_batch_by_id(batch_id)
     if not batch:
         st.error(f"Batch {batch_id} not found.")
@@ -560,10 +614,7 @@ def undo_batch_jar(
     *,
     delete_photos: bool = True,
 ) -> tuple[int, int, Optional[str]]:
-    """
-    Reverse a batch's jarring: delete every fish jarred by this
-    batch, clear jarring_date, flip stage back to free_swimming.
-    """
+    """Reverse a batch's jarring."""
     try:
         batch_id = batch.get("id")
         if not batch_id:
