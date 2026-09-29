@@ -15,6 +15,11 @@
 #     parent is already on another active spawn.
 #   • Rollback: if parent-status sync or tank assignment fails after
 #     spawn insert, the spawn row is deleted so no orphans remain.
+#
+# Session 30 — Round H Part 3 (this revision):
+#   • get_pairing_performance() → per parent-pair rollup of all
+#     their batches: batch count, fry count, grade breakdown,
+#     quality score. Used by the Pairing Performance tab.
 
 from __future__ import annotations
 
@@ -31,6 +36,7 @@ from database import (
     delete_spawn,
     get_fish_by_id,
     get_all_fish,
+    get_all_fry_batches,
     get_all_tanks,
     log_activity,
 )
@@ -66,6 +72,30 @@ VALID_SPAWN_STATUSES = [
 ACTIVE_STATUSES = {"In Pairing", "Pending (Success)"}
 SUCCESS_STATUSES = {"Pending (Success)", "Free Swimming", "Completed"}
 
+# Grade tiers used by the pairing performance rollup.
+GRADE_ORDER = [
+    "Show Grade",
+    "High Grade",
+    "Breeder Grade",
+    "Material Grade",
+    "Pet Grade",
+]
+QUALITY_GRADES = {"Show Grade", "High Grade", "Breeder Grade"}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _iso_date_prefix(val) -> Optional[str]:
+    """Return YYYY-MM-DD from a value, or None if it can't be parsed."""
+    if not val:
+        return None
+    s = str(val)[:10]
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        return s
+    return None
+
 
 # ============================================================
 # READ
@@ -82,9 +112,7 @@ def list_active_spawns() -> list[dict]:
 def get_active_pairing_fish_ids() -> set[str]:
     """
     Session 29/E — return the set of fish ids that are currently on
-    an active spawn (In Pairing or Pending Success). Used to filter
-    pairing dropdowns and to guard create_new_spawn() against
-    duplicate pairings.
+    an active spawn (In Pairing or Pending Success).
     """
     out: set[str] = set()
     for s in get_all_spawns():
@@ -146,6 +174,118 @@ def get_pairing_dropdown_data() -> tuple[list[dict], list[dict]]:
     return get_breeder_pairs_data()
 
 
+def get_pairing_performance() -> list[dict]:
+    """
+    Session 30 — Round H Part 3.
+
+    Return one row per parent pair (male_id × female_id), aggregating
+    all spawns between them.
+
+    Each row:
+      {
+        "male_id":           str,
+        "female_id":         str,
+        "male_system_id":    str,
+        "female_system_id":  str,
+        "pair_label":        str,   # "FISH-0002 × FISH-0003"
+        "batch_count":       int,
+        "fry_count":         int,   # total fish counted in those batches
+        "counts":            { grade: int },
+        "quality_count":     int,
+        "quality_score":     int,   # 0–100
+        "spawn_ids":         [ str ],
+      }
+
+    Sorted by quality_score DESC.
+    """
+    try:
+        spawns = get_all_spawns()
+        batches = get_all_fry_batches()
+        all_fish = get_all_fish()
+
+        # Index fish by id for parent labels
+        fish_by_id = {f["id"]: f for f in all_fish}
+
+        # Bucket batches by spawn_id
+        batches_by_spawn: dict[str, list[dict]] = {}
+        for b in batches:
+            sid = b.get("spawn_id")
+            if sid:
+                batches_by_spawn.setdefault(sid, []).append(b)
+
+        # Group spawns by (male_id, female_id)
+        pairs: dict[tuple, dict] = {}
+
+        for s in spawns:
+            mid = s.get("male_id")
+            fid = s.get("female_id")
+            if not mid or not fid:
+                continue
+
+            key = (mid, fid)
+            if key not in pairs:
+                male_row = fish_by_id.get(mid) or {}
+                female_row = fish_by_id.get(fid) or {}
+                male_sid = male_row.get("system_id") or "?"
+                female_sid = female_row.get("system_id") or "?"
+                pairs[key] = {
+                    "male_id":          mid,
+                    "female_id":        fid,
+                    "male_system_id":   male_sid,
+                    "female_system_id": female_sid,
+                    "pair_label":       f"{male_sid} × {female_sid}",
+                    "spawn_ids":        [],
+                    "batch_count":      0,
+                    "fry_count":        0,
+                    "counts":           {g: 0 for g in GRADE_ORDER},
+                    "quality_count":    0,
+                    "quality_score":    0,
+                }
+
+            pairs[key]["spawn_ids"].append(s["id"])
+
+        # For each pair, walk its spawns' batches and count grades
+        for pair in pairs.values():
+            for sid in pair["spawn_ids"]:
+                for b in batches_by_spawn.get(sid, []):
+                    pair["batch_count"] += 1
+
+                    spawn_id_for_batch = b.get("spawn_id")
+                    jarring_date = _iso_date_prefix(b.get("jarring_date"))
+                    if not spawn_id_for_batch or not jarring_date:
+                        continue
+
+                    # Count fish jarred by THIS batch (excluding culled/deceased)
+                    for f in all_fish:
+                        if f.get("batch_id") != spawn_id_for_batch:
+                            continue
+                        if _iso_date_prefix(f.get("birth_date")) != jarring_date:
+                            continue
+                        if (f.get("status") or "").lower() in ("culled", "deceased"):
+                            continue
+
+                        pair["fry_count"] += 1
+                        g = (f.get("grade") or "").strip()
+                        if g in pair["counts"]:
+                            pair["counts"][g] += 1
+
+            # Compute quality for this pair
+            total = pair["fry_count"]
+            quality_count = sum(pair["counts"][g] for g in QUALITY_GRADES)
+            pair["quality_count"] = quality_count
+            pair["quality_score"] = (
+                int(round((quality_count / total) * 100)) if total > 0 else 0
+            )
+
+        # Sort by quality score DESC, then fry_count DESC
+        rows = list(pairs.values())
+        rows.sort(key=lambda r: (r["quality_score"], r["fry_count"]), reverse=True)
+        return rows
+    except Exception as e:
+        st.error(f"get_pairing_performance failed: {e}")
+        return []
+
+
 # ============================================================
 # CREATE
 # ============================================================
@@ -162,18 +302,8 @@ def create_new_spawn(
     Create a new spawn record.
 
     Session 28A — accepts an optional pairing_date (ISO 'YYYY-MM-DD').
-    If passed, the spawn's pairing_date is stored as that date and
-    both parents' breeder_status_started_at are stamped to that same
-    moment (so backdated spawns compute correct durations).
-
-    Session 29/E — guards against duplicate pairings:
-      • Refuses if male_id == female_id.
-      • Refuses if either parent is currently on another active spawn
-        (In Pairing or Pending Success).
-      • Rolls back the spawn row if parent status sync or tank
-        assignment fails after insert.
+    Session 29/E — guards against duplicate pairings + rollback.
     """
-    # --- Guard 1: same fish on both sides ---
     if male_id == female_id:
         st.error("Male and female must be different fish.")
         return None
@@ -184,7 +314,6 @@ def create_new_spawn(
         st.error("Both parents must be valid fish.")
         return None
 
-    # --- Guard 2: neither parent already In Pairing ---
     active_fish_ids = get_active_pairing_fish_ids()
     conflicts = []
     if male_id in active_fish_ids:
@@ -214,11 +343,8 @@ def create_new_spawn(
     )
     spawn_code = generate_spawn_code()
 
-    # Resolve pairing_date: explicit → today
     resolved_pairing_date = pairing_date or _dt.date.today().isoformat()
 
-    # Timestamp for parent breeder_status_started_at
-    # Matches the pairing date at noon (avoids TZ edge cases)
     pairing_timestamp = _dt.datetime.combine(
         _dt.date.fromisoformat(resolved_pairing_date),
         _dt.time(12, 0, 0),
@@ -242,7 +368,6 @@ def create_new_spawn(
     if not saved:
         return None
 
-    # --- Parent + tank assignment, with rollback on failure ---
     try:
         sync_breeder_status(male_id, "In Pairing", timestamp=pairing_timestamp)
         sync_breeder_status(female_id, "In Pairing", timestamp=pairing_timestamp)
@@ -251,7 +376,6 @@ def create_new_spawn(
             from database import assign_occupant
             assign_occupant(tank_id, None, f"Spawn {system_id}")
     except Exception as e:
-        # Rollback: remove the spawn row we just created
         try:
             delete_spawn(saved["id"])
         except Exception:
@@ -299,13 +423,6 @@ def mark_free_swimming(
     Transition to Free Swimming.
 
     Session 28A — accepts an optional free_swim_date (ISO 'YYYY-MM-DD').
-    If passed, the spawn's free_swimming_date is that date, and both
-    parents' breeder_status_started_at are stamped to that same moment.
-    This makes the recovery countdown (MALE 4d, FEMALE 14d) begin from
-    the backdated moment rather than "now".
-
-    MALE   → "Recovering"  (4d auto-flip → Conditioning → 10d → Available)
-    FEMALE → "Recovering"  (14d auto-flip → Available)
     """
     spawn = get_spawn_by_id(spawn_id)
     if not spawn:
@@ -327,7 +444,6 @@ def mark_free_swimming(
     if not ok:
         return False
 
-    # Parent transitions
     male_id = spawn.get("male_id")
     female_id = spawn.get("female_id")
 
@@ -336,7 +452,6 @@ def mark_free_swimming(
     if female_id:
         sync_breeder_status(female_id, "Recovering", timestamp=free_swim_timestamp)
 
-    # Free the spawn tank
     if spawn.get("tank_id"):
         unassign_tank(spawn["tank_id"])
 
