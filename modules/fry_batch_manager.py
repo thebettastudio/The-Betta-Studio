@@ -1,158 +1,80 @@
-# modules/spawn_outcome.py
+# modules/fry_batch_manager.py
 # Betta Farm Management System
-# Session 24B — Computed batch outcome per spawn.
-# Session 24C — Split culls (pre-jar / jarred), add died, reconciliation check.
+# Session 15 — Fry batch tracking logic.
 #
-# Count model (all numbers must reconcile):
-#   Initial = Current + Jarred_alive + Culled_pre + Culled_jarred + Died
+# One batch per spawn (Q2=A1). Manual stage advancement (Q4=A1).
+# Hybrid jarring: bulk-create placeholder fish rows (Q3=A3).
 #
-# Where:
-#   Current       = unjarred fry still alive in the batch (DERIVED)
-#   Jarred_alive  = individually tracked fish jarred from THIS batch,
-#                   status not culled/deceased
-#   Culled_pre    = fry culled BEFORE jarring (batch.culled_count)
-#   Culled_jarred = fish jarred from THIS batch then later culled
-#   Died          = natural deaths (batch.died_count)
+# Session 28A/B2b — jar_fry_bulk() accepts optional jarring_date.
 #
-# Survival % = (Current + Jarred_alive) ÷ Initial
+# Session 29 — Fry batch fixes:
+#   • create_batch_from_spawn() accepts hatch_date.
+#   • jar_fry_bulk() auto-advances stage → jarred.
+#   • get_batch_parents(batch) → {male, female}.
 #
-# Verdict uses:
-#   high_pct  = (High+ grade jarred alive) ÷ jarred_alive
-#   cull_rate = (Culled_pre + Culled_jarred) ÷ Initial
+# Session 29/D — Undo Jar + Delete Batch & Fish.
 #
-# Session 29 — Batch-scoping fix:
-#   _compute_from_data() accepts an optional batch_id. When given,
-#   jarred-fish counts are scoped to only the fish jarred from THAT
-#   batch (discriminated by fish.birth_date == batch.jarring_date).
-#
-# Session 29/F (this revision) — Derived current_count:
-#   current_count is no longer read from the stored DB value. It's
-#   now computed at read time using the same formula as
-#   fry_batch_manager._compute_current_count():
+# Session 29/F — DERIVED current_count:
+#   current_count is now COMPUTED, not stored-and-edited:
 #
 #     current = initial
 #             − jarred_alive
 #             − culled_jarred
-#             − culled_pre
-#             − died
+#             − culled_count
+#             − died_count
 #
-#   Reason: the stored value drifted out of sync (e.g. "Current 48"
-#   when the true unjarred count was 38 after culls and deaths).
-#   Deriving it makes the outcome panel match the batch card metric,
-#   and guarantees reconciliation always passes when the manual
-#   numbers (initial, culled_pre, died) are correct.
+#   list_all_batches() overrides the stored value with the derived
+#   value. get_batch_stats() uses derived totals too. set_current_count()
+#   is deprecated but kept for backward compatibility.
 
 from __future__ import annotations
 
+import datetime as _dt
 from typing import Optional
 
+import streamlit as st
+
 from database import (
-    get_all_fish,
-    get_all_spawns,
     get_all_fry_batches,
+    get_fry_batch_by_id,
+    get_fry_batches_for_spawn,
+    create_fry_batch,
+    update_fry_batch,
+    delete_fry_batch,
+    get_all_spawns,
+    get_spawn_by_id,
+    get_all_tanks,
+    get_fish_by_id,
+    get_all_fish,
+    delete_fish,
+    log_activity,
 )
+from modules.fish_manager import register_fish_from_spawn
 
 
 # ============================================================
 # CONSTANTS
 # ============================================================
 
-HIGH_GRADES = {"Show Grade", "High Grade"}
+VALID_STAGES = [
+    "egg",
+    "fry",
+    "free_swimming",
+    "jarred",
+    "juvenile",
+    "sub_adult",
+    "adult",
+]
 
-_GRADE_RANK = {
-    "Show Grade": 5,
-    "High Grade": 4,
-    "Breeder Grade": 3,
-    "Material Grade": 2,
-    "Pet Grade": 1,
-}
+ACTIVE_STAGES = {"egg", "fry", "free_swimming"}
+MATURE_STAGES = {"jarred", "juvenile", "sub_adult", "adult"}
 
-VERDICT_ICONS = {
-    "excellent": "🌟",
-    "solid": "✅",
-    "mixed": "⚠️",
-    "weak": "❌",
-    "failed": "🚫",
-    "pending": "⏳",
-    "unknown": "—",
-}
+DEFAULT_HATCH_OFFSET_DAYS = 3
 
 
 # ============================================================
 # HELPERS
 # ============================================================
-
-def _safe_int(val, default: int = 0) -> int:
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return default
-
-
-def _avg(values: list) -> Optional[float]:
-    clean = [v for v in values if v is not None]
-    if not clean:
-        return None
-    return sum(clean) / len(clean)
-
-
-def _grade_breakdown(jarred: list[dict]) -> dict:
-    out: dict = {}
-    for f in jarred:
-        g = f.get("grade") or "Unspecified"
-        out[g] = out.get(g, 0) + 1
-    return out
-
-
-def _high_plus_count(jarred: list[dict]) -> int:
-    return sum(1 for f in jarred if (f.get("grade") or "") in HIGH_GRADES)
-
-
-def _best_fish(jarred: list[dict]) -> Optional[dict]:
-    if not jarred:
-        return None
-    def _key(f):
-        rank = _GRADE_RANK.get(f.get("grade") or "", 0)
-        score = _safe_int(f.get("form_score"))
-        return (rank, score)
-    return max(jarred, key=_key)
-
-
-def _compute_verdict(
-    jarred_alive: int,
-    high_plus_count: int,
-    total_culled: int,
-    initial: int,
-) -> tuple[str, str]:
-    """
-    Returns (verdict_key, reason_short).
-    cull_rate = total_culled ÷ initial (of all fry started, how many culled).
-    """
-    if jarred_alive == 0 and total_culled > 0:
-        return ("failed", f"All {total_culled} culled, none jarred")
-
-    if jarred_alive == 0 and total_culled == 0:
-        return ("pending", "No jarring or culling recorded yet")
-
-    if jarred_alive == 0:
-        return ("unknown", "No jarred fish to grade")
-
-    high_pct = high_plus_count / jarred_alive
-    cull_rate = (total_culled / initial) if initial > 0 else 0.0
-
-    summary = f"{high_pct*100:.0f}% High+ · {cull_rate*100:.0f}% culled"
-
-    if high_pct >= 0.50 and cull_rate < 0.20:
-        return ("excellent", summary)
-
-    if high_pct < 0.10 or cull_rate > 0.60:
-        return ("weak", summary)
-
-    if high_pct >= 0.25 and cull_rate <= 0.40:
-        return ("solid", summary)
-
-    return ("mixed", summary)
-
 
 def _iso_date_prefix(val) -> Optional[str]:
     """Return YYYY-MM-DD from a value, or None if it can't be parsed."""
@@ -164,311 +86,544 @@ def _iso_date_prefix(val) -> Optional[str]:
     return None
 
 
-def _resolve_batch(
-    spawn_id: str,
-    all_batches: list[dict],
-    batch_id: Optional[str] = None,
-) -> Optional[dict]:
-    """
-    Find the batch row for this spawn. If batch_id is given, match
-    exactly that row. Otherwise, fall back to the first batch for
-    the spawn (old behavior for backward compatibility).
-    """
-    if batch_id:
-        return next(
-            (b for b in all_batches
-             if b.get("id") == batch_id and b.get("spawn_id") == spawn_id),
-            None,
-        )
-    return next((b for b in all_batches if b.get("spawn_id") == spawn_id), None)
+def _safe_int(val, default: int = 0) -> int:
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
 
 
-def _fish_belongs_to_batch(
-    fish: dict,
-    spawn_id: str,
-    batch: Optional[dict],
-    *,
-    scope_to_batch: bool,
-) -> bool:
-    """
-    Decide whether a fish counts as jarred from this batch.
-
-    When scope_to_batch is False (legacy spawn-wide mode):
-      Just check fish.batch_id == spawn_id.
-
-    When scope_to_batch is True (batch-scoped mode):
-      fish.batch_id == spawn_id  AND
-      fish.birth_date matches the batch's jarring_date (if set).
-    """
-    if fish.get("batch_id") != spawn_id:
+def _fish_belongs_to_batch(fish: dict, batch: dict) -> bool:
+    """Return True if this fish row was jarred by this specific batch."""
+    spawn_id = batch.get("spawn_id")
+    if not spawn_id or fish.get("batch_id") != spawn_id:
         return False
-
-    if not scope_to_batch or not batch:
-        return True
-
-    jarring_date = _iso_date_prefix(batch.get("jarring_date"))
-    if not jarring_date:
-        # Batch has no jarring_date recorded — can't discriminate.
-        # Fall back to accepting the fish (backward-compatible).
-        return True
-
-    fish_date = _iso_date_prefix(fish.get("birth_date"))
-    return fish_date == jarring_date
+    batch_jd = _iso_date_prefix(batch.get("jarring_date"))
+    if not batch_jd:
+        return False
+    return _iso_date_prefix(fish.get("birth_date")) == batch_jd
 
 
-# ============================================================
-# MAIN API
-# ============================================================
-
-def compute_spawn_outcome(
-    spawn_id: str,
-    *,
-    batch_id: Optional[str] = None,
-) -> dict:
+def _compute_current_count(batch: dict, all_fish: list[dict]) -> dict:
     """
-    Compute the outcome for one spawn.
-
-    Session 29 — accepts optional batch_id to scope jarred-fish
-    counts to a single fry batch. Without batch_id, falls back to
-    the old spawn-wide behavior.
+    Session 29/F — derive current_count from other fields + fish rows.
     """
-    all_fish = get_all_fish()
-    all_batches = get_all_fry_batches()
-    return _compute_from_data(spawn_id, all_fish, all_batches, batch_id=batch_id)
+    initial    = _safe_int(batch.get("initial_count"))
+    culled_pre = _safe_int(batch.get("culled_count"))
+    died       = _safe_int(batch.get("died_count"))
 
+    jarred_alive = 0
+    culled_jarred = 0
+    for f in all_fish:
+        if not _fish_belongs_to_batch(f, batch):
+            continue
+        status = (f.get("status") or "").lower()
+        if status in ("culled", "deceased"):
+            culled_jarred += 1
+        else:
+            jarred_alive += 1
 
-def _compute_from_data(
-    spawn_id: str,
-    all_fish: list[dict],
-    all_batches: list[dict],
-    *,
-    batch_id: Optional[str] = None,
-) -> dict:
-    """
-    Internal: compute using pre-fetched data.
-
-    Session 29 — batch_id is optional. When provided, jarred-fish
-    counts are scoped to only the fish belonging to that specific
-    batch.
-    """
-    # --- Resolve the batch row ---
-    batch = _resolve_batch(spawn_id, all_batches, batch_id=batch_id)
-    scope_to_batch = batch_id is not None
-
-    # --- Jarred fish (any status) that came from this batch ---
-    all_from_spawn = [
-        f for f in all_fish
-        if _fish_belongs_to_batch(
-            f, spawn_id, batch, scope_to_batch=scope_to_batch,
-        )
-    ]
-
-    culled_jarred_fish = [
-        f for f in all_from_spawn
-        if (f.get("status") or "").lower() in ("culled", "deceased")
-    ]
-    alive_jarred = [
-        f for f in all_from_spawn
-        if (f.get("status") or "").lower() not in ("culled", "deceased")
-    ]
-
-    # --- Batch counts (manual fields only) ---
-    culled_pre        = _safe_int(batch.get("culled_count"))  if batch else 0
-    female_count      = _safe_int(batch.get("female_count"))  if batch else 0
-    died_count        = _safe_int(batch.get("died_count"))    if batch else 0
-    initial_count     = _safe_int(batch.get("initial_count")) if batch else 0
-
-    # --- Session 29/F — DERIVED current_count ---
-    # current = initial − jarred_alive − culled_jarred − culled_pre − died
-    jarred_alive   = len(alive_jarred)
-    culled_jarred  = len(culled_jarred_fish)
-    total_culled   = culled_pre + culled_jarred
-
-    current_count = max(
-        0,
-        initial_count
-        - jarred_alive
-        - culled_jarred
-        - culled_pre
-        - died_count,
-    )
-
-    # --- Grade breakdown (over alive jarred only) ---
-    breakdown  = _grade_breakdown(alive_jarred)
-    high_plus  = _high_plus_count(alive_jarred)
-
-    scores = [_safe_int(f.get("form_score")) for f in alive_jarred if f.get("form_score") is not None]
-    avg_score = _avg(scores)
-
-    # --- Survival % = (Current + Jarred_alive) ÷ Initial ---
-    survival = None
-    if initial_count > 0:
-        survival = (current_count + jarred_alive) / initial_count
-
-    # --- Reconciliation (now a tautology when inputs are consistent) ---
-    expected_sum = current_count + jarred_alive + culled_pre + culled_jarred + died_count
-    reconciliation_delta = initial_count - expected_sum
-    reconciles = abs(reconciliation_delta) <= 1
-
-    # --- Verdict ---
-    verdict_key, verdict_reason = _compute_verdict(
-        jarred_alive=jarred_alive,
-        high_plus_count=high_plus,
-        total_culled=total_culled,
-        initial=initial_count,
-    )
-
-    best = _best_fish(alive_jarred)
+    raw_current = initial - jarred_alive - culled_jarred - culled_pre - died
+    clamped = max(0, raw_current)
 
     return {
-        "spawn_id": spawn_id,
-        "batch_id": batch_id,
-
-        # Core counts
-        "initial_count":   initial_count,
-        "current_count":   current_count,
-        "jarred_alive":    jarred_alive,
-        "jarred_total":    len(all_from_spawn),
-        "culled_pre":      culled_pre,
-        "culled_jarred":   culled_jarred,
-        "culled_total":    total_culled,
-        "died":            died_count,
-        "female_count":    female_count,
-
-        # Quality
-        "survival":        survival,
-        "grade_breakdown": breakdown,
-        "high_plus_count": high_plus,
-        "avg_form_score":  avg_score,
-        "best_fish":       best,
-
-        # Verdict
-        "verdict_key":     verdict_key,
-        "verdict_icon":    VERDICT_ICONS.get(verdict_key, "—"),
-        "verdict_reason":  verdict_reason,
-
-        # Reconciliation
-        "expected_sum":    expected_sum,
-        "reconciliation_delta": reconciliation_delta,
-        "reconciles":      reconciles,
-
-        # Meta
-        "has_batch":       batch is not None,
-        "scope_to_batch":  scope_to_batch,
-
-        # Aliases for backward-compat
-        "jarred_count":    jarred_alive,
-        "culled_count":    total_culled,
+        "current":          clamped,
+        "raw_current":      raw_current,
+        "jarred_alive":     jarred_alive,
+        "culled_jarred":    culled_jarred,
+        "negative_warning": raw_current < 0,
     }
 
 
-def compute_all_spawn_outcomes() -> dict[str, dict]:
-    """
-    Compute outcomes for all spawns in one pass (spawn-wide, legacy).
-    """
-    all_spawns  = get_all_spawns()
-    all_fish    = get_all_fish()
-    all_batches = get_all_fry_batches()
+# ============================================================
+# READ
+# ============================================================
 
-    out = {}
-    for s in all_spawns:
-        out[s["id"]] = _compute_from_data(s["id"], all_fish, all_batches)
+def list_all_batches() -> list[dict]:
+    """
+    All fry batches enriched with spawn, tank, survival, and
+    DERIVED current_count.
+    """
+    spawn_by_id = {s["id"]: s for s in get_all_spawns()}
+    tank_by_id = {t["id"]: t for t in get_all_tanks()}
+    all_fish = get_all_fish()
+
+    out = []
+    for b in get_all_fry_batches():
+        derived = _compute_current_count(b, all_fish)
+        initial = b.get("initial_count") or 0
+
+        b_view = dict(b)
+        b_view["current_count"] = derived["current"]
+        b_view["_derived"] = derived
+
+        survival = (derived["current"] / initial) if initial > 0 else None
+
+        out.append({
+            "batch": b_view,
+            "spawn": spawn_by_id.get(b.get("spawn_id")),
+            "tank": tank_by_id.get(b.get("tank_id")),
+            "survival": survival,
+            "derived": derived,
+        })
     return out
 
 
-def compute_all_batch_outcomes() -> dict[str, dict]:
-    """
-    Compute outcomes keyed by BATCH id, scoped to each batch.
+def list_active_batches() -> list[dict]:
+    return [d for d in list_all_batches() if (d["batch"].get("stage") or "").lower() in ACTIVE_STAGES]
 
-    Returns: { batch_id: outcome_dict }
-    """
-    all_fish    = get_all_fish()
+
+def list_mature_batches() -> list[dict]:
+    return [d for d in list_all_batches() if (d["batch"].get("stage") or "").lower() in MATURE_STAGES]
+
+
+def list_batches_for_spawn(spawn_id: str) -> list[dict]:
+    return get_fry_batches_for_spawn(spawn_id)
+
+
+def get_batch_stats() -> dict:
+    """Counts for the batch view header. Uses derived current_count."""
     all_batches = get_all_fry_batches()
+    all_fish = get_all_fish()
 
-    out = {}
+    active_count = 0
+    alive_count = 0
     for b in all_batches:
-        bid = b.get("id")
-        sid = b.get("spawn_id")
-        if not bid or not sid:
+        stage = (b.get("stage") or "").lower()
+        if stage in ACTIVE_STAGES:
+            active_count += 1
+            derived = _compute_current_count(b, all_fish)
+            alive_count += derived["current"]
+
+    return {
+        "total_batches": len(all_batches),
+        "active_batches": active_count,
+        "mature_batches": sum(1 for b in all_batches if (b.get("stage") or "").lower() in MATURE_STAGES),
+        "total_fry_alive": alive_count,
+    }
+
+
+def suggest_batch_tag(spawn: dict) -> str:
+    line = (spawn.get("line_code") or "").strip()
+    gen = (spawn.get("generation") or "").strip()
+    if line and line != "UNK" and len(line) <= 12:
+        return f"{line}-{gen}" if gen else line
+    return spawn.get("system_id") or "BATCH"
+
+
+def get_spawns_available_for_batch() -> list[dict]:
+    existing_spawn_ids = {b.get("spawn_id") for b in get_all_fry_batches()}
+    out = []
+    for s in get_all_spawns():
+        if (s.get("status") or "") != "Free Swimming":
             continue
-        out[bid] = _compute_from_data(sid, all_fish, all_batches, batch_id=bid)
+        if s["id"] in existing_spawn_ids:
+            continue
+        out.append(s)
+    return out
+
+
+def get_batch_parents(batch: dict) -> dict:
+    """Return the sire and dam fish rows for a batch's spawn."""
+    out = {"male": None, "female": None}
+    try:
+        spawn_id = batch.get("spawn_id")
+        if not spawn_id:
+            return out
+        spawn = next((s for s in get_all_spawns() if s["id"] == spawn_id), None)
+        if not spawn:
+            return out
+        if spawn.get("male_id"):
+            out["male"] = get_fish_by_id(spawn["male_id"])
+        if spawn.get("female_id"):
+            out["female"] = get_fish_by_id(spawn["female_id"])
+    except Exception as e:
+        st.warning(f"get_batch_parents failed: {e}")
     return out
 
 
 # ============================================================
-# DISPLAY HELPERS
+# BATCH ↔ FISH LINKING
 # ============================================================
 
-def verdict_badge_html(outcome: dict) -> str:
-    """Return an inline HTML badge for the verdict."""
-    key = outcome.get("verdict_key", "unknown")
-    icon = outcome.get("verdict_icon", "—")
-    label_map = {
-        "excellent": "Excellent",
-        "solid": "Solid",
-        "mixed": "Mixed",
-        "weak": "Weak",
-        "failed": "Failed",
-        "pending": "Pending",
-        "unknown": "Unknown",
+def get_batch_jarred_fish(batch: dict) -> list[dict]:
+    """Return all fish rows that were jarred by this specific batch."""
+    try:
+        spawn_id = batch.get("spawn_id")
+        if not spawn_id:
+            return []
+        jarring_date = _iso_date_prefix(batch.get("jarring_date"))
+        if not jarring_date:
+            return []
+
+        out = []
+        for f in get_all_fish():
+            if f.get("batch_id") != spawn_id:
+                continue
+            if _iso_date_prefix(f.get("birth_date")) != jarring_date:
+                continue
+            out.append(f)
+        return out
+    except Exception as e:
+        st.warning(f"get_batch_jarred_fish failed: {e}")
+        return []
+
+
+def count_batch_jarred_fish(batch: dict) -> int:
+    """Fast count of jarred fish for this batch (for preview UI)."""
+    try:
+        spawn_id = batch.get("spawn_id")
+        if not spawn_id:
+            return 0
+        jarring_date = _iso_date_prefix(batch.get("jarring_date"))
+        if not jarring_date:
+            return 0
+
+        count = 0
+        for f in get_all_fish():
+            if f.get("batch_id") != spawn_id:
+                continue
+            if _iso_date_prefix(f.get("birth_date")) == jarring_date:
+                count += 1
+        return count
+    except Exception:
+        return 0
+
+
+# ============================================================
+# CREATE
+# ============================================================
+
+def create_batch_from_spawn(
+    spawn_id: str,
+    *,
+    batch_tag: str,
+    initial_count: int,
+    notes: str = "",
+    hatch_date: Optional[str] = None,
+) -> Optional[dict]:
+    """Create a fry batch linked to a spawn. Enforces one-per-spawn."""
+    spawn = get_spawn_by_id(spawn_id)
+    if not spawn:
+        st.error(f"Spawn {spawn_id} not found.")
+        return None
+
+    existing = get_fry_batches_for_spawn(spawn_id)
+    if existing:
+        st.error(f"Spawn {spawn.get('system_id')} already has a batch.")
+        return None
+
+    today = _dt.date.today().isoformat()
+
+    resolved_hatch = hatch_date
+    if not resolved_hatch:
+        fsd = spawn.get("free_swimming_date")
+        if fsd:
+            try:
+                fsd_date = _dt.date.fromisoformat(str(fsd)[:10])
+                resolved_hatch = (
+                    fsd_date - _dt.timedelta(days=DEFAULT_HATCH_OFFSET_DAYS)
+                ).isoformat()
+            except Exception:
+                resolved_hatch = today
+        else:
+            resolved_hatch = today
+
+    record = {
+        "batch_tag": batch_tag.strip() or suggest_batch_tag(spawn),
+        "batch_code": spawn.get("spawn_code") or spawn.get("system_id") or "",
+        "spawn_id": spawn_id,
+        "hatch_date": resolved_hatch,
+        "initial_count": int(initial_count or 0),
+        "current_count": int(initial_count or 0),
+        "stage": "fry",
+        "notes": notes,
     }
-    label = label_map.get(key, "—")
 
-    color_map = {
-        "excellent": ("#D1FAE5", "#065F46"),
-        "solid":     ("#DBEAFE", "#1E40AF"),
-        "mixed":     ("#FEF3C7", "#92400E"),
-        "weak":      ("#FEE2E2", "#991B1B"),
-        "failed":    ("#F3F4F6", "#6B7280"),
-        "pending":   ("#F3F4F6", "#374151"),
-        "unknown":   ("#F3F4F6", "#6B7280"),
-    }
-    bg, fg = color_map.get(key, ("#F3F4F6", "#374151"))
-
-    return (
-        f'<span style="display:inline-block;background:{bg};color:{fg};'
-        f'font-size:12px;font-weight:600;padding:3px 10px;border-radius:10px;">'
-        f'{icon} {label}</span>'
-    )
-
-
-def grade_breakdown_short(outcome: dict) -> str:
-    """Return '5 Show · 2 High · 3 Pet' style summary."""
-    breakdown = outcome.get("grade_breakdown") or {}
-    if not breakdown:
-        return "—"
-    order = ["Show Grade", "High Grade", "Breeder Grade", "Material Grade", "Pet Grade"]
-    parts = []
-    for g in order:
-        if g in breakdown:
-            short = g.replace(" Grade", "")
-            parts.append(f"{breakdown[g]} {short}")
-    for g, count in breakdown.items():
-        if g not in order:
-            parts.append(f"{count} {g}")
-    return " · ".join(parts) if parts else "—"
-
-
-def reconciliation_html(outcome: dict) -> str:
-    """
-    Return an HTML badge showing whether the counts reconcile.
-    """
-    if not outcome.get("has_batch"):
-        return ""
-
-    delta = outcome.get("reconciliation_delta", 0)
-    initial = outcome.get("initial_count", 0)
-
-    if abs(delta) <= 1:
-        return (
-            '<span style="display:inline-block;background:#D1FAE5;color:#065F46;'
-            'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;">'
-            '✓ Counts reconcile</span>'
+    saved = create_fry_batch(record)
+    if saved:
+        log_activity(
+            action_type="fry_batch_created",
+            description=(
+                f"Created batch '{saved.get('batch_tag')}' from "
+                f"{spawn.get('system_id')} with {initial_count} fry "
+                f"(hatch {resolved_hatch})"
+            ),
+            entity_type="fry_batch",
+            entity_id=saved["id"],
         )
+    return saved
 
-    sign = "+" if delta > 0 else ""
-    return (
-        f'<span style="display:inline-block;background:#FEF3C7;color:#92400E;'
-        f'font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;">'
-        f'⚠️ Off by {sign}{delta}</span>'
-    )
+
+# ============================================================
+# UPDATE
+# ============================================================
+
+def edit_batch(batch_id: str, updates: dict) -> bool:
+    ok = update_fry_batch(batch_id, updates)
+    if ok:
+        log_activity(
+            action_type="fry_batch_updated",
+            description=f"Updated batch fields: {', '.join(updates.keys())}",
+            entity_type="fry_batch",
+            entity_id=batch_id,
+        )
+    return ok
+
+
+def advance_stage(batch_id: str, new_stage: str) -> bool:
+    if new_stage not in VALID_STAGES:
+        st.error(f"Invalid stage: {new_stage}")
+        return False
+
+    updates = {"stage": new_stage}
+    if new_stage == "jarred":
+        batch = get_fry_batch_by_id(batch_id)
+        if batch and not batch.get("jarring_date"):
+            updates["jarring_date"] = _dt.date.today().isoformat()
+
+    ok = update_fry_batch(batch_id, updates)
+    if ok:
+        b = get_fry_batch_by_id(batch_id)
+        log_activity(
+            action_type="fry_batch_stage_changed",
+            description=f"Batch '{b.get('batch_tag')}' advanced to {new_stage}",
+            entity_type="fry_batch",
+            entity_id=batch_id,
+        )
+    return ok
+
+
+def set_current_count(batch_id: str, count: int) -> bool:
+    """
+    DEPRECATED (Session 29/F). current_count is derived, not stored.
+    Kept for backward compatibility.
+    """
+    count = max(0, int(count))
+    return update_fry_batch(batch_id, {"current_count": count})
+
+
+def assign_batch_tank(batch_id: str, tank_id: Optional[str]) -> bool:
+    ok = update_fry_batch(batch_id, {"tank_id": tank_id})
+    if ok:
+        b = get_fry_batch_by_id(batch_id)
+        log_activity(
+            action_type="fry_batch_tank_assigned",
+            description=f"Batch '{b.get('batch_tag')}' assigned to tank",
+            entity_type="fry_batch",
+            entity_id=batch_id,
+        )
+    return ok
+
+
+# ============================================================
+# JARRING FLOW
+# ============================================================
+
+def jar_fry_bulk(
+    batch_id: str,
+    *,
+    count: int,
+    gender: str = "Unsexed",
+    grade: str = "Pet Grade",
+    location: str = "",
+    jarring_date: Optional[str] = None,
+) -> tuple[list[dict], int]:
+    """
+    Bulk-create `count` placeholder fish rows linked to the batch's spawn.
+    Returns (created_fish_rows, failed_count).
+
+    Session 29/F — does NOT touch current_count (derived at read time).
+    """
+    batch = get_fry_batch_by_id(batch_id)
+    if not batch:
+        st.error(f"Batch {batch_id} not found.")
+        return ([], 0)
+
+    spawn_id = batch.get("spawn_id")
+    if not spawn_id:
+        st.error("Batch is not linked to a spawn.")
+        return ([], 0)
+
+    count = max(0, int(count))
+    if count == 0:
+        return ([], 0)
+
+    resolved_date = jarring_date or _dt.date.today().isoformat()
+
+    if not batch.get("jarring_date"):
+        update_fry_batch(batch_id, {"jarring_date": resolved_date})
+
+    created = []
+    failed = 0
+    for _ in range(count):
+        fish = register_fish_from_spawn(
+            spawn_id=spawn_id,
+            gender=gender,
+            grade=grade,
+            location=location,
+            notes=f"Jarred from batch '{batch.get('batch_tag')}'",
+            birth_date=resolved_date,
+        )
+        if fish:
+            created.append(fish)
+        else:
+            failed += 1
+
+    if created and (batch.get("stage") or "").lower() not in ("jarred", "juvenile", "sub_adult", "adult"):
+        update_fry_batch(batch_id, {"stage": "jarred"})
+
+    if created:
+        log_activity(
+            action_type="fry_batch_jarred",
+            description=(
+                f"Jarred {len(created)} fry from batch '{batch.get('batch_tag')}' "
+                f"(jarring date {resolved_date})"
+                + (f" — {failed} failed" if failed else "")
+            ),
+            entity_type="fry_batch",
+            entity_id=batch_id,
+        )
+    return (created, failed)
+
+
+# ============================================================
+# UNDO JAR
+# ============================================================
+
+def undo_batch_jar(
+    batch: dict,
+    *,
+    delete_photos: bool = True,
+) -> tuple[int, int, Optional[str]]:
+    """
+    Reverse a batch's jarring: delete every fish jarred by this
+    batch, clear jarring_date, flip stage back to free_swimming.
+
+    Session 29/F — no longer writes current_count (derived).
+    """
+    try:
+        batch_id = batch.get("id")
+        if not batch_id:
+            return (0, 0, "Missing batch id.")
+
+        jarred = get_batch_jarred_fish(batch)
+
+        deleted = 0
+        failed = 0
+        for f in jarred:
+            fid = f.get("id")
+            if not fid:
+                failed += 1
+                continue
+
+            if delete_photos:
+                try:
+                    from modules.photo_service import delete_drive_file
+                    for key in ("photo_id", "qr_id"):
+                        if f.get(key):
+                            delete_drive_file(f[key])
+                except Exception:
+                    pass
+
+            ok = delete_fish(fid)
+            if ok:
+                deleted += 1
+            else:
+                failed += 1
+
+        current_stage = (batch.get("stage") or "").lower()
+        updates = {"jarring_date": None}
+        if current_stage == "jarred":
+            updates["stage"] = "free_swimming"
+
+        update_fry_batch(batch_id, updates)
+
+        log_activity(
+            action_type="fry_batch_jar_undone",
+            description=(
+                f"Undid jar for batch '{batch.get('batch_tag')}': "
+                f"deleted {deleted} fish"
+                + (f" ({failed} failed)" if failed else "")
+            ),
+            entity_type="fry_batch",
+            entity_id=batch_id,
+        )
+        return (deleted, failed, None)
+    except Exception as e:
+        return (0, 0, str(e))
+
+
+# ============================================================
+# DELETE BATCH & FISH
+# ============================================================
+
+def delete_batch_and_fish(
+    batch: dict,
+    *,
+    delete_photos: bool = True,
+) -> tuple[int, int, bool, Optional[str]]:
+    """Delete every fish jarred by this batch AND the batch itself."""
+    try:
+        batch_id = batch.get("id")
+        if not batch_id:
+            return (0, 0, False, "Missing batch id.")
+
+        jarred = get_batch_jarred_fish(batch)
+
+        deleted = 0
+        failed = 0
+        for f in jarred:
+            fid = f.get("id")
+            if not fid:
+                failed += 1
+                continue
+
+            if delete_photos:
+                try:
+                    from modules.photo_service import delete_drive_file
+                    for key in ("photo_id", "qr_id"):
+                        if f.get(key):
+                            delete_drive_file(f[key])
+                except Exception:
+                    pass
+
+            ok = delete_fish(fid)
+            if ok:
+                deleted += 1
+            else:
+                failed += 1
+
+        batch_ok = delete_batch(batch_id)
+        if batch_ok:
+            log_activity(
+                action_type="fry_batch_deleted_with_fish",
+                description=(
+                    f"Deleted batch '{batch.get('batch_tag')}' and "
+                    f"{deleted} jarred fish"
+                    + (f" ({failed} failed)" if failed else "")
+                ),
+                entity_type="fry_batch",
+            )
+        return (deleted, failed, batch_ok, None)
+    except Exception as e:
+        return (0, 0, False, str(e))
+
+
+# ============================================================
+# DELETE (existing, keeps fish)
+# ============================================================
+
+def delete_batch(batch_id: str) -> bool:
+    """Delete a batch only. Jarred fish are kept."""
+    batch = get_fry_batch_by_id(batch_id)
+    if not batch:
+        return False
+    ok = delete_fry_batch(batch_id)
+    if ok:
+        log_activity(
+            action_type="fry_batch_deleted",
+            description=f"Deleted batch '{batch.get('batch_tag')}'",
+            entity_type="fry_batch",
+        )
+    return ok
