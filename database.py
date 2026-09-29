@@ -16,14 +16,13 @@
 # Session 28B — PERFORMANCE OPTIMIZATION ROUND 1: caching, batch
 #               occupant fetch, cache invalidation.
 # Session 30 — MILESTONE_FIELDS: added "grade".
-# Session 31 — (no database.py change; Round G deferred count was
-#               handled with existing nullable column).
+# Session 31 — (no change; Round G deferred count handled with
+#               existing nullable column).
 # Session 32 (this revision) — PAIRING PLANS:
 #   • New table pairing_plans (created via SQL migration).
-#   • PAIRING_PLAN_FIELDS whitelist + CRUD helpers:
-#     get_all_pairing_plans, get_pairing_plan_by_id,
-#     create_pairing_plan, update_pairing_plan, delete_pairing_plan.
+#   • PAIRING_PLAN_FIELDS whitelist + CRUD helpers.
 #   • "get_all_pairing_plans" added to _CACHE_NAMES.
+#   • Fixed: get_pairing_plan_by_id had a missing closing paren.
 
 from __future__ import annotations
 
@@ -1362,7 +1361,7 @@ def get_all_pairing_plans() -> list[dict]:
 
 def get_pairing_plan_by_id(plan_id: str) -> Optional[dict]:
     try:
-        res = (_sb().table("pairing_plans").select("*").eq("id", plan_id).limit(1).execute()
+        res = (_sb().table("pairing_plans").select("*").eq("id", plan_id).limit(1).execute())
         return (res.data or [None])[0]
     except Exception as e:
         st.error(f"get_pairing_plan_by_id failed: {e}")
